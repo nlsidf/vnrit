@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>vnrit</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #111;
+    color: #ccc;
+    font-family: -apple-system, sans-serif;
+    height: 100vh;
+    overflow: hidden;
+  }
+  #status {
+    position: fixed;
+    top: 4px;
+    right: 8px;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    user-select: none;
+    pointer-events: none;
+  }
+  #status-text {
+    font-size: 11px;
+    color: rgba(255,255,255,0.3);
+    transition: opacity 0.5s;
+  }
+  #dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #f44;
+    display: inline-block;
+    transition: background 0.3s;
+  }
+  #dot.connected { background: #4f4; }
+  #container {
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+    position: relative;
+    cursor: none;
+  }
+  video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+    background: #000;
+    cursor: crosshair;
+    image-rendering: auto;
+    touch-action: none;
+  }
+  #info {
+    position: fixed;
+    bottom: 8px;
+    right: 48px;
+    font-size: 12px;
+    color: rgba(255,255,255,0.25);
+    pointer-events: none;
+    z-index: 5;
+  }
+  #pointer-hint {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: rgba(255,255,255,0.4);
+    font-size: 14px;
+    pointer-events: none;
+    display: none;
+    text-align: center;
+    transition: opacity 1s;
+    background: rgba(0,0,0,0.5);
+    padding: 12px 20px;
+    border-radius: 8px;
+  }
+  #pointer-hint.fade {
+    opacity: 0;
+  }
+  #toolbar {
+    position: fixed;
+    bottom: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    display: flex;
+    gap: 6px;
+    opacity: 0.4;
+    transition: opacity 0.3s;
+  }
+  #toolbar:hover {
+    opacity: 1;
+  }
+  #toolbar button {
+    background: rgba(0,0,0,0.55);
+    color: #ccc;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+  #toolbar button:hover {
+    background: rgba(255,255,255,0.15);
+    color: #fff;
+  }
+  #audio-hint {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(255,255,255,0.5);
+    font-size: 12px;
+    pointer-events: none;
+    display: none;
+    background: rgba(0,0,0,0.5);
+    padding: 6px 14px;
+    border-radius: 4px;
+    z-index: 10;
+  }
+  /* ── Browser-side cursor overlay ──
+     The video stream has show-pointer=false to keep cursor out of encoding.
+     Instead, we render a position-synced cursor overlay at near-real-time
+     responsiveness (decoupled from video framerate). */
+  #cursor-overlay {
+    position: absolute;
+    width: 22px;
+    height: 22px;
+    pointer-events: none;
+    z-index: 999;
+    display: none;
+    /* High-contrast cursor indicator: white core, black ring, subtle glow */
+    transform: translate(-50%, -50%);
+    /* Outer glow ring */
+    box-shadow: 0 0 6px rgba(0,0,0,0.5);
+    /* Circle with 3 layers: black outline, white fill, transparent */
+    background: radial-gradient(
+      circle at 50% 50%,
+      #fff 2px,
+      #fff 3px,
+      rgba(0,0,0,0.85) 3.5px,
+      rgba(0,0,0,0.85) 4.5px,
+      transparent 5px
+    );
+    border-radius: 50%;
+    transition: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="status">
+  <span id="dot"></span>
+  <span id="status-text">Connecting...</span>
+</div>
+
+<div id="container">
+  <video id="remote-video" autoplay playsinline muted></video>
+  <div id="cursor-overlay"></div>
+  <div id="pointer-hint">Click to capture input<br><small>(press Escape to release)</small></div>
+  <div id="audio-hint">Tap to enable audio</div>
+</div>
+<div id="info">vnrit</div>
+<div id="toolbar">
+  <button id="fullscreen-btn">Fullscreen</button>
+</div>
+
+<script>
+const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const wsUrl = `${wsProto}//${location.host}/ws`;
+const video = document.getElementById('remote-video');
+const dot = document.getElementById('dot');
+const statusText = document.getElementById('status-text');
+const pointerHint = document.getElementById('pointer-hint');
+
+let pc = null;
+let ws = null;
+let pointerLocked = false;
+let displayWidth = 0;
+let displayHeight = 0;
+
+// ── Browser-side cursor overlay tracking ──
+// localCursorX/Y tracks the cursor position in display coordinates locally
+// (accumulated from relative moves, set from absolute moves).
+// The server periodically sends authoritative position via {"type":"cursor",x,y}
+// to correct drift (e.g. from edge-clamping or app-initiated moves).
+let localCursorX = 0;
+let localCursorY = 0;
+const cursorOverlay = document.getElementById('cursor-overlay');
+
+// Convert display coordinates to CSS pixel position within the container,
+// accounting for object-fit: contain letterboxing.
+function updateCursorOverlay() {
+  const rect = video.getBoundingClientRect();
+  const elW = rect.width, elH = rect.height;
+  const vidW = displayWidth, vidH = displayHeight;
+  if (vidW <= 0 || vidH <= 0 || elW <= 0 || elH <= 0) return;
+
+  const elAspect = elW / elH;
+  const vidAspect = vidW / vidH;
+
+  let renderW, renderH, renderX, renderY;
+  if (vidAspect > elAspect) {
+    renderW = elW;
+    renderH = elW / vidAspect;
+    renderX = 0;
+    renderY = (elH - renderH) / 2;
+  } else {
+    renderH = elH;
+    renderW = elH * vidAspect;
+    renderX = (elW - renderW) / 2;
+    renderY = 0;
+  }
+
+  const cssX = renderX + (localCursorX / vidW) * renderW;
+  const cssY = renderY + (localCursorY / vidH) * renderH;
+
+  cursorOverlay.style.left = cssX + 'px';
+  cursorOverlay.style.top = cssY + 'px';
+  cursorOverlay.style.display = 'block';
+}
+
+function capLocalCursor() {
+  localCursorX = Math.max(0, Math.min(displayWidth - 1, localCursorX));
+  localCursorY = Math.max(0, Math.min(displayHeight - 1, localCursorY));
+}
+
+function setStatus(text, connected) {
+  statusText.textContent = text;
+  dot.className = connected ? 'connected' : '';
+}
+
+// ── Throttled input: accumulate deltas, flush at near-video-framerate ──
+// Browser mousemove fires at 60-120Hz, but video only updates at ~24fps.
+// Most intermediate cursor positions would never be rendered anyway, but
+// sending every event floods X11 with redundant MotionNotify events.
+//
+// Solution: accumulate relative deltas (mr) and flush them on a ~35ms
+// interval. Absolute moves (ma) are throttled with a simple timestamp
+// gate. Clicks, keys, and scroll events pass through immediately.
+let relAccDx = 0, relAccDy = 0;
+let throttleTimer = null;
+let lastAbsMoveTs = 0;
+const THROTTLE_MS = 20; // ~50fps — much faster than video, input feels responsive
+
+function flushRelInput() {
+  const dx = relAccDx;
+  const dy = relAccDy;
+  relAccDx = 0;
+  relAccDy = 0;
+  if ((dx !== 0 || dy !== 0) && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(`mr,${dx},${dy}`);
+  }
+  // NOTE: cursor overlay position is updated IMMEDIATELY on each input event
+  // (mousemove, touchmove) — NOT here. This keeps the overlay responsive even
+  // though we throttle the WebSocket sends to avoid flooding the X server.
+}
+
+function startInputThrottle() {
+  stopInputThrottle();
+  throttleTimer = setInterval(flushRelInput, THROTTLE_MS);
+}
+
+function stopInputThrottle() {
+  if (throttleTimer) {
+    clearInterval(throttleTimer);
+    throttleTimer = null;
+  }
+  flushRelInput(); // flush remaining deltas on unlock
+}
+
+// Raw CSV protocol (no JSON overhead):
+//   mr,dx,dy     — relative mouse move
+//   ma,x,y       — absolute mouse move
+//   md,button    — mouse button down (1=left, 2=middle, 3=right)
+//   mu,button    — mouse button up
+//   ms,deltaY    — scroll wheel
+//   kd,code      — key down (using KeyboardEvent.code)
+//   ku,code      — key up
+function sendInput(csv) {
+  // Track cursor position locally for overlay
+  if (csv.startsWith('ma,')) {
+    const parts = csv.split(',');
+    localCursorX = parseInt(parts[1], 10);
+    localCursorY = parseInt(parts[2], 10);
+    capLocalCursor();
+    updateCursorOverlay();
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(csv);
+  }
+  // drop silently when not connected
+}
+
+function connect() {
+  setStatus('Connecting...', false);
+  ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    setStatus('Connected, negotiating...', true);
+    ws.send(JSON.stringify({ type: 'ready' }));
+  };
+
+  ws.onmessage = async (event) => {
+    const msg = JSON.parse(event.data);
+
+    switch (msg.type) {
+      case 'offer':
+        await handleOffer(msg.sdp);
+        break;
+      case 'ice':
+        if (pc) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate({
+              candidate: msg.candidate,
+              sdpMLineIndex: msg.sdp_mline_index,
+            }));
+          } catch (e) {
+            // ignore minor ICE errors
+          }
+        }
+        break;
+      case 'cursor':
+        // Server sends authoritative cursor position (for drift correction)
+        if (typeof msg.x === 'number' && typeof msg.y === 'number') {
+          localCursorX = msg.x;
+          localCursorY = msg.y;
+          capLocalCursor();
+          updateCursorOverlay();
+        }
+        break;
+      case 'error':
+        setStatus('Error: ' + msg.error, false);
+        break;
+    }
+  };
+
+  ws.onclose = () => {
+    setStatus('Disconnected, retrying...', false);
+    cursorOverlay.style.display = 'none';
+    if (pc) { pc.close(); pc = null; }
+    setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => {
+    ws.close();
+  };
+}
+
+async function handleOffer(sdp) {
+  if (pc) pc.close();
+
+  pc = new RTCPeerConnection({
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' }
+    ]
+  });
+
+  // No data channel needed — input is sent via WebSocket (lower overhead).
+
+  // Not using const to shadow
+  pc.ontrack = (event) => {
+    if (event.track.kind === 'video') {
+      video.srcObject = event.streams[0];
+      video.onloadedmetadata = () => {
+        displayWidth = video.videoWidth;
+        displayHeight = video.videoHeight;
+        console.log(`[video] ${displayWidth}x${displayHeight}`);
+        // Center cursor overlay at initial position (0,0) until server syncs
+        updateCursorOverlay();
+      };
+      // Hide status text once video arrives
+      setStatus('●', true);
+      document.getElementById('status-text').style.opacity = '0';
+      pointerHint.style.display = 'block';
+    }
+  };
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'ice',
+        candidate: event.candidate.candidate,
+        sdp_mline_index: event.candidate.sdpMLineIndex,
+      }));
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      setStatus('Connection lost', false);
+    }
+  };
+
+  const remoteDesc = { type: 'offer', sdp: sdp };
+  await pc.setRemoteDescription(new RTCSessionDescription(remoteDesc));
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+
+  ws.send(JSON.stringify({
+    type: 'answer',
+    sdp: answer.sdp,
+  }));
+}
+
+// Helper: get cursor position relative to video content in display coords.
+// Accounts for object-fit: contain letterboxing (black bars).
+function videoPos(clientX, clientY) {
+  const rect = video.getBoundingClientRect();
+  const elW = rect.width;
+  const elH = rect.height;
+  const vidW = displayWidth;
+  const vidH = displayHeight;
+  if (vidW <= 0 || vidH <= 0 || elW <= 0 || elH <= 0) return null;
+
+  const elAspect = elW / elH;
+  const vidAspect = vidW / vidH;
+
+  let renderW, renderH, renderX, renderY;
+
+  if (vidAspect > elAspect) {
+    // Video is wider than container → black bars top/bottom
+    renderW = elW;
+    renderH = elW / vidAspect;
+    renderX = 0;
+    renderY = (elH - renderH) / 2;
+  } else {
+    // Video is taller than container → black bars left/right
+    renderH = elH;
+    renderW = elH * vidAspect;
+    renderX = (elW - renderW) / 2;
+    renderY = 0;
+  }
+
+  // Convert to video-content-relative 0-1
+  const x = (clientX - rect.left - renderX) / renderW;
+  const y = (clientY - rect.top - renderY) / renderH;
+
+  if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+
+  return {
+    x: Math.round(x * vidW),
+    y: Math.round(y * vidH)
+  };
+}
+
+// Refresh display size from video track (call on resize/orientation change)
+function refreshDisplaySize() {
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (w > 0 && h > 0) {
+    displayWidth = w;
+    displayHeight = h;
+    updateCursorOverlay();
+  }
+}
+
+// Cancel any pending input accumulators (prevents stale events after touch end)
+function cancelPendingInputs() {
+  relAccDx = 0;
+  relAccDy = 0;
+}
+
+// Recompute display size on resize / orientation change
+window.addEventListener('resize', refreshDisplaySize);
+window.addEventListener('orientationchange', () => {
+  setTimeout(refreshDisplaySize, 300); // wait for layout to settle
+});
+
+// ── Pointer Lock for desktop mouse control ──
+video.addEventListener('click', () => {
+  if (!pointerLocked) {
+    video.requestPointerLock();
+  }
+});
+
+document.addEventListener('pointerlockchange', () => {
+  pointerLocked = document.pointerLockElement === video;
+  if (pointerLocked) {
+    pointerHint.style.display = 'none';
+  }
+});
+
+// ── Mouse events (use touchActive flag + timestamp to skip synthesized touch events) ──
+let lastTouchEndTime = 0;
+
+function isSyntheticFromTouch() {
+  return touchActive || Date.now() - lastTouchEndTime < 200;
+}
+
+document.addEventListener('mousemove', (e) => {
+  if (isSyntheticFromTouch()) return; // synthesized from touch
+  refreshDisplaySize();
+  if (pointerLocked) {
+    // Accumulate relative delta — flushRelInput will send it at THROTTLE_MS interval
+    relAccDx += e.movementX;
+    relAccDy += e.movementY;
+    // Update overlay position IMMEDIATELY (decoupled from WS send throttle)
+    localCursorX += e.movementX;
+    localCursorY += e.movementY;
+    capLocalCursor();
+    updateCursorOverlay();
+    return;
+  }
+  // Absolute position: always update overlay immediately, throttle WS sends
+  const pos = videoPos(e.clientX, e.clientY);
+  if (pos) {
+    // Update overlay position immediately (smooth local tracking)
+    localCursorX = pos.x;
+    localCursorY = pos.y;
+    capLocalCursor();
+    updateCursorOverlay();
+    // Throttle WebSocket sends to avoid flooding X server
+    const now = Date.now();
+    if (now - lastAbsMoveTs >= THROTTLE_MS) {
+      sendInput(`ma,${pos.x},${pos.y}`);
+      lastAbsMoveTs = now;
+    }
+  }
+});
+
+document.addEventListener('mousedown', (e) => {
+  if (isSyntheticFromTouch() || e.button !== 0) return;
+  refreshDisplaySize();
+  const pos = videoPos(e.clientX, e.clientY);
+  if (pos) {
+    sendInput(`ma,${pos.x},${pos.y}`);
+    sendInput('md,1');
+  }
+});
+
+document.addEventListener('mouseup', (e) => {
+  if (isSyntheticFromTouch() || e.button !== 0) return;
+  sendInput('mu,1');
+});
+
+document.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  sendInput(`ms,${e.deltaY}`);
+}, { passive: false });
+
+// ── Touch events (trackpad mode) ──
+// Interaction model:
+//   Quick tap (<300ms, no movement)     → left click at current cursor position
+//   Finger slide                        → move remote cursor (relative displacement)
+//   Long press (>700ms, no move)        → right click at current cursor position
+//   Long press + vertical move          → scroll wheel
+//   Double-tap (<400ms) + hold + move   → drag mode (select text / scroll)
+//
+// Drag mode only triggers if the PREVIOUS touch was a tap (not a cursor move,
+// scroll, or drag). This prevents repeated scroll gestures from accidentally
+// entering drag mode.
+//
+// This is trackpad mode: touch position does NOT jump the cursor.
+// All movement is relative to finger displacement on the touch surface.
+let touchActive = false;
+let dragMode = false;       // second tap of double-tap → drag-selection enabled
+let dragStarted = false;    // mousedown(1) has been sent for an active drag
+let lastWasTap = false;     // previous touch ended as a tap (only this triggers drag init)
+let longPressTimer = null;
+let lastTapTime = 0;
+let startTouchTime = 0;
+let touchStartX = 0;        // initial clientX (for tap-versus-slide detection)
+let touchStartY = 0;        // initial clientY
+let isLongPress = false;    // set by 500ms timer
+let longPressMoved = false; // finger moved after long press → scroll mode
+let cursorMoved = false;    // finger moved at all (any time)
+let lastScrollY = 0;        // last clientY for scroll delta accumulation
+// Relative-move tracking
+let lastTouchX = 0;         // previous clientX for delta calc
+let lastTouchY = 0;         // previous clientY for delta calc
+const MOVE_THRESHOLD = 15;   // min pixel movement to count as "moved"
+const SCROLL_THRESHOLD = 20; // pixels per scroll tick
+const TAP_TIME_MAX = 300;    // max ms for a quick tap (must also have cursorMoved==false)
+const LONG_PRESS_MS = 700;   // long-press activation time
+const DBL_TAP_MAX = 400;     // max gap between touches to trigger drag mode
+// Touch deltas are accumulated into relAccDx/relAccDy and flushed by the
+// throttle timer — matching the video framerate instead of the touch controller's
+// native rate, preventing redundant X11 MotionNotify events.
+
+video.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  lastTouchEndTime = Date.now();  // block synthetic mouse events during this touch
+  const t = e.touches[0];
+  refreshDisplaySize();
+  clearTimeout(longPressTimer);
+
+  const now = Date.now();
+  if (lastWasTap && (now - lastTapTime < DBL_TAP_MAX) && lastTapTime > 0) {
+    // Double-tap detected: enter drag mode
+    dragMode = true;
+    lastWasTap = false; // consume the tap so triple-tap doesn't re-enter
+  } else {
+    dragMode = false;
+  }
+
+  touchActive = true;
+  startTouchTime = now;
+  touchStartX = t.clientX;
+  touchStartY = t.clientY;
+  lastTouchX = t.clientX;
+  lastTouchY = t.clientY;
+  isLongPress = false;
+  dragStarted = false;
+  longPressMoved = false;
+  cursorMoved = false;
+  lastScrollY = t.clientY;
+
+  // Trackpad mode: do NOT send mousemove to touch position.
+  // The cursor stays wherever it was — only relative deltas move it.
+
+  // Long press timer → scroll or right-click mode
+  if (!dragMode) {
+    longPressTimer = setTimeout(() => {
+      if (touchActive && !dragMode) {
+        cancelPendingInputs();
+        isLongPress = true;
+        lastScrollY = touchStartY;
+      }
+    }, LONG_PRESS_MS);
+  }
+}, { passive: false });
+
+video.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  if (!touchActive) return;
+
+  const t = e.touches[0];
+  const dx = Math.abs(t.clientX - touchStartX);
+  const dy = Math.abs(t.clientY - touchStartY);
+  const moved = dx > MOVE_THRESHOLD || dy > MOVE_THRESHOLD;
+
+  if (!moved) return;
+
+  if (dragMode) {
+    // Double-tap drag: use relative movement while holding
+    if (!dragStarted) {
+      clearTimeout(longPressTimer);
+      cancelPendingInputs();
+      dragStarted = true;
+      // Send mousedown at current cursor position (no jump)
+      sendInput('md,1');
+    }
+    // Accumulate relative delta for throttled send
+    cursorMoved = true;
+    const deltaXDrag = Math.round(t.clientX - lastTouchX);
+    const deltaYDrag = Math.round(t.clientY - lastTouchY);
+    lastTouchX = t.clientX;
+    lastTouchY = t.clientY;
+    if (deltaXDrag !== 0 || deltaYDrag !== 0) {
+      relAccDx += deltaXDrag;
+      relAccDy += deltaYDrag;
+      // Update overlay position IMMEDIATELY drag cursor
+      localCursorX += deltaXDrag;
+      localCursorY += deltaYDrag;
+      capLocalCursor();
+      updateCursorOverlay();
+    }
+  } else if (isLongPress) {
+    // Long press + move → scroll mode
+    longPressMoved = true;
+    const scrollDy = t.clientY - lastScrollY;
+    if (Math.abs(scrollDy) >= SCROLL_THRESHOLD) {
+      const steps = Math.floor(Math.abs(scrollDy) / SCROLL_THRESHOLD);
+      const dir = scrollDy > 0 ? 1 : -1;
+      for (let i = 0; i < Math.min(steps, 5); i++) {
+        sendInput(`ms,${dir}`);
+      }
+      lastScrollY = t.clientY;
+    }
+  } else {
+    // DEFAULT: trackpad cursor mode — accumulate delta for throttled send
+    cursorMoved = true;
+    const deltaX = Math.round(t.clientX - lastTouchX);
+    const deltaY = Math.round(t.clientY - lastTouchY);
+    lastTouchX = t.clientX;
+    lastTouchY = t.clientY;
+    if (deltaX !== 0 || deltaY !== 0) {
+      relAccDx += deltaX;
+      relAccDy += deltaY;
+      // Update overlay position IMMEDIATELY for responsive touch cursor
+      localCursorX += deltaX;
+      localCursorY += deltaY;
+      capLocalCursor();
+      updateCursorOverlay();
+    }
+  }
+}, { passive: false });
+
+video.addEventListener('touchend', (e) => {
+  e.preventDefault();
+  clearTimeout(longPressTimer);
+  cancelPendingInputs();
+
+  const touchDuration = Date.now() - startTouchTime;
+
+  if (touchActive) {
+    if (dragStarted) {
+      // End drag selection
+      sendInput('mu,1');
+      dragMode = false;
+      lastWasTap = false; // drag → not a tap
+    } else if (isLongPress && !longPressMoved) {
+      // Long press + no movement → right-click at current cursor position
+      sendInput('md,3');
+      sendInput('mu,3');
+      lastWasTap = false;
+    } else if (touchDuration < TAP_TIME_MAX && !cursorMoved) {
+      // Quick tap (< 300ms, no finger movement): left click at current cursor position
+      sendInput('md,1');
+      sendInput('mu,1');
+      lastWasTap = true; // ← only set after a genuine tap!
+    } else {
+      // Deliberate slide / scroll → not a tap
+      lastWasTap = false;
+    }
+  }
+
+  touchActive = false;
+  dragMode = false;
+  dragStarted = false;
+  cursorMoved = false;
+  longPressMoved = false;
+  lastTapTime = Date.now();
+  lastTouchEndTime = Date.now();
+  isLongPress = false;
+}, { passive: false });
+
+// ── Keyboard events (work without pointer lock) ──
+document.addEventListener('keydown', (e) => {
+  // F11 → toggle fullscreen instead of sending to remote
+  if (e.code === 'F11') {
+    e.preventDefault();
+    fsBtn.click();
+    return;
+  }
+  const preventKeys = ['Tab', 'F5', 'F12', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+  if (preventKeys.includes(e.code) || e.ctrlKey || e.altKey || e.metaKey) {
+    e.preventDefault();
+  }
+  sendInput(`kd,${e.code}`);
+});
+
+document.addEventListener('keyup', (e) => {
+  sendInput(`ku,${e.code}`);
+});
+
+// Auto-hide hint after 4 seconds
+setTimeout(() => {
+  pointerHint.style.display = 'none';
+}, 4000);
+
+// Hide hint on first interaction
+function hideHint() {
+  pointerHint.style.display = 'none';
+  document.removeEventListener('touchstart', hideHint);
+  document.removeEventListener('mousedown', hideHint);
+}
+document.addEventListener('touchstart', hideHint);
+document.addEventListener('mousedown', hideHint);
+
+// ── Context menu prevention (right-click in pointer lock) ──
+document.addEventListener('contextmenu', (e) => {
+  if (pointerLocked) e.preventDefault();
+});
+
+// ── Fullscreen toggle ──
+const fsBtn = document.getElementById('fullscreen-btn');
+const container = document.getElementById('container');
+
+function updateFsButton() {
+  fsBtn.textContent = document.fullscreenElement ? 'Exit' : 'Fullscreen';
+}
+
+fsBtn.addEventListener('click', () => {
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    container.requestFullscreen();
+  }
+});
+
+document.addEventListener('fullscreenchange', updateFsButton);
+
+// ── Audio unmute on first interaction (keep muted for autoplay) ──
+const audioHint = document.getElementById('audio-hint');
+let audioEnabled = false;
+
+function enableAudio() {
+  if (audioEnabled) return;
+  audioEnabled = true;
+  video.muted = false;
+  audioHint.style.display = 'none';
+  document.removeEventListener('click', enableAudio);
+  document.removeEventListener('touchstart', enableAudio);
+}
+
+// Show audio hint after video starts playing
+video.addEventListener('playing', () => {
+  if (!audioEnabled) {
+    audioHint.style.display = 'block';
+    // Auto-hide after 8 seconds
+    setTimeout(() => { audioHint.style.display = 'none'; }, 8000);
+  }
+});
+
+document.addEventListener('click', enableAudio);
+document.addEventListener('touchstart', enableAudio);
+
+// ── Start ──
+connect();
+// Start the relative-move throttle timer — always running from page load
+// so touch and pointer-lock input both get flushed at ~28fps.
+startInputThrottle();
+
+// For debugging
+window.econsole = console;
+</script>
+</body>
+</html>
