@@ -166,7 +166,7 @@
 <div id="container">
   <video id="remote-video" autoplay playsinline muted></video>
   <div id="cursor-overlay"></div>
-  <div id="pointer-hint">Click to capture input<br><small>(press Escape to release)</small></div>
+  <div id="pointer-hint">Click to interact<br><small>(right-click for menu)</small></div>
   <div id="audio-hint">Tap to enable audio</div>
 </div>
 <div id="info">vnrit</div>
@@ -185,7 +185,6 @@ const pointerHint = document.getElementById('pointer-hint');
 
 let pc = null;
 let ws = null;
-let pointerLocked = false;
 let displayWidth = 0;
 let displayHeight = 0;
 let reconnectDelay = 1000;
@@ -204,8 +203,16 @@ const cursorOverlay = document.getElementById('cursor-overlay');
 function updateCursorOverlay() {
   const rect = video.getBoundingClientRect();
   const elW = rect.width, elH = rect.height;
+  if (elW <= 0 || elH <= 0) return;
+
   const vidW = displayWidth, vidH = displayHeight;
-  if (vidW <= 0 || vidH <= 0 || elW <= 0 || elH <= 0) return;
+  // Before video dimensions are known, show at center of container
+  if (vidW <= 0 || vidH <= 0) {
+    cursorOverlay.style.left = (elW / 2) + 'px';
+    cursorOverlay.style.top = (elH / 2) + 'px';
+    cursorOverlay.style.display = 'block';
+    return;
+  }
 
   const elAspect = elW / elH;
   const vidAspect = vidW / vidH;
@@ -528,20 +535,6 @@ window.addEventListener('orientationchange', () => {
   setTimeout(refreshDisplaySize, 300); // wait for layout to settle
 });
 
-// ── Pointer Lock for desktop mouse control ──
-video.addEventListener('click', () => {
-  if (!pointerLocked) {
-    video.requestPointerLock();
-  }
-});
-
-document.addEventListener('pointerlockchange', () => {
-  pointerLocked = document.pointerLockElement === video;
-  if (pointerLocked) {
-    pointerHint.style.display = 'none';
-  }
-});
-
 // ── Mouse events (use touchActive flag + timestamp to skip synthesized touch events) ──
 let lastTouchEndTime = 0;
 
@@ -552,18 +545,7 @@ function isSyntheticFromTouch() {
 document.addEventListener('mousemove', (e) => {
   if (isSyntheticFromTouch()) return; // synthesized from touch
   refreshDisplaySize();
-  if (pointerLocked) {
-    // Accumulate relative delta — flushRelInput will send it at THROTTLE_MS interval
-    relAccDx += e.movementX;
-    relAccDy += e.movementY;
-    // Update overlay position IMMEDIATELY (decoupled from WS send throttle)
-    localCursorX += e.movementX;
-    localCursorY += e.movementY;
-    capLocalCursor();
-    updateCursorOverlay();
-    return;
-  }
-  // Absolute position: always update overlay immediately, throttle WS sends
+  // Absolute position: update overlay immediately, throttle WS sends
   const pos = videoPos(e.clientX, e.clientY);
   if (pos) {
     // Update overlay position immediately (smooth local tracking)
@@ -820,9 +802,9 @@ function hideHint() {
 document.addEventListener('touchstart', hideHint);
 document.addEventListener('mousedown', hideHint);
 
-// ── Context menu prevention (right-click in pointer lock) ──
+// ── Context menu prevention ──
 document.addEventListener('contextmenu', (e) => {
-  if (pointerLocked) e.preventDefault();
+  e.preventDefault();
 });
 
 // ── Fullscreen toggle ──
@@ -873,6 +855,9 @@ connect();
 // Start the relative-move throttle timer — always running from page load
 // so touch and pointer-lock input both get flushed at ~28fps.
 startInputThrottle();
+// Show the cursor overlay immediately (center of screen) — it will be
+// repositioned once video metadata and server cursor position arrive.
+setTimeout(updateCursorOverlay, 100);
 
 // For debugging
 window.econsole = console;
