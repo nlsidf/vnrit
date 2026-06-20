@@ -312,8 +312,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn root_handler() -> Html<&'static str> {
-    Html(include_str!("index.html"))
+async fn root_handler(State(state): State<ServerState>) -> Html<String> {
+    let html = include_str!("index.html")
+        .replace("{{STUN_SERVER}}", &state.args.stun);
+    Html(html)
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<ServerState>) -> impl IntoResponse {

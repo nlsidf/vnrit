@@ -177,6 +177,7 @@
 <script>
 const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const wsUrl = `${wsProto}//${location.host}/ws`;
+const STUN_SERVER = '{{STUN_SERVER}}';
 const video = document.getElementById('remote-video');
 const dot = document.getElementById('dot');
 const statusText = document.getElementById('status-text');
@@ -187,6 +188,7 @@ let ws = null;
 let pointerLocked = false;
 let displayWidth = 0;
 let displayHeight = 0;
+let reconnectDelay = 1000;
 
 // ── Browser-side cursor overlay tracking ──
 // localCursorX/Y tracks the cursor position in display coordinates locally
@@ -306,7 +308,8 @@ function connect() {
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
-    setStatus('Connected, negotiating...', true);
+    setStatus('Connected', true);
+    reconnectDelay = 1000; // reset backoff on successful connection
     ws.send(JSON.stringify({ type: 'ready' }));
   };
 
@@ -315,7 +318,12 @@ function connect() {
 
     switch (msg.type) {
       case 'offer':
-        await handleOffer(msg.sdp);
+        try {
+          await handleOffer(msg.sdp);
+        } catch (e) {
+          console.error('[offer] handleOffer failed:', e);
+          ws.close();
+        }
         break;
       case 'ice':
         if (pc) {
@@ -348,7 +356,8 @@ function connect() {
     setStatus('Disconnected, retrying...', false);
     cursorOverlay.style.display = 'none';
     if (pc) { pc.close(); pc = null; }
-    setTimeout(connect, 2000);
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
   };
 
   ws.onerror = () => {
@@ -357,13 +366,23 @@ function connect() {
 }
 
 async function handleOffer(sdp) {
-  if (pc) pc.close();
+  // Clean up any previous PC before starting new negotiation
+  if (pc) { pc.close(); pc = null; }
 
-  pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' }
-    ]
-  });
+  setStatus('Negotiating...', false);
+
+  // Build RTCPeerConnection config to match server-side STUN setting
+  const pcConfig = {};
+  if (STUN_SERVER) {
+    // Convert stun://host:port (GStreamer format) → stun:host:port (browser format)
+    pcConfig.iceServers = [{ urls: STUN_SERVER.replace('stun://', 'stun:') }];
+  } else {
+    // STUN disabled on server → host-only candidates only
+    pcConfig.iceServers = [];
+    pcConfig.iceTransportPolicy = 'host';
+  }
+
+  pc = new RTCPeerConnection(pcConfig);
 
   // No data channel needed — input is sent via WebSocket (lower overhead).
 
@@ -395,21 +414,54 @@ async function handleOffer(sdp) {
     }
   };
 
-  pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+  // Monitor both connection states — abort on any failure
+  const onConnectionFail = () => {
+    if (!pc) return;
+    const st = pc.connectionState;
+    const ice = pc.iceConnectionState;
+    if (st === 'failed' || st === 'disconnected' ||
+        ice === 'failed' || ice === 'disconnected') {
+      console.warn(`[pc] connection failed (connectionState=${st}, iceConnectionState=${ice})`);
       setStatus('Connection lost', false);
+      ws.close();
     }
   };
+  pc.onconnectionstatechange = onConnectionFail;
+  pc.oniceconnectionstatechange = onConnectionFail;
 
-  const remoteDesc = { type: 'offer', sdp: sdp };
-  await pc.setRemoteDescription(new RTCSessionDescription(remoteDesc));
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
+  try {
+    const remoteDesc = { type: 'offer', sdp: sdp };
+    await pc.setRemoteDescription(new RTCSessionDescription(remoteDesc));
 
-  ws.send(JSON.stringify({
-    type: 'answer',
-    sdp: answer.sdp,
-  }));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    // Confirm WebSocket is still open before sending answer
+    if (ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket closed before answer could be sent');
+    }
+
+    ws.send(JSON.stringify({
+      type: 'answer',
+      sdp: answer.sdp,
+    }));
+
+    // Watchdog: if ICE doesn't connect within 15s, restart negotiation
+    // This prevents permanent black screen when something goes wrong
+    // after the answer was sent (e.g. firewall blocks ICE, STUN unreachable)
+    setTimeout(() => {
+      if (pc && pc.connectionState !== 'connected' && pc.connectionState !== 'closed') {
+        console.warn('[pc] negotiation timeout (15s), restarting');
+        setStatus('Negotiation timeout, retrying...', false);
+        ws.close();
+      }
+    }, 15000);
+
+  } catch (e) {
+    console.error('[offer] negotiation error:', e);
+    setStatus('Error: ' + (e.message || e), false);
+    ws.close();
+  }
 }
 
 // Helper: get cursor position relative to video content in display coords.
