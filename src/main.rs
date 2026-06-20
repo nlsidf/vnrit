@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use anyhow::{Context, Result};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -257,8 +260,8 @@ enum SignalingMessage {
 struct AppState {
     conn: x11rb::rust_connection::RustConnection,
     root: xproto::Window,
-    cursor_x: i32,
-    cursor_y: i32,
+    cursor_x: AtomicI32,
+    cursor_y: AtomicI32,
     // Cached keyboard mapping (fetched once on start) to convert keysym → keycode
     keysyms: Vec<u32>,
     keysyms_per_keycode: u8,
@@ -478,8 +481,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let state = Arc::new(Mutex::new(AppState {
         conn: x11_conn,
         root,
-        cursor_x: ptr.root_x as i32,
-        cursor_y: ptr.root_y as i32,
+        cursor_x: AtomicI32::new(ptr.root_x as i32),
+        cursor_y: AtomicI32::new(ptr.root_y as i32),
         keysyms: kbd.keysyms.to_vec(),
         keysyms_per_keycode: kbd.keysyms_per_keycode,
         first_keycode,
@@ -492,7 +495,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         .name("webrtcbin")
         .build()
         .expect("failed to create webrtcbin");
-    webrtcbin.set_property_from_str("stun-server", "stun://stun.l.google.com:19302");
+    webrtcbin.set_property_from_str("stun-server", "stun://stun.cloudflare.com:3478");
     pipeline.add(&webrtcbin).unwrap();
 
     // ── ximagesrc → videoconvert → encoder → payloader ──
@@ -501,7 +504,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         .build()
         .unwrap();
     ximagesrc.set_property("display-name", &format!("{}", args.display));
-    ximagesrc.set_property("use-damage", false);
+    ximagesrc.set_property("use-damage", true);
     ximagesrc.set_property("show-pointer", false);
 
     let videoconvert = gst::ElementFactory::make("videoconvert").name("videoconvert").build().unwrap();
@@ -554,7 +557,11 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         _ => "rtph264pay",
     };
     let payloader = gst::ElementFactory::make(pay_name).name("payloader").build().unwrap();
-
+	
+    // ── 仅当使用 H.264 编码器时，每个 RTP 包都带 SPS/PPS ──
+    if args.codec == "openh264" || args.codec == "h264" {
+    payloader.set_property("config-interval", -1);
+    }
     // ── Optional stream downscaling (--height, e.g. 720 for 720p) ──
     // Fewer pixels encoded = less CPU + less bandwidth, especially valuable on ARM.
     if args.height > 0 {
@@ -768,26 +775,36 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
     }
 
     // ── Direct X11 via XTest extension (no xdotool, no pipe, no IPC) ──
-    let mut s = state.lock().unwrap();
+    let s = state.lock().unwrap();
 
     match parts[0] {
         "mr" if parts.len() >= 3 => {
             // mr,dx,dy — relative mouse move: update internal cursor, send absolute
             let dx: i32 = parts[1].parse().unwrap_or(0);
             let dy: i32 = parts[2].parse().unwrap_or(0);
-            s.cursor_x = s.cursor_x.saturating_add(dx).max(0);
-            s.cursor_y = s.cursor_y.saturating_add(dy).max(0);
+            let new_x = s.cursor_x.load(Ordering::Relaxed).saturating_add(dx).max(0);
+            let new_y = s.cursor_y.load(Ordering::Relaxed).saturating_add(dy).max(0);
+            s.cursor_x.store(new_x, Ordering::Relaxed);
+	    s.cursor_y.store(new_y, Ordering::Relaxed);
             let _ = xtest::fake_input(&s.conn, X11_MOTION_NOTIFY,
-                0, 0, s.root, s.cursor_x as i16, s.cursor_y as i16, 0);
+                0, 0, s.root, 
+                s.cursor_x.load(Ordering::Relaxed) as i16,
+                s.cursor_y.load(Ordering::Relaxed) as i16,
+		0);
             let _ = s.conn.flush();
         }
         "ma" if parts.len() >= 3 => {
             // ma,x,y — absolute mouse move
-            s.cursor_x = parts[1].parse::<i32>().unwrap_or(0).max(0);
-            s.cursor_y = parts[2].parse::<i32>().unwrap_or(0).max(0);
+            let new_x = parts[1].parse::<i32>().unwrap_or(0).max(0);
+            let new_y = parts[2].parse::<i32>().unwrap_or(0).max(0);
+            s.cursor_x.store(new_x, Ordering::Relaxed);
+            s.cursor_y.store(new_y, Ordering::Relaxed);
             let _ = xtest::fake_input(&s.conn, X11_MOTION_NOTIFY,
-                0, 0, s.root, s.cursor_x as i16, s.cursor_y as i16, 0);
-            let _ = s.conn.flush();
+		0, 0, s.root,
+		s.cursor_x.load(Ordering::Relaxed) as i16,
+		s.cursor_y.load(Ordering::Relaxed) as i16,
+                0);
+	    let _ = s.conn.flush();
         }
         "md" if parts.len() >= 2 => {
             // md,button — mouse button down
@@ -797,7 +814,7 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
                 _ => 1,
             };
             let _ = xtest::fake_input(&s.conn, X11_BUTTON_PRESS,
-                btn, 0, s.root, s.cursor_x as i16, s.cursor_y as i16, 0);
+                btn, 0, s.root, s.cursor_x.load(Ordering::Relaxed) as i16, s.cursor_y.load(Ordering::Relaxed) as i16, 0);
             let _ = s.conn.flush();
         }
         "mu" if parts.len() >= 2 => {
@@ -808,7 +825,7 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
                 _ => 1,
             };
             let _ = xtest::fake_input(&s.conn, X11_BUTTON_RELEASE,
-                btn, 0, s.root, s.cursor_x as i16, s.cursor_y as i16, 0);
+                btn, 0, s.root, s.cursor_x.load(Ordering::Relaxed) as i16, s.cursor_y.load(Ordering::Relaxed) as i16, 0);
             let _ = s.conn.flush();
         }
         "ms" if parts.len() >= 2 => {
@@ -816,9 +833,9 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
             let delta: f64 = parts[1].parse().unwrap_or(0.0);
             let btn = if delta > 0.0 { 5 } else { 4 };
             let _ = xtest::fake_input(&s.conn, X11_BUTTON_PRESS,
-                btn, 0, s.root, s.cursor_x as i16, s.cursor_y as i16, 0);
+                btn, 0, s.root, s.cursor_x.load(Ordering::Relaxed) as i16, s.cursor_y.load(Ordering::Relaxed) as i16, 0);
             let _ = xtest::fake_input(&s.conn, X11_BUTTON_RELEASE,
-                btn, 0, s.root, s.cursor_x as i16, s.cursor_y as i16, 0);
+                btn, 0, s.root, s.cursor_x.load(Ordering::Relaxed) as i16, s.cursor_y.load(Ordering::Relaxed) as i16, 0);
             let _ = s.conn.flush();
         }
         "kd" if parts.len() >= 2 => {
@@ -828,7 +845,7 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
                 let kc = find_keycode(&s, keysym);
                 if kc > 0 {
                     let _ = xtest::fake_input(&s.conn, X11_KEY_PRESS,
-                        kc, 0, s.root, s.cursor_x as i16, s.cursor_y as i16, 0);
+                        kc, 0, s.root, s.cursor_x.load(Ordering::Relaxed) as i16, s.cursor_y.load(Ordering::Relaxed) as i16, 0);
                     let _ = s.conn.flush();
                 }
             }
@@ -839,7 +856,7 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
                 let kc = find_keycode(&s, keysym);
                 if kc > 0 {
                     let _ = xtest::fake_input(&s.conn, X11_KEY_RELEASE,
-                        kc, 0, s.root, s.cursor_x as i16, s.cursor_y as i16, 0);
+                        kc, 0, s.root, s.cursor_x.load(Ordering::Relaxed) as i16, s.cursor_y.load(Ordering::Relaxed) as i16, 0);
                     let _ = s.conn.flush();
                 }
             }
@@ -854,8 +871,8 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
 /// so the browser's overlay always stays in sync between local event updates.
 fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &Arc<Mutex<AppState>>) {
     let s = state.lock().unwrap();
-    let x = s.cursor_x;
-    let y = s.cursor_y;
+    let x = s.cursor_x.load(Ordering::Relaxed);
+    let y = s.cursor_y.load(Ordering::Relaxed);
     drop(s);
     let msg = serde_json::to_string(&serde_json::json!({
         "type": "cursor",
