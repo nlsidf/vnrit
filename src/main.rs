@@ -217,6 +217,13 @@ Lower values (10, 15) save bandwidth and CPU for mostly-static desktops."
     )]
     framerate: i32,
 
+#[arg(
+    long,
+    default_value = "stun://stun.cloudflare.com:3478",
+    help = "STUN server URL (set empty string to disable)"
+)]
+stun: String,
+
     #[arg(
         long,
         default_value = "1000",
@@ -495,7 +502,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         .name("webrtcbin")
         .build()
         .expect("failed to create webrtcbin");
-    webrtcbin.set_property_from_str("stun-server", "stun://stun.cloudflare.com:3478");
+    if !args.stun.is_empty() {
+       eprintln!("[config] STUN server: {}", args.stun);
+       webrtcbin.set_property_from_str("stun-server", &args.stun);
+}else {
+    eprintln!("[config] STUN disabled (using host candidates only)");
+}
+// 如果 args.stun 为空字符串，则不设置 stun-server，webrtcbin 将仅使用 host 候选
     pipeline.add(&webrtcbin).unwrap();
 
     // ── ximagesrc → videoconvert → encoder → payloader ──
