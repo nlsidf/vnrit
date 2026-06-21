@@ -810,8 +810,13 @@ function isSyntheticFromTouch() {
   return touchActive || Date.now() - lastTouchEndTime < 200;
 }
 
+// Skip mouse events that land on UI controls (toolbar / keyboard)
+function isOnUI(el) {
+  return el.closest('#toolbar') || el.closest('#custom-keyboard');
+}
+
 document.addEventListener('mousemove', (e) => {
-  if (isSyntheticFromTouch()) return;
+  if (isSyntheticFromTouch() || isOnUI(e.target)) return;
   refreshDisplaySize();
   const pos = videoPos(e.clientX, e.clientY);
   if (pos) {
@@ -828,7 +833,7 @@ document.addEventListener('mousemove', (e) => {
 });
 
 document.addEventListener('mousedown', (e) => {
-  if (isSyntheticFromTouch()) return;
+  if (isSyntheticFromTouch() || isOnUI(e.target)) return;
   refreshDisplaySize();
   const pos = videoPos(e.clientX, e.clientY);
   if (pos) {
@@ -843,7 +848,7 @@ document.addEventListener('mousedown', (e) => {
 });
 
 document.addEventListener('mouseup', (e) => {
-  if (isSyntheticFromTouch()) return;
+  if (isSyntheticFromTouch() || isOnUI(e.target)) return;
   let btn = 0;
   if (e.button === 0) btn = 1;
   else if (e.button === 1) btn = 2;
