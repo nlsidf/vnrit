@@ -568,18 +568,28 @@ document.addEventListener('mousemove', (e) => {
 });
 
 document.addEventListener('mousedown', (e) => {
-  if (isSyntheticFromTouch() || e.button !== 0) return;
+  if (isSyntheticFromTouch()) return;
   refreshDisplaySize();
   const pos = videoPos(e.clientX, e.clientY);
   if (pos) {
     sendInput(`ma,${pos.x},${pos.y}`);
-    sendInput('md,1');
+    let btn = 0;
+    if (e.button === 0) btn = 1;
+    else if (e.button === 1) btn = 2;
+    else if (e.button === 2) btn = 3;
+    else return;
+    sendInput(`md,${btn}`);
   }
 });
 
 document.addEventListener('mouseup', (e) => {
-  if (isSyntheticFromTouch() || e.button !== 0) return;
-  sendInput('mu,1');
+  if (isSyntheticFromTouch()) return;
+  let btn = 0;
+  if (e.button === 0) btn = 1;
+  else if (e.button === 1) btn = 2;
+  else if (e.button === 2) btn = 3;
+  else return;
+  sendInput(`mu,${btn}`);
 });
 
 document.addEventListener('wheel', (e) => {
