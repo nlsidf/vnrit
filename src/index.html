@@ -89,7 +89,7 @@
     bottom: 8px;
     left: 50%;
     transform: translateX(-50%);
-    z-index: 20;
+    z-index: 50;
     display: flex;
     gap: 6px;
     opacity: 0.4;
@@ -112,6 +112,11 @@
     background: rgba(255,255,255,0.15);
     color: #fff;
   }
+  #kbd-btn {
+    font-size: 16px;
+    line-height: 1;
+    padding: 4px 8px;
+  }
   #audio-hint {
     position: absolute;
     top: 12px;
@@ -126,10 +131,7 @@
     border-radius: 4px;
     z-index: 10;
   }
-  /* ── Browser-side cursor overlay ──
-     The video stream has show-pointer=false to keep cursor out of encoding.
-     Instead, we render a position-synced cursor overlay at near-real-time
-     responsiveness (decoupled from video framerate). */
+  /* ── Browser-side cursor overlay ── */
   #cursor-overlay {
     position: absolute;
     width: 22px;
@@ -137,11 +139,8 @@
     pointer-events: none;
     z-index: 999;
     display: none;
-    /* High-contrast cursor indicator: white core, black ring, subtle glow */
     transform: translate(-50%, -50%);
-    /* Outer glow ring */
     box-shadow: 0 0 6px rgba(0,0,0,0.5);
-    /* Circle with 3 layers: black outline, white fill, transparent */
     background: radial-gradient(
       circle at 50% 50%,
       #fff 2px,
@@ -153,6 +152,148 @@
     border-radius: 50%;
     transition: left 0.015s ease-out, top 0.015s ease-out;
     will-change: left, top; 
+  }
+  /* ── Custom Virtual Keyboard ── */
+  #custom-keyboard {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 46vh;
+    background: rgba(18,18,22,0.92);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    z-index: 200;
+    display: flex;
+    flex-direction: column;
+    padding: 4px 3px 2px;
+    transform: translateY(100%);
+    transition: transform 0.22s cubic-bezier(0.33, 1, 0.68, 1);
+    user-select: none;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    border-top: 1px solid rgba(255,255,255,0.06);
+  }
+  #custom-keyboard.visible {
+    transform: translateY(0);
+  }
+  .kbd-layer {
+    display: none;
+    flex: 1;
+    flex-direction: column;
+    justify-content: space-evenly;
+    padding: 1px 0;
+  }
+  .kbd-layer.active {
+    display: flex;
+  }
+  .kbd-row {
+    display: flex;
+    gap: 3px;
+    justify-content: center;
+    align-items: stretch;
+    flex: 1;
+  }
+  .kbd-key {
+    flex: 1;
+    min-width: 0;
+    background: rgba(255,255,255,0.08);
+    color: #ddd;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 5px;
+    font-size: 13px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 2px;
+    transition: background 0.05s, transform 0.05s, border-color 0.15s, box-shadow 0.15s;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    will-change: transform;
+    position: relative;
+  }
+  .kbd-key:active {
+    background: rgba(255,255,255,0.18);
+    transform: scale(0.94);
+  }
+  .kbd-key.wide {
+    flex: 1.6;
+  }
+  .kbd-key.xwide {
+    flex: 2.2;
+  }
+  .kbd-key.xxwide {
+    flex: 3.5;
+  }
+  .kbd-key.mod-active {
+    border-color: #4a9eff;
+    box-shadow: inset 0 0 6px rgba(74,158,255,0.25);
+  }
+  .kbd-key.mod-latched {
+    background: rgba(74,158,255,0.12);
+    border-color: rgba(74,158,255,0.5);
+  }
+  .kbd-key.mod-locked {
+    background: rgba(74,158,255,0.22);
+    border-color: #4a9eff;
+    box-shadow: inset 0 0 8px rgba(74,158,255,0.35);
+  }
+  .kbd-key.special {
+    font-size: 11px;
+  }
+  .kbd-key .sub {
+    font-size: 8px;
+    position: absolute;
+    top: 2px;
+    right: 3px;
+    color: rgba(255,255,255,0.35);
+  }
+  /* Bottom bar */
+  .kbd-bottom-bar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 4px 1px;
+    border-top: 1px solid rgba(255,255,255,0.05);
+    flex-shrink: 0;
+  }
+  .kbd-bottom-bar button {
+    background: rgba(255,255,255,0.06);
+    color: #999;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 5px;
+    padding: 5px 10px;
+    font-size: 11px;
+    cursor: pointer;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    flex-shrink: 0;
+  }
+  .kbd-bottom-bar button:active {
+    background: rgba(255,255,255,0.14);
+  }
+  .kbd-bottom-bar .layer-active {
+    background: rgba(74,158,255,0.25);
+    color: #fff;
+    border-color: rgba(74,158,255,0.4);
+  }
+  .kbd-bottom-bar .kbd-spacer {
+    flex: 1;
+  }
+  .kbd-dismiss {
+    font-size: 14px;
+    padding: 5px 14px;
+  }
+  .kbd-key.dim {
+    color: rgba(255,255,255,0.15);
+  }
+  /* Prevent body scroll when keyboard is visible */
+  body.kbd-open {
+    overflow: hidden;
   }
 </style>
 </head>
@@ -168,11 +309,167 @@
   <div id="cursor-overlay"></div>
   <div id="pointer-hint">Click to interact<br><small>(right-click for menu)</small></div>
   <div id="audio-hint">Tap to enable audio</div>
+  <!-- 工具栏移入 container 内部，全屏时可见 -->
+  <div id="toolbar">
+    <button id="fullscreen-btn">Fullscreen</button>
+    <button id="kbd-btn">⌨️</button>
+  </div>
+  <!-- ── Custom Virtual Keyboard (inside container for fullscreen) ── -->
+  <div id="custom-keyboard" style="position:fixed;">
+  <!-- Main Layer -->
+  <div class="kbd-layer active" data-layer="main">
+    <div class="kbd-row">
+      <button class="kbd-key special" data-code="Escape">Esc</button>
+      <button class="kbd-key" data-code="Backquote">`</button>
+      <button class="kbd-key" data-code="Digit1">1</button>
+      <button class="kbd-key" data-code="Digit2">2</button>
+      <button class="kbd-key" data-code="Digit3">3</button>
+      <button class="kbd-key" data-code="Digit4">4</button>
+      <button class="kbd-key" data-code="Digit5">5</button>
+      <button class="kbd-key" data-code="Digit6">6</button>
+      <button class="kbd-key" data-code="Digit7">7</button>
+      <button class="kbd-key" data-code="Digit8">8</button>
+      <button class="kbd-key" data-code="Digit9">9</button>
+      <button class="kbd-key" data-code="Digit0">0</button>
+      <button class="kbd-key special" data-code="Minus">-</button>
+      <button class="kbd-key special" data-code="Equal">=</button>
+      <button class="kbd-key wide special" data-code="Backspace">⌫</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key wide special" data-code="Tab">Tab</button>
+      <button class="kbd-key" data-code="KeyQ">Q</button>
+      <button class="kbd-key" data-code="KeyW">W</button>
+      <button class="kbd-key" data-code="KeyE">E</button>
+      <button class="kbd-key" data-code="KeyR">R</button>
+      <button class="kbd-key" data-code="KeyT">T</button>
+      <button class="kbd-key" data-code="KeyY">Y</button>
+      <button class="kbd-key" data-code="KeyU">U</button>
+      <button class="kbd-key" data-code="KeyI">I</button>
+      <button class="kbd-key" data-code="KeyO">O</button>
+      <button class="kbd-key" data-code="KeyP">P</button>
+      <button class="kbd-key special" data-code="BracketLeft">[</button>
+      <button class="kbd-key special" data-code="BracketRight">]</button>
+      <button class="kbd-key wide special" data-code="Backslash">\</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key xwide special" data-code="CapsLock">Caps</button>
+      <button class="kbd-key" data-code="KeyA">A</button>
+      <button class="kbd-key" data-code="KeyS">S</button>
+      <button class="kbd-key" data-code="KeyD">D</button>
+      <button class="kbd-key" data-code="KeyF">F</button>
+      <button class="kbd-key" data-code="KeyG">G</button>
+      <button class="kbd-key" data-code="KeyH">H</button>
+      <button class="kbd-key" data-code="KeyJ">J</button>
+      <button class="kbd-key" data-code="KeyK">K</button>
+      <button class="kbd-key" data-code="KeyL">L</button>
+      <button class="kbd-key special" data-code="Semicolon">;</button>
+      <button class="kbd-key special" data-code="Quote">'</button>
+      <button class="kbd-key xwide special" data-code="Enter">Enter</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key xwide mod-key special" data-code="ShiftLeft">Shift</button>
+      <button class="kbd-key" data-code="KeyZ">Z</button>
+      <button class="kbd-key" data-code="KeyX">X</button>
+      <button class="kbd-key" data-code="KeyC">C</button>
+      <button class="kbd-key" data-code="KeyV">V</button>
+      <button class="kbd-key" data-code="KeyB">B</button>
+      <button class="kbd-key" data-code="KeyN">N</button>
+      <button class="kbd-key" data-code="KeyM">M</button>
+      <button class="kbd-key special" data-code="Comma">,</button>
+      <button class="kbd-key special" data-code="Period">.</button>
+      <button class="kbd-key special" data-code="Slash">/</button>
+      <button class="kbd-key xwide mod-key special" data-code="ShiftRight">Shift</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key wide mod-key special" data-code="ControlLeft">Ctrl</button>
+      <button class="kbd-key mod-key special" data-code="AltLeft">Alt</button>
+      <button class="kbd-key xxwide" data-code="Space">Space</button>
+      <button class="kbd-key mod-key special" data-code="AltRight">Alt</button>
+      <button class="kbd-key wide mod-key special" data-code="ControlRight">Ctrl</button>
+      <button class="kbd-key special" data-code="ArrowLeft">◀</button>
+      <button class="kbd-key special" data-code="ArrowUp">▲</button>
+      <button class="kbd-key special" data-code="ArrowDown">▼</button>
+      <button class="kbd-key special" data-code="ArrowRight">▶</button>
+    </div>
+  </div>
+
+  <!-- Func Layer -->
+  <div class="kbd-layer" data-layer="func">
+    <div class="kbd-row">
+      <button class="kbd-key special" data-code="F1">F1</button>
+      <button class="kbd-key special" data-code="F2">F2</button>
+      <button class="kbd-key special" data-code="F3">F3</button>
+      <button class="kbd-key special" data-code="F4">F4</button>
+      <button class="kbd-key special" data-code="F5">F5</button>
+      <button class="kbd-key special" data-code="F6">F6</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key special" data-code="F7">F7</button>
+      <button class="kbd-key special" data-code="F8">F8</button>
+      <button class="kbd-key special" data-code="F9">F9</button>
+      <button class="kbd-key special" data-code="F10">F10</button>
+      <button class="kbd-key special" data-code="F11">F11</button>
+      <button class="kbd-key special" data-code="F12">F12</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key special" data-code="PrintScreen">PrtSc</button>
+      <button class="kbd-key special" data-code="ScrollLock">ScrLk</button>
+      <button class="kbd-key special" data-code="Pause">Pause</button>
+      <button class="kbd-key special" data-code="Break">Break</button>
+      <button class="kbd-key special" data-code="SysRq">SysRq</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key special" data-code="Insert">Ins</button>
+      <button class="kbd-key special" data-code="Delete">Del</button>
+      <button class="kbd-key special" data-code="Home">Home</button>
+      <button class="kbd-key special" data-code="End">End</button>
+      <button class="kbd-key special" data-code="PageUp">PgUp</button>
+      <button class="kbd-key special" data-code="PageDown">PgDn</button>
+    </div>
+  </div>
+
+  <!-- Num Layer -->
+  <div class="kbd-layer" data-layer="num">
+    <div class="kbd-row">
+      <button class="kbd-key special" data-code="NumLock">NumLk</button>
+      <button class="kbd-key special" data-code="NumpadDivide">/</button>
+      <button class="kbd-key special" data-code="NumpadMultiply">*</button>
+      <button class="kbd-key special" data-code="NumpadSubtract">-</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key" data-code="Numpad7">7</button>
+      <button class="kbd-key" data-code="Numpad8">8</button>
+      <button class="kbd-key" data-code="Numpad9">9</button>
+      <button class="kbd-key special" data-code="NumpadAdd">+</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key" data-code="Numpad4">4</button>
+      <button class="kbd-key" data-code="Numpad5">5</button>
+      <button class="kbd-key" data-code="Numpad6">6</button>
+      <button class="kbd-key wide special" data-code="NumpadDecimal">.</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key" data-code="Numpad1">1</button>
+      <button class="kbd-key" data-code="Numpad2">2</button>
+      <button class="kbd-key" data-code="Numpad3">3</button>
+      <button class="kbd-key wide special" data-code="NumpadEnter">Ent</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key xxwide" data-code="Numpad0">0</button>
+      <button class="kbd-key" data-code="NumpadDecimal">.</button>
+    </div>
+  </div>
+
+  <!-- Bottom bar (always visible) -->
+  <div class="kbd-bottom-bar">
+    <button id="kbd-layer-fn" class="kbd-layer-btn" data-target="func">Fn</button>
+    <button id="kbd-layer-num" class="kbd-layer-btn" data-target="num">123</button>
+    <span class="kbd-spacer"></span>
+    <button class="kbd-dismiss">▼</button>
+  </div>
+</div>
 </div>
 <div id="info">vnrit</div>
-<div id="toolbar">
-  <button id="fullscreen-btn">Fullscreen</button>
-</div>
 
 <script>
 const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -187,6 +484,8 @@ const video = document.getElementById('remote-video');
 const dot = document.getElementById('dot');
 const statusText = document.getElementById('status-text');
 const pointerHint = document.getElementById('pointer-hint');
+const fsBtn = document.getElementById('fullscreen-btn');
+const container = document.getElementById('container');
 
 let pc = null;
 let ws = null;
@@ -195,23 +494,16 @@ let displayHeight = 0;
 let reconnectDelay = 1000;
 
 // ── Browser-side cursor overlay tracking ──
-// localCursorX/Y tracks the cursor position in display coordinates locally
-// (accumulated from relative moves, set from absolute moves).
-// The server periodically sends authoritative position via {"type":"cursor",x,y}
-// to correct drift (e.g. from edge-clamping or app-initiated moves).
 let localCursorX = 0;
 let localCursorY = 0;
 const cursorOverlay = document.getElementById('cursor-overlay');
 
-// Convert display coordinates to CSS pixel position within the container,
-// accounting for object-fit: contain letterboxing.
 function updateCursorOverlay() {
   const rect = video.getBoundingClientRect();
   const elW = rect.width, elH = rect.height;
   if (elW <= 0 || elH <= 0) return;
 
   const vidW = displayWidth, vidH = displayHeight;
-  // Before video dimensions are known, show at center of container
   if (vidW <= 0 || vidH <= 0) {
     cursorOverlay.style.left = (elW / 2) + 'px';
     cursorOverlay.style.top = (elH / 2) + 'px';
@@ -253,18 +545,11 @@ function setStatus(text, connected) {
   dot.className = connected ? 'connected' : '';
 }
 
-// ── Throttled input: accumulate deltas, flush at near-video-framerate ──
-// Browser mousemove fires at 60-120Hz, but video only updates at ~24fps.
-// Most intermediate cursor positions would never be rendered anyway, but
-// sending every event floods X11 with redundant MotionNotify events.
-//
-// Solution: accumulate relative deltas (mr) and flush them on a ~35ms
-// interval. Absolute moves (ma) are throttled with a simple timestamp
-// gate. Clicks, keys, and scroll events pass through immediately.
+// ── Throttled input ──
 let relAccDx = 0, relAccDy = 0;
 let throttleTimer = null;
 let lastAbsMoveTs = 0;
-const THROTTLE_MS = 20; // ~50fps — much faster than video, input feels responsive
+const THROTTLE_MS = 20;
 
 function flushRelInput() {
   const dx = relAccDx;
@@ -274,9 +559,6 @@ function flushRelInput() {
   if ((dx !== 0 || dy !== 0) && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(`mr,${dx},${dy}`);
   }
-  // NOTE: cursor overlay position is updated IMMEDIATELY on each input event
-  // (mousemove, touchmove) — NOT here. This keeps the overlay responsive even
-  // though we throttle the WebSocket sends to avoid flooding the X server.
 }
 
 function startInputThrottle() {
@@ -289,19 +571,10 @@ function stopInputThrottle() {
     clearInterval(throttleTimer);
     throttleTimer = null;
   }
-  flushRelInput(); // flush remaining deltas on unlock
+  flushRelInput();
 }
 
-// Raw CSV protocol (no JSON overhead):
-//   mr,dx,dy     — relative mouse move
-//   ma,x,y       — absolute mouse move
-//   md,button    — mouse button down (1=left, 2=middle, 3=right)
-//   mu,button    — mouse button up
-//   ms,deltaY    — scroll wheel
-//   kd,code      — key down (using KeyboardEvent.code)
-//   ku,code      — key up
 function sendInput(csv) {
-  // Track cursor position locally for overlay
   if (csv.startsWith('ma,')) {
     const parts = csv.split(',');
     localCursorX = parseInt(parts[1], 10);
@@ -312,16 +585,21 @@ function sendInput(csv) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(csv);
   }
-  // drop silently when not connected
 }
 
 function connect() {
+  // Release any stuck modifiers before reconnecting
+  releaseAllModifiers();
+  // Close existing connection before opening a new one
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.close();
+  }
   setStatus('Connecting...', false);
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
     setStatus('Connected', true);
-    reconnectDelay = 1000; // reset backoff on successful connection
+    reconnectDelay = 1000;
     ws.send(JSON.stringify({ type: 'ready' }));
   };
 
@@ -344,13 +622,10 @@ function connect() {
               candidate: msg.candidate,
               sdpMLineIndex: msg.sdp_mline_index,
             }));
-          } catch (e) {
-            // ignore minor ICE errors
-          }
+          } catch (e) {}
         }
         break;
       case 'cursor':
-        // Server sends authoritative cursor position (for drift correction)
         if (typeof msg.x === 'number' && typeof msg.y === 'number') {
           localCursorX = msg.x;
           localCursorY = msg.y;
@@ -365,6 +640,7 @@ function connect() {
   };
 
   ws.onclose = () => {
+    releaseAllModifiers();
     setStatus('Disconnected, retrying...', false);
     cursorOverlay.style.display = 'none';
     if (pc) { pc.close(); pc = null; }
@@ -373,32 +649,26 @@ function connect() {
   };
 
   ws.onerror = () => {
+    releaseAllModifiers();
     ws.close();
   };
 }
 
 async function handleOffer(sdp) {
-  // Clean up any previous PC before starting new negotiation
   if (pc) { pc.close(); pc = null; }
 
   setStatus('Negotiating...', false);
 
-  // Build RTCPeerConnection config to match server-side STUN setting
   const pcConfig = {};
   if (STUN_SERVER) {
-    // Convert stun://host:port (GStreamer format) → stun:host:port (browser format)
     pcConfig.iceServers = [{ urls: STUN_SERVER.replace('stun://', 'stun:') }];
   } else {
-    // STUN disabled on server → host-only candidates only
     pcConfig.iceServers = [];
     pcConfig.iceTransportPolicy = 'host';
   }
 
   pc = new RTCPeerConnection(pcConfig);
 
-  // No data channel needed — input is sent via WebSocket (lower overhead).
-
-  // Not using const to shadow
   pc.ontrack = (event) => {
     if (event.track.kind === 'video') {
       video.srcObject = event.streams[0];
@@ -406,10 +676,8 @@ async function handleOffer(sdp) {
         displayWidth = video.videoWidth;
         displayHeight = video.videoHeight;
         console.log(`[video] ${displayWidth}x${displayHeight}`);
-        // Center cursor overlay at initial position (0,0) until server syncs
         updateCursorOverlay();
       };
-      // Hide status text once video arrives
       setStatus('●', true);
       document.getElementById('status-text').style.opacity = '0';
       pointerHint.style.display = 'block';
@@ -426,7 +694,6 @@ async function handleOffer(sdp) {
     }
   };
 
-  // Monitor both connection states — abort on any failure
   const onConnectionFail = () => {
     if (!pc) return;
     const st = pc.connectionState;
@@ -448,7 +715,6 @@ async function handleOffer(sdp) {
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
 
-    // Confirm WebSocket is still open before sending answer
     if (ws.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket closed before answer could be sent');
     }
@@ -458,9 +724,6 @@ async function handleOffer(sdp) {
       sdp: answer.sdp,
     }));
 
-    // Watchdog: if ICE doesn't connect within 15s, restart negotiation
-    // This prevents permanent black screen when something goes wrong
-    // after the answer was sent (e.g. firewall blocks ICE, STUN unreachable)
     setTimeout(() => {
       if (pc && pc.connectionState !== 'connected' && pc.connectionState !== 'closed') {
         console.warn('[pc] negotiation timeout (15s), restarting');
@@ -476,8 +739,6 @@ async function handleOffer(sdp) {
   }
 }
 
-// Helper: get cursor position relative to video content in display coords.
-// Accounts for object-fit: contain letterboxing (black bars).
 function videoPos(clientX, clientY) {
   const rect = video.getBoundingClientRect();
   const elW = rect.width;
@@ -492,20 +753,17 @@ function videoPos(clientX, clientY) {
   let renderW, renderH, renderX, renderY;
 
   if (vidAspect > elAspect) {
-    // Video is wider than container → black bars top/bottom
     renderW = elW;
     renderH = elW / vidAspect;
     renderX = 0;
     renderY = (elH - renderH) / 2;
   } else {
-    // Video is taller than container → black bars left/right
     renderH = elH;
     renderW = elH * vidAspect;
     renderX = (elW - renderW) / 2;
     renderY = 0;
   }
 
-  // Convert to video-content-relative 0-1
   const x = (clientX - rect.left - renderX) / renderW;
   const y = (clientY - rect.top - renderY) / renderH;
 
@@ -517,7 +775,6 @@ function videoPos(clientX, clientY) {
   };
 }
 
-// Refresh display size from video track (call on resize/orientation change)
 function refreshDisplaySize() {
   const w = video.videoWidth;
   const h = video.videoHeight;
@@ -528,19 +785,17 @@ function refreshDisplaySize() {
   }
 }
 
-// Cancel any pending input accumulators (prevents stale events after touch end)
 function cancelPendingInputs() {
   relAccDx = 0;
   relAccDy = 0;
 }
 
-// Recompute display size on resize / orientation change
 window.addEventListener('resize', refreshDisplaySize);
 window.addEventListener('orientationchange', () => {
-  setTimeout(refreshDisplaySize, 300); // wait for layout to settle
+  setTimeout(refreshDisplaySize, 300);
 });
 
-// ── Mouse events (use touchActive flag + timestamp to skip synthesized touch events) ──
+// ── Mouse events ──
 let lastTouchEndTime = 0;
 
 function isSyntheticFromTouch() {
@@ -548,17 +803,14 @@ function isSyntheticFromTouch() {
 }
 
 document.addEventListener('mousemove', (e) => {
-  if (isSyntheticFromTouch()) return; // synthesized from touch
+  if (isSyntheticFromTouch()) return;
   refreshDisplaySize();
-  // Absolute position: update overlay immediately, throttle WS sends
   const pos = videoPos(e.clientX, e.clientY);
   if (pos) {
-    // Update overlay position immediately (smooth local tracking)
     localCursorX = pos.x;
     localCursorY = pos.y;
     capLocalCursor();
     updateCursorOverlay();
-    // Throttle WebSocket sends to avoid flooding X server
     const now = Date.now();
     if (now - lastAbsMoveTs >= THROTTLE_MS) {
       sendInput(`ma,${pos.x},${pos.y}`);
@@ -598,56 +850,38 @@ document.addEventListener('wheel', (e) => {
 }, { passive: false });
 
 // ── Touch events (trackpad mode) ──
-// Interaction model:
-//   Quick tap (<300ms, no movement)     → left click at current cursor position
-//   Finger slide                        → move remote cursor (relative displacement)
-//   Long press (>700ms, no move)        → right click at current cursor position
-//   Long press + vertical move          → scroll wheel
-//   Double-tap (<400ms) + hold + move   → drag mode (select text / scroll)
-//
-// Drag mode only triggers if the PREVIOUS touch was a tap (not a cursor move,
-// scroll, or drag). This prevents repeated scroll gestures from accidentally
-// entering drag mode.
-//
-// This is trackpad mode: touch position does NOT jump the cursor.
-// All movement is relative to finger displacement on the touch surface.
 let touchActive = false;
-let dragMode = false;       // second tap of double-tap → drag-selection enabled
-let dragStarted = false;    // mousedown(1) has been sent for an active drag
-let lastWasTap = false;     // previous touch ended as a tap (only this triggers drag init)
+let dragMode = false;
+let dragStarted = false;
+let lastWasTap = false;
 let longPressTimer = null;
 let lastTapTime = 0;
 let startTouchTime = 0;
-let touchStartX = 0;        // initial clientX (for tap-versus-slide detection)
-let touchStartY = 0;        // initial clientY
-let isLongPress = false;    // set by 500ms timer
-let longPressMoved = false; // finger moved after long press → scroll mode
-let cursorMoved = false;    // finger moved at all (any time)
-let lastScrollY = 0;        // last clientY for scroll delta accumulation
-// Relative-move tracking
-let lastTouchX = 0;         // previous clientX for delta calc
-let lastTouchY = 0;         // previous clientY for delta calc
-const MOVE_THRESHOLD = 15;   // min pixel movement to count as "moved"
-const SCROLL_THRESHOLD = 20; // pixels per scroll tick
-const TAP_TIME_MAX = 300;    // max ms for a quick tap (must also have cursorMoved==false)
-const LONG_PRESS_MS = 700;   // long-press activation time
-const DBL_TAP_MAX = 400;     // max gap between touches to trigger drag mode
-// Touch deltas are accumulated into relAccDx/relAccDy and flushed by the
-// throttle timer — matching the video framerate instead of the touch controller's
-// native rate, preventing redundant X11 MotionNotify events.
+let touchStartX = 0;
+let touchStartY = 0;
+let isLongPress = false;
+let longPressMoved = false;
+let cursorMoved = false;
+let lastScrollY = 0;
+let lastTouchX = 0;
+let lastTouchY = 0;
+const MOVE_THRESHOLD = 15;
+const SCROLL_THRESHOLD = 20;
+const TAP_TIME_MAX = 300;
+const LONG_PRESS_MS = 700;
+const DBL_TAP_MAX = 400;
 
 video.addEventListener('touchstart', (e) => {
   e.preventDefault();
-  lastTouchEndTime = Date.now();  // block synthetic mouse events during this touch
+  lastTouchEndTime = Date.now();
   const t = e.touches[0];
   refreshDisplaySize();
   clearTimeout(longPressTimer);
 
   const now = Date.now();
   if (lastWasTap && (now - lastTapTime < DBL_TAP_MAX) && lastTapTime > 0) {
-    // Double-tap detected: enter drag mode
     dragMode = true;
-    lastWasTap = false; // consume the tap so triple-tap doesn't re-enter
+    lastWasTap = false;
   } else {
     dragMode = false;
   }
@@ -664,10 +898,6 @@ video.addEventListener('touchstart', (e) => {
   cursorMoved = false;
   lastScrollY = t.clientY;
 
-  // Trackpad mode: do NOT send mousemove to touch position.
-  // The cursor stays wherever it was — only relative deltas move it.
-
-  // Long press timer → scroll or right-click mode
   if (!dragMode) {
     longPressTimer = setTimeout(() => {
       if (touchActive && !dragMode) {
@@ -691,15 +921,12 @@ video.addEventListener('touchmove', (e) => {
   if (!moved) return;
 
   if (dragMode) {
-    // Double-tap drag: use relative movement while holding
     if (!dragStarted) {
       clearTimeout(longPressTimer);
       cancelPendingInputs();
       dragStarted = true;
-      // Send mousedown at current cursor position (no jump)
       sendInput('md,1');
     }
-    // Accumulate relative delta for throttled send
     cursorMoved = true;
     const deltaXDrag = Math.round(t.clientX - lastTouchX);
     const deltaYDrag = Math.round(t.clientY - lastTouchY);
@@ -708,14 +935,12 @@ video.addEventListener('touchmove', (e) => {
     if (deltaXDrag !== 0 || deltaYDrag !== 0) {
       relAccDx += deltaXDrag;
       relAccDy += deltaYDrag;
-      // Update overlay position IMMEDIATELY drag cursor
       localCursorX += deltaXDrag;
       localCursorY += deltaYDrag;
       capLocalCursor();
       updateCursorOverlay();
     }
   } else if (isLongPress) {
-    // Long press + move → scroll mode
     longPressMoved = true;
     const scrollDy = t.clientY - lastScrollY;
     if (Math.abs(scrollDy) >= SCROLL_THRESHOLD) {
@@ -727,7 +952,6 @@ video.addEventListener('touchmove', (e) => {
       lastScrollY = t.clientY;
     }
   } else {
-    // DEFAULT: trackpad cursor mode — accumulate delta for throttled send
     cursorMoved = true;
     const deltaX = Math.round(t.clientX - lastTouchX);
     const deltaY = Math.round(t.clientY - lastTouchY);
@@ -736,7 +960,6 @@ video.addEventListener('touchmove', (e) => {
     if (deltaX !== 0 || deltaY !== 0) {
       relAccDx += deltaX;
       relAccDy += deltaY;
-      // Update overlay position IMMEDIATELY for responsive touch cursor
       localCursorX += deltaX;
       localCursorY += deltaY;
       capLocalCursor();
@@ -754,22 +977,18 @@ video.addEventListener('touchend', (e) => {
 
   if (touchActive) {
     if (dragStarted) {
-      // End drag selection
       sendInput('mu,1');
       dragMode = false;
-      lastWasTap = false; // drag → not a tap
+      lastWasTap = false;
     } else if (isLongPress && !longPressMoved) {
-      // Long press + no movement → right-click at current cursor position
       sendInput('md,3');
       sendInput('mu,3');
       lastWasTap = false;
     } else if (touchDuration < TAP_TIME_MAX && !cursorMoved) {
-      // Quick tap (< 300ms, no finger movement): left click at current cursor position
       sendInput('md,1');
       sendInput('mu,1');
-      lastWasTap = true; // ← only set after a genuine tap!
+      lastWasTap = true;
     } else {
-      // Deliberate slide / scroll → not a tap
       lastWasTap = false;
     }
   }
@@ -784,9 +1003,8 @@ video.addEventListener('touchend', (e) => {
   isLongPress = false;
 }, { passive: false });
 
-// ── Keyboard events (work without pointer lock) ──
+// ── Keyboard events (physical keyboard) ──
 document.addEventListener('keydown', (e) => {
-  // F11 → toggle fullscreen instead of sending to remote
   if (e.code === 'F11') {
     e.preventDefault();
     fsBtn.click();
@@ -808,7 +1026,6 @@ setTimeout(() => {
   pointerHint.style.display = 'none';
 }, 4000);
 
-// Hide hint on first interaction
 function hideHint() {
   pointerHint.style.display = 'none';
   document.removeEventListener('touchstart', hideHint);
@@ -817,15 +1034,11 @@ function hideHint() {
 document.addEventListener('touchstart', hideHint);
 document.addEventListener('mousedown', hideHint);
 
-// ── Context menu prevention ──
 document.addEventListener('contextmenu', (e) => {
   e.preventDefault();
 });
 
 // ── Fullscreen toggle ──
-const fsBtn = document.getElementById('fullscreen-btn');
-const container = document.getElementById('container');
-
 function updateFsButton() {
   fsBtn.textContent = document.fullscreenElement ? 'Exit' : 'Fullscreen';
 }
@@ -840,7 +1053,229 @@ fsBtn.addEventListener('click', () => {
 
 document.addEventListener('fullscreenchange', updateFsButton);
 
-// ── Audio unmute on first interaction (keep muted for autoplay) ──
+// ── Custom Virtual Keyboard ──
+const keyboard = document.getElementById('custom-keyboard');
+const kbdBtn = document.getElementById('kbd-btn');
+const allLayers = keyboard.querySelectorAll('.kbd-layer');
+const layerBtns = keyboard.querySelectorAll('.kbd-layer-btn');
+const dismissBtn = keyboard.querySelector('.kbd-dismiss');
+const allKeys = keyboard.querySelectorAll('.kbd-key');
+
+let keyboardVisible = false;
+let currentLayer = 'main';
+
+// Modifier key state
+const MOD_CODES = ['ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight', 'AltLeft', 'AltRight'];
+const modState = {};
+for (const code of MOD_CODES) {
+  modState[code] = { active: false, latched: false, timer: null };
+}
+
+function updateModVisual(code) {
+  const state = modState[code];
+  // Update all buttons with this data-code
+  keyboard.querySelectorAll(`.kbd-key[data-code="${code}"]`).forEach(el => {
+    el.classList.remove('mod-latched', 'mod-locked', 'mod-active');
+    if (state.active && state.latched) {
+      el.classList.add('mod-latched', 'mod-active');
+    } else if (state.active && !state.latched) {
+      el.classList.add('mod-locked', 'mod-active');
+    }
+  });
+}
+
+function releaseLatchedMods() {
+  for (const code of Object.keys(modState)) {
+    const m = modState[code];
+    if (m.active && m.latched) {
+      sendInput(`ku,${code}`);
+      m.active = false;
+      m.latched = false;
+      clearTimeout(m.timer);
+      m.timer = null;
+      updateModVisual(code);
+    }
+  }
+}
+
+function releaseAllModifiers() {
+  for (const code of Object.keys(modState)) {
+    const m = modState[code];
+    if (m.active) {
+      sendInput(`ku,${code}`);
+    }
+    clearTimeout(m.timer);
+    m.active = false;
+    m.latched = false;
+    m.timer = null;
+    updateModVisual(code);
+  }
+}
+
+function handleModKey(code) {
+  const m = modState[code];
+  if (!m) return;
+
+  if (m.active) {
+    // Toggle off (release)
+    sendInput(`ku,${code}`);
+    m.active = false;
+    m.latched = false;
+    clearTimeout(m.timer);
+    m.timer = null;
+    updateModVisual(code);
+    return;
+  }
+
+  // Press
+  sendInput(`kd,${code}`);
+  m.active = true;
+
+  if (m.timer) {
+    // Second click within timer window → lock
+    clearTimeout(m.timer);
+    m.timer = null;
+    m.latched = false;
+    updateModVisual(code);
+    return;
+  }
+
+  // First click: start timer for latch detection
+  m.timer = setTimeout(() => {
+    m.timer = null;
+    m.latched = true;
+    updateModVisual(code);
+  }, 300);
+}
+
+function handleNormalKey(code) {
+  // 1. Send key press (modifier keys are still active, enabling combos)
+  sendInput(`kd,${code}`);
+  // 2. Send key release
+  sendInput(`ku,${code}`);
+  // 3. Release all latched modifiers (single-click auto-release)
+  for (const modCode of Object.keys(modState)) {
+    const m = modState[modCode];
+    if (m.active && m.latched) {
+      sendInput(`ku,${modCode}`);
+      m.active = false;
+      m.latched = false;
+      clearTimeout(m.timer);
+      m.timer = null;
+      updateModVisual(modCode);
+    }
+  }
+}
+
+function handleKeyUp(code) {
+  // Normal keys already released in handleNormalKey; modifiers managed by latch/lock logic
+}
+
+// Layer switching
+function switchLayer(layer) {
+  if (layer === 'main' && currentLayer === 'main') return; // already main
+  if (layer === currentLayer) {
+    // Toggle back to main
+    layer = 'main';
+  }
+  currentLayer = layer;
+  allLayers.forEach(l => l.classList.toggle('active', l.dataset.layer === layer));
+  layerBtns.forEach(btn => {
+    const target = btn.dataset.target;
+    btn.classList.toggle('layer-active', target === layer);
+  });
+}
+
+// Pointer events for keyboard keys
+function getCode(el) {
+  const key = el.closest('.kbd-key');
+  return key ? key.dataset.code : null;
+}
+
+keyboard.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  const key = e.target.closest('.kbd-key');
+  if (!key) return;
+  const code = key.dataset.code;
+  if (!code) return;
+
+  // Set pointer capture so we get the up event even if pointer leaves the element
+  try { key.setPointerCapture(e.pointerId); } catch(_) {}
+
+  if (MOD_CODES.includes(code)) {
+    handleModKey(code);
+  } else {
+    handleNormalKey(code);
+  }
+});
+
+keyboard.addEventListener('pointerup', (e) => {
+  const key = e.target.closest('.kbd-key');
+  if (!key) return;
+  const code = key.dataset.code;
+  if (!code) return;
+  handleKeyUp(code);
+});
+
+keyboard.addEventListener('pointerleave', (e) => {
+  // Release all pressed normal keys when pointer leaves keyboard
+  // (safety net for edge cases)
+});
+
+// Layer switch buttons (Fn, 123)
+layerBtns.forEach(btn => {
+  btn.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = btn.dataset.target;
+    if (target === 'func' || target === 'num') {
+      switchLayer(target);
+    }
+  });
+});
+
+// Dismiss button
+dismissBtn.addEventListener('click', (e) => {
+  e.preventDefault();
+  hideKeyboard();
+});
+
+// Keyboard toggle from toolbar
+kbdBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (keyboardVisible) {
+    hideKeyboard();
+  } else {
+    showKeyboard();
+  }
+});
+
+function showKeyboard() {
+  keyboardVisible = true;
+  keyboard.classList.add('visible');
+  document.body.classList.add('kbd-open');
+  currentLayer = 'main';
+  allLayers.forEach(l => l.classList.toggle('active', l.dataset.layer === 'main'));
+  layerBtns.forEach(btn => btn.classList.remove('layer-active'));
+}
+
+function hideKeyboard() {
+  keyboardVisible = false;
+  keyboard.classList.remove('visible');
+  document.body.classList.remove('kbd-open');
+  // Reset to main layer
+  switchLayer('main');
+  // Release all modifier states (sends ku for any active modifiers)
+  releaseAllModifiers();
+}
+
+// Click on video area → hide keyboard
+container.addEventListener('click', (e) => {
+  if (keyboardVisible && !e.target.closest('#toolbar')) {
+    hideKeyboard();
+  }
+});
+
+// ── Audio unmute ──
 const audioHint = document.getElementById('audio-hint');
 let audioEnabled = false;
 
@@ -853,11 +1288,9 @@ function enableAudio() {
   document.removeEventListener('touchstart', enableAudio);
 }
 
-// Show audio hint after video starts playing
 video.addEventListener('playing', () => {
   if (!audioEnabled) {
     audioHint.style.display = 'block';
-    // Auto-hide after 8 seconds
     setTimeout(() => { audioHint.style.display = 'none'; }, 8000);
   }
 });
@@ -867,14 +1300,9 @@ document.addEventListener('touchstart', enableAudio);
 
 // ── Start ──
 connect();
-// Start the relative-move throttle timer — always running from page load
-// so touch and pointer-lock input both get flushed at ~28fps.
 startInputThrottle();
-// Show the cursor overlay immediately (center of screen) — it will be
-// repositioned once video metadata and server cursor position arrive.
 setTimeout(updateCursorOverlay, 100);
 
-// For debugging
 window.econsole = console;
 </script>
 </body>

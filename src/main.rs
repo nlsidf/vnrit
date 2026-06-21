@@ -1120,6 +1120,12 @@ fn code_to_keysym(code: &str) -> u32 {
         "Semicolon" => 0x003b,
         "Quote" => 0x0027,
         "Backquote" => 0x0060,
+        "PrintScreen" => 0xff61,   // XK_Print
+        "ScrollLock" => 0xff14,    // XK_Scroll_Lock
+        "Pause" => 0xff13,         // XK_Pause
+        "Break" => 0xff6b,         // XK_Break
+        "SysRq" => 0xff15,         // XK_Sys_Req
+        "NumLock" => 0xff7f,       // XK_Num_Lock
         "Comma" => 0x002c,
         "Period" => 0x002e,
         "Slash" => 0x002f,
@@ -1140,6 +1146,7 @@ fn code_to_keysym(code: &str) -> u32 {
             "NumpadSubtract" => 0xffad,
             "NumpadMultiply" => 0xffaa,
             "NumpadDivide" => 0xffaf,
+            "NumpadDecimal" => 0xffae,
             _ => return 0,
         },
         k if k.starts_with('F') && k.len() <= 4 => {
