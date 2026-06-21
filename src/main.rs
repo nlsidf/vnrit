@@ -1,5 +1,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use anyhow::{Context, Result};
 use axum::{
@@ -286,10 +287,8 @@ struct AppState {
     root: xproto::Window,
     cursor_x: AtomicI32,
     cursor_y: AtomicI32,
-    // Cached keyboard mapping (fetched once on start) to convert keysym → keycode
-    keysyms: Vec<u32>,
-    keysyms_per_keycode: u8,
-    first_keycode: u8,
+    // O(1) keysym → keycode lookup, built on init
+    keycode_cache: HashMap<u32, u8>,
 }
 
 #[tokio::main]
@@ -592,9 +591,19 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         root,
         cursor_x: AtomicI32::new(ptr.root_x as i32),
         cursor_y: AtomicI32::new(ptr.root_y as i32),
-        keysyms: kbd.keysyms.to_vec(),
-        keysyms_per_keycode: kbd.keysyms_per_keycode,
-        first_keycode,
+        keycode_cache: {
+            let kpk = kbd.keysyms_per_keycode as usize;
+            let mut m = HashMap::new();
+            for (i, chunk) in kbd.keysyms.chunks(kpk).enumerate() {
+                let kc = first_keycode + i as u8;
+                for &ks in chunk {
+                    if ks != 0 {
+                        m.entry(ks).or_insert(kc);
+                    }
+                }
+            }
+            m
+        },
     }));
 
     let mut pipeline_holder = Some(gst::Pipeline::new());
@@ -1024,12 +1033,18 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
         }
         "ms" if parts.len() >= 2 => {
             // ms,deltaY — scroll wheel (click 4=up, 5=down)
+            // Scale: every ~40 pixels = 1 click, clamp to 1-20 to handle fast swipes
             let delta: f64 = parts[1].parse().unwrap_or(0.0);
-            let btn = if delta > 0.0 { 5 } else { 4 };
-            let _ = xtest::fake_input(&s.conn, X11_BUTTON_PRESS,
-                btn, 0, s.root, s.cursor_x.load(Ordering::Relaxed) as i16, s.cursor_y.load(Ordering::Relaxed) as i16, 0);
-            let _ = xtest::fake_input(&s.conn, X11_BUTTON_RELEASE,
-                btn, 0, s.root, s.cursor_x.load(Ordering::Relaxed) as i16, s.cursor_y.load(Ordering::Relaxed) as i16, 0);
+            let steps = (delta.abs() / 40.0).round().clamp(1.0, 20.0) as u32;
+            let btn = if delta > 0.0 { 5_u8 } else { 4_u8 };
+            let cx = s.cursor_x.load(Ordering::Relaxed) as i16;
+            let cy = s.cursor_y.load(Ordering::Relaxed) as i16;
+            for _ in 0..steps {
+                let _ = xtest::fake_input(&s.conn, X11_BUTTON_PRESS,
+                    btn, 0, s.root, cx, cy, 0);
+                let _ = xtest::fake_input(&s.conn, X11_BUTTON_RELEASE,
+                    btn, 0, s.root, cx, cy, 0);
+            }
             let _ = s.conn.flush();
         }
         "kd" if parts.len() >= 2 => {
@@ -1076,17 +1091,9 @@ fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &Arc<Mutex<AppSta
     let _ = out_tx.try_send(Message::Text(msg.into()));
 }
 
-/// Look up X11 keycode for a given keysym using cached keyboard mapping.
+/// Look up X11 keycode for a given keysym using the pre-built HashMap cache.
 fn find_keycode(s: &AppState, keysym: u32) -> u8 {
-    let kpk = s.keysyms_per_keycode as usize;
-    for (i, chunk) in s.keysyms.chunks(kpk).enumerate() {
-        for &ks in chunk {
-            if ks == keysym {
-                return s.first_keycode + i as u8;
-            }
-        }
-    }
-    0
+    s.keycode_cache.get(&keysym).copied().unwrap_or(0)
 }
 
 /// Convert browser KeyboardEvent.code to X11 keysym (u32).
@@ -1129,7 +1136,7 @@ fn code_to_keysym(code: &str) -> u32 {
         "Comma" => 0x002c,
         "Period" => 0x002e,
         "Slash" => 0x002f,
-        "IntlBackslash" => 0x005c,
+        "Backslash" | "IntlBackslash" => 0x005c,
         k if k.starts_with("Numpad") => match k {
             "Numpad0" => 0xffb0,
             "Numpad1" => 0xffb1,

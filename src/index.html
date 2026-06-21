@@ -47,6 +47,13 @@
     position: relative;
     cursor: none;
   }
+  #viewport {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    overflow: hidden;
+    transition: transform 0.22s cubic-bezier(0.33, 1, 0.68, 1);
+  }
   video {
     width: 100%;
     height: 100%;
@@ -159,7 +166,7 @@
     bottom: 0;
     left: 0;
     width: 100%;
-    height: 46vh;
+    height: 38vh;
     background: rgba(18,18,22,0.92);
     -webkit-backdrop-filter: blur(12px);
     backdrop-filter: blur(12px);
@@ -189,7 +196,7 @@
   }
   .kbd-row {
     display: flex;
-    gap: 3px;
+    gap: 2px;
     justify-content: center;
     align-items: stretch;
     flex: 1;
@@ -201,7 +208,7 @@
     color: #ddd;
     border: 1px solid rgba(255,255,255,0.06);
     border-radius: 5px;
-    font-size: 13px;
+    font-size: 11px;
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -243,7 +250,7 @@
     box-shadow: inset 0 0 8px rgba(74,158,255,0.35);
   }
   .kbd-key.special {
-    font-size: 11px;
+    font-size: 9px;
   }
   .kbd-key .sub {
     font-size: 8px;
@@ -266,8 +273,8 @@
     color: #999;
     border: 1px solid rgba(255,255,255,0.06);
     border-radius: 5px;
-    padding: 5px 10px;
-    font-size: 11px;
+    padding: 3px 6px;
+    font-size: 9px;
     cursor: pointer;
     touch-action: none;
     -webkit-tap-highlight-color: transparent;
@@ -305,10 +312,12 @@
 </div>
 
 <div id="container">
-  <video id="remote-video" autoplay playsinline muted></video>
-  <div id="cursor-overlay"></div>
-  <div id="pointer-hint">Click to interact<br><small>(right-click for menu)</small></div>
-  <div id="audio-hint">Tap to enable audio</div>
+  <div id="viewport">
+    <video id="remote-video" autoplay playsinline muted></video>
+    <div id="cursor-overlay"></div>
+    <div id="pointer-hint">Click to interact<br><small>(right-click for menu)</small></div>
+    <div id="audio-hint">Tap to enable audio</div>
+  </div>
   <!-- 工具栏移入 container 内部，全屏时可见 -->
   <div id="toolbar">
     <button id="fullscreen-btn">Fullscreen</button>
@@ -486,6 +495,7 @@ const statusText = document.getElementById('status-text');
 const pointerHint = document.getElementById('pointer-hint');
 const fsBtn = document.getElementById('fullscreen-btn');
 const container = document.getElementById('container');
+const viewport = document.getElementById('viewport');
 
 let pc = null;
 let ws = null;
@@ -503,13 +513,36 @@ function updateCursorOverlay() {
   const elW = rect.width, elH = rect.height;
   if (elW <= 0 || elH <= 0) return;
 
-  const vidW = displayWidth, vidH = displayHeight;
-  if (vidW <= 0 || vidH <= 0) {
+  if (displayWidth <= 0 || displayHeight <= 0) {
     cursorOverlay.style.left = (elW / 2) + 'px';
     cursorOverlay.style.top = (elH / 2) + 'px';
     cursorOverlay.style.display = 'block';
     return;
   }
+
+  const r = getVideoRenderRect();
+  if (!r) return;
+
+  const cssX = r.renderX + (localCursorX / displayWidth) * r.renderW;
+  const cssY = r.renderY + (localCursorY / displayHeight) * r.renderH;
+
+  cursorOverlay.style.left = cssX + 'px';
+  cursorOverlay.style.top = cssY + 'px';
+  cursorOverlay.style.display = 'block';
+}
+
+function capLocalCursor() {
+  localCursorX = Math.max(0, Math.min(displayWidth - 1, localCursorX));
+  localCursorY = Math.max(0, Math.min(displayHeight - 1, localCursorY));
+}
+
+// Shared: compute video render rect (letterboxed area accounting for aspect ratio)
+function getVideoRenderRect() {
+  const rect = video.getBoundingClientRect();
+  const elW = rect.width, elH = rect.height;
+  if (elW <= 0 || elH <= 0) return null;
+  const vidW = displayWidth, vidH = displayHeight;
+  if (vidW <= 0 || vidH <= 0) return null;
 
   const elAspect = elW / elH;
   const vidAspect = vidW / vidH;
@@ -527,17 +560,7 @@ function updateCursorOverlay() {
     renderY = 0;
   }
 
-  const cssX = renderX + (localCursorX / vidW) * renderW;
-  const cssY = renderY + (localCursorY / vidH) * renderH;
-
-  cursorOverlay.style.left = cssX + 'px';
-  cursorOverlay.style.top = cssY + 'px';
-  cursorOverlay.style.display = 'block';
-}
-
-function capLocalCursor() {
-  localCursorX = Math.max(0, Math.min(displayWidth - 1, localCursorX));
-  localCursorY = Math.max(0, Math.min(displayHeight - 1, localCursorY));
+  return { renderW, renderH, renderX, renderY };
 }
 
 function setStatus(text, connected) {
@@ -741,37 +764,17 @@ async function handleOffer(sdp) {
 
 function videoPos(clientX, clientY) {
   const rect = video.getBoundingClientRect();
-  const elW = rect.width;
-  const elH = rect.height;
-  const vidW = displayWidth;
-  const vidH = displayHeight;
-  if (vidW <= 0 || vidH <= 0 || elW <= 0 || elH <= 0) return null;
+  const r = getVideoRenderRect();
+  if (!r) return null;
 
-  const elAspect = elW / elH;
-  const vidAspect = vidW / vidH;
-
-  let renderW, renderH, renderX, renderY;
-
-  if (vidAspect > elAspect) {
-    renderW = elW;
-    renderH = elW / vidAspect;
-    renderX = 0;
-    renderY = (elH - renderH) / 2;
-  } else {
-    renderH = elH;
-    renderW = elH * vidAspect;
-    renderX = (elW - renderW) / 2;
-    renderY = 0;
-  }
-
-  const x = (clientX - rect.left - renderX) / renderW;
-  const y = (clientY - rect.top - renderY) / renderH;
+  const x = (clientX - rect.left - r.renderX) / r.renderW;
+  const y = (clientY - rect.top - r.renderY) / r.renderH;
 
   if (x < 0 || x > 1 || y < 0 || y > 1) return null;
 
   return {
-    x: Math.round(x * vidW),
-    y: Math.round(y * vidH)
+    x: Math.round(x * displayWidth),
+    y: Math.round(y * displayHeight)
   };
 }
 
@@ -1256,6 +1259,7 @@ function showKeyboard() {
   currentLayer = 'main';
   allLayers.forEach(l => l.classList.toggle('active', l.dataset.layer === 'main'));
   layerBtns.forEach(btn => btn.classList.remove('layer-active'));
+  requestAnimationFrame(() => adjustVideoForKeyboard(true));
 }
 
 function hideKeyboard() {
@@ -1266,7 +1270,21 @@ function hideKeyboard() {
   switchLayer('main');
   // Release all modifier states (sends ku for any active modifiers)
   releaseAllModifiers();
+  adjustVideoForKeyboard(false);
 }
+
+// Adjust container translate when keyboard shows/hides
+function adjustVideoForKeyboard(show) {
+  const kbdHeight = keyboard.offsetHeight;
+  const tbHeight = document.getElementById('toolbar').offsetHeight;
+  const offset = show ? (kbdHeight + tbHeight) : 0;
+  viewport.style.transform = `translateY(-${offset}px)`;
+}
+
+// Recalculate container offset on resize when keyboard is visible
+window.addEventListener('resize', () => {
+  if (keyboardVisible) adjustVideoForKeyboard(true);
+});
 
 // Click on video area → hide keyboard
 container.addEventListener('click', (e) => {
