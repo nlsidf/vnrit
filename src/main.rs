@@ -11,6 +11,7 @@ use axum::{
 };
 use clap::Parser;
 use glib;
+use glib::signal::SignalHandlerId;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_sdp::SDPMessage;
@@ -331,7 +332,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Message, axum::Error>>(256);
 
-    tokio::spawn(async move {
+    // Clone in_tx so the parent retains a copy for explicit close in cleanup
+    let in_tx_task = in_tx.clone();
+
+    let io_handle = tokio::spawn(async move {
         use futures_util::SinkExt;
         let (mut ws_sink, mut ws_stream) = ws.split();
         loop {
@@ -350,7 +354,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 incoming = ws_stream.next() => {
                     match incoming {
                         Some(Ok(msg)) => {
-                            if in_tx.send(Ok(msg)).await.is_err() {
+                            if in_tx_task.send(Ok(msg)).await.is_err() {
                                 break;
                             }
                         }
@@ -497,7 +501,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         first_keycode,
     }));
 
-    let pipeline = gst::Pipeline::new();
+    let mut pipeline_holder = Some(gst::Pipeline::new());
+    let pipeline = pipeline_holder.as_ref().expect("pipeline_holder should be Some");
 
     // ── webrtcbin ──
     let webrtcbin = gst::ElementFactory::make("webrtcbin")
@@ -625,17 +630,20 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     }
 
     // ── Signal handlers: connect before pipeline plays ──
+    let mut signal_handlers = Vec::<SignalHandlerId>::new();
     let ws_neg = out_tx.clone();
     let ws_ice = out_tx.clone();
 
-    // on-negotiation-needed
-    webrtcbin.connect_closure(
+    // on-negotiation-needed (core fix: use weak reference to break circular ref)
+    let wb_weak = webrtcbin.downgrade();
+    let handler_id = webrtcbin.connect_closure(
         "on-negotiation-needed",
         false,
         glib::closure!(|wb: gst::Element| {
             eprintln!("[webrtc] on-negotiation-needed fired");
             let ws = ws_neg.clone();
-            let wb2 = wb.clone();
+            // Clone the weak ref for the nested Promise closure
+            let wb_weak_inner = wb_weak.clone();
 
             // Note: input is now sent via WebSocket, not data channel.
             // No data channel needed — just video (and optionally audio) media tracks.
@@ -643,6 +651,14 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             // Promise for create-offer
             let promise = gst::Promise::with_change_func(move |result| {
                 eprintln!("[webrtc] create-offer promise resolved");
+                // Upgrade weak ref — if webrtcbin is gone, bail out immediately
+                let wb2 = match wb_weak_inner.upgrade() {
+                    Some(w) => w,
+                    None => {
+                        eprintln!("[webrtc] webrtcbin already destroyed, skipping offer creation");
+                        return;
+                    }
+                };
                 if let Ok(Some(reply)) = result {
                     if let Ok(offer) = reply.get::<gstreamer_webrtc::WebRTCSessionDescription>("offer") {
                         let sdp_text = offer.sdp().as_text().unwrap().to_string();
@@ -673,9 +689,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             wb.emit_by_name::<()>("create-offer", &[&opts, &promise]);
         }),
     );
+    signal_handlers.push(handler_id);
 
     // on-ice-candidate
-    webrtcbin.connect_closure(
+    let handler_id = webrtcbin.connect_closure(
         "on-ice-candidate",
         false,
         glib::closure!(|_: gst::Element, mline: u32, cand: String| {
@@ -689,6 +706,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             let _ = ws.try_send(Message::Text(msg.into()));
         }),
     );
+    signal_handlers.push(handler_id);
 
     // Start
     pipeline.set_state(gst::State::Playing).unwrap();
@@ -701,12 +719,20 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // ── ICE state logging via signal (no polling — fires once per state change) ──
     // We use notify::ice-connection-state so we only print when the state actually
     // changes, and a one-shot state-read after 2s for the initial state.
+    let ice_handle;
     {
-        let wb = webrtcbin.clone();
-        webrtcbin.connect_closure(
+        let wb_weak_ice = webrtcbin.downgrade();
+        let handler_id = webrtcbin.connect_closure(
             "notify::ice-connection-state",
             false,
             glib::closure!(|_: gst::Element, _pspec: glib::ParamSpec| {
+                let wb = match wb_weak_ice.upgrade() {
+                    Some(w) => w,
+                    None => {
+                        eprintln!("[ice] webrtcbin already destroyed");
+                        return;
+                    }
+                };
                 let cs: gstreamer_webrtc::WebRTCICEConnectionState =
                     wb.property("ice-connection-state");
                 let gs: gstreamer_webrtc::WebRTCICEGatheringState =
@@ -717,9 +743,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     cs, gs, ss);
             }),
         );
+        signal_handlers.push(handler_id);
         // Also read one-shot after initial delay so the browser gets a known starting state
         let wb_init = webrtcbin.clone();
-        tokio::spawn(async move {
+        ice_handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let cs: gstreamer_webrtc::WebRTCICEConnectionState =
                 wb_init.property("ice-connection-state");
@@ -779,8 +806,64 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         }
     }
 
-    let _ = pipeline.set_state(gst::State::Null);
-    eprintln!("[ws] client disconnected");
+    // ── CLEANUP: deterministic resource release ──
+    eprintln!("[cleanup] client disconnected, starting cleanup...");
+
+    // 0. Abort I/O task first — ensures the spawned WebSocket loop terminates,
+    //    preventing the main loop from blocking forever on channel recv.
+    eprintln!("[cleanup] aborting I/O task");
+    io_handle.abort();
+    let _ = io_handle.await;
+    drop(out_tx);
+    drop(in_tx);
+    eprintln!("[cleanup] I/O task terminated");
+
+    // Abort the one-shot ICE state reader if still pending (2s sleep)
+    ice_handle.abort();
+    let _ = ice_handle.await;
+
+    // 1. Disconnect all signal handlers to break signal → closure references
+    for handler_id in signal_handlers {
+        webrtcbin.disconnect(handler_id);
+    }
+    eprintln!("[cleanup] signal handlers disconnected");
+
+    // 2. Stop pipeline, flush bus, release elements
+    if let Some(p) = pipeline_holder.take() {
+        eprintln!("[cleanup] setting pipeline to NULL");
+        let _ = p.set_state(gst::State::Null);
+        // Wait up to 2 seconds for the NULL state transition to complete
+        let _ = p.state(gst::ClockTime::from_seconds(2));
+
+        // Drain bus messages (timed pop up to 2 seconds, then force flush)
+        if let Some(bus) = p.bus() {
+            for _ in 0..20 {
+                if bus.timed_pop(gst::ClockTime::from_mseconds(100)).is_some() {
+                    // Continue draining
+                } else {
+                    break;
+                }
+            }
+            while bus.pop().is_some() {}
+        }
+        eprintln!("[cleanup] bus drained");
+
+        // Remove webrtcbin from pipeline and force NULL state
+        let _ = p.remove(&webrtcbin);
+        let _ = webrtcbin.set_state(gst::State::Null);
+        eprintln!("[cleanup] webrtcbin set to NULL explicitly");
+
+        // Explicitly drop the pipeline
+        drop(p);
+        eprintln!("[cleanup] pipeline dropped");
+    }
+
+    // 3. Flush X11 connection
+    if let Ok(s) = state.lock() {
+        let _ = s.conn.flush();
+    }
+    drop(state);
+    eprintln!("[ws] client disconnected, cleanup complete");
 }
 
 fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
