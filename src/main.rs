@@ -4,8 +4,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use anyhow::{Context, Result};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::State,
-    response::{Html, IntoResponse},
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -33,6 +35,7 @@ use x11rb_protocol::xauth::get_auth;
 struct ServerState {
     args: Args,
     pulseaudio_available: bool,
+    token: Option<String>,
 }
 
 // X11 event opcodes used by XTest fake_input (standard X11 protocol values)
@@ -249,6 +252,19 @@ Examples: --height 720  produces a 720p stream
 Uses GStreamer videoscale + capsfilter in the encoding pipeline."
     )]
     height: i32,
+
+    #[arg(
+        long,
+        help = "Authentication token (if set, all connections require this token)",
+        long_help = "\
+If set, all HTTP and WebSocket connections must include a 'token' query parameter \
+or a 'token' cookie matching this value. The server sets a cookie on first successful \
+authentication so subsequent requests (including the WebSocket upgrade) can reuse it.
+
+Examples: vnrit --token mysecret
+          vnrit --token abc123 --port 9090"
+    )]
+    token: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -288,7 +304,8 @@ async fn main() -> Result<()> {
         .map(|o| o.status.success())
         .unwrap_or(false);
 
-    let state = ServerState { args, pulseaudio_available };
+    let token = args.token.clone();
+    let state = ServerState { args, pulseaudio_available, token };
 
     let addr = format!("0.0.0.0:{}", state.args.port);
     println!("vnrit listening on http://{}", addr);
@@ -302,10 +319,15 @@ async fn main() -> Result<()> {
         println!("  Scale  : native (no scaling)");
     }
     println!("  PulseAudio: {}", if state.pulseaudio_available { "yes" } else { "no" });
+    match &state.token {
+        Some(t) => println!("  Auth token: {} (required)", t),
+        None => println!("  Auth token: none (open access)"),
+    }
 
     let app = Router::new()
         .route("/", get(root_handler))
         .route("/ws", get(ws_handler))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -321,6 +343,80 @@ async fn root_handler(State(state): State<ServerState>) -> Html<String> {
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<ServerState>) -> impl IntoResponse {
     ws.on_upgrade(move |ws| handle_ws(ws, state))
+}
+
+/// Authentication middleware for token-based access control.
+///
+/// If `state.token` is `None`, all requests pass through (open access).
+/// If a token is set, the middleware checks:
+/// 1. Query parameter `?token=xxx` in the URL
+/// 2. `Cookie: token=xxx` header
+///
+/// On first successful authentication via query parameter, a `Set-Cookie`
+/// header is added so subsequent requests (including WebSocket upgrade)
+/// are authenticated via cookie.
+async fn auth_middleware(
+    State(state): State<ServerState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, Response> {
+    let expected_token = match &state.token {
+        Some(t) => t.clone(),
+        None => return Ok(next.run(req).await),
+    };
+
+    // Check query parameter: ?token=xxx
+    let query_token = req.uri().query().and_then(|q| {
+        for pair in q.split('&') {
+            let mut parts = pair.splitn(2, '=');
+            if parts.next() == Some("token") {
+                return parts.next().map(|v| v.to_string());
+            }
+        }
+        None
+    });
+
+    // Check Cookie header: Cookie: token=xxx
+    let cookie_token = req
+        .headers()
+        .get("Cookie")
+        .and_then(|c| c.to_str().ok())
+        .and_then(|c| {
+            for cookie in c.split(';') {
+                let trimmed = cookie.trim();
+                if let Some(val) = trimmed.strip_prefix("token=") {
+                    return Some(val.to_string());
+                }
+            }
+            None
+        });
+
+    let authenticated = query_token.as_deref() == Some(&expected_token)
+        || cookie_token.as_deref() == Some(&expected_token);
+
+    if !authenticated {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "unauthorized — provide ?token=<token> or Cookie: token=<token>",
+        )
+            .into_response());
+    }
+
+    let mut response = next.run(req).await;
+
+    // If authenticated via query param, set a cookie so subsequent requests
+    // (including WebSocket upgrade) are authenticated without the query param.
+    if query_token.as_deref() == Some(&expected_token) {
+        let cookie = format!(
+            "token={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400",
+            expected_token
+        );
+        response
+            .headers_mut()
+            .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+    }
+
+    Ok(response)
 }
 
 async fn handle_ws(ws: WebSocket, state: ServerState) {

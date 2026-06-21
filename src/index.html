@@ -176,7 +176,12 @@
 
 <script>
 const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-const wsUrl = `${wsProto}//${location.host}/ws`;
+const urlParams = new URLSearchParams(location.search);
+const authToken = urlParams.get('token');
+let wsUrl = `${wsProto}//${location.host}/ws`;
+if (authToken) {
+  wsUrl += `?token=${encodeURIComponent(authToken)}`;
+}
 const STUN_SERVER = '{{STUN_SERVER}}';
 const video = document.getElementById('remote-video');
 const dot = document.getElementById('dot');
