@@ -1195,6 +1195,11 @@ function getCode(el) {
   return key ? key.dataset.code : null;
 }
 
+// Block all click events inside the keyboard from bubbling to the container
+keyboard.addEventListener('click', (e) => {
+  e.stopPropagation();
+});
+
 keyboard.addEventListener('pointerdown', (e) => {
   e.preventDefault();
   const key = e.target.closest('.kbd-key');
@@ -1229,6 +1234,7 @@ keyboard.addEventListener('pointerleave', (e) => {
 layerBtns.forEach(btn => {
   btn.addEventListener('click', (e) => {
     e.preventDefault();
+    e.stopPropagation();
     const target = btn.dataset.target;
     if (target === 'func' || target === 'num') {
       switchLayer(target);
@@ -1239,6 +1245,7 @@ layerBtns.forEach(btn => {
 // Dismiss button
 dismissBtn.addEventListener('click', (e) => {
   e.preventDefault();
+  e.stopPropagation();
   hideKeyboard();
 });
 
@@ -1288,7 +1295,7 @@ window.addEventListener('resize', () => {
 
 // Click on video area → hide keyboard
 container.addEventListener('click', (e) => {
-  if (keyboardVisible && !e.target.closest('#toolbar')) {
+  if (keyboardVisible && !e.target.closest('#toolbar') && !e.target.closest('#custom-keyboard')) {
     hideKeyboard();
   }
 });
