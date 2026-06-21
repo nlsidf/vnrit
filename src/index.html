@@ -93,36 +93,41 @@
   }
   #toolbar {
     position: fixed;
-    bottom: 8px;
-    left: 50%;
-    transform: translateX(-50%);
+    bottom: 10px;
+    right: 10px;
+    left: auto;
+    transform: none;
     z-index: 50;
     display: flex;
-    gap: 6px;
-    opacity: 0.4;
+    flex-direction: column;
+    gap: 4px;
+    opacity: 0.35;
     transition: opacity 0.3s;
+    pointer-events: auto;
   }
-  #toolbar:hover {
+  #toolbar:hover,
+  #toolbar:active {
     opacity: 1;
   }
   #toolbar button {
-    background: rgba(0,0,0,0.55);
+    background: rgba(0,0,0,0.5);
     color: #ccc;
-    border: 1px solid rgba(255,255,255,0.15);
-    border-radius: 4px;
-    padding: 4px 10px;
-    font-size: 12px;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 5px;
+    padding: 3px 8px;
+    font-size: 11px;
     cursor: pointer;
     user-select: none;
+    touch-action: none;
   }
   #toolbar button:hover {
-    background: rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.12);
     color: #fff;
   }
   #kbd-btn {
-    font-size: 16px;
+    font-size: 14px;
     line-height: 1;
-    padding: 4px 8px;
+    padding: 2px 6px;
   }
   #audio-hint {
     position: absolute;
