@@ -1292,10 +1292,18 @@ function hideKeyboard() {
 
 // Adjust container translate when keyboard shows/hides
 function adjustVideoForKeyboard(show) {
-  const kbdHeight = keyboard.offsetHeight;
-  const tbHeight = document.getElementById('toolbar').offsetHeight;
-  const offset = show ? (kbdHeight + tbHeight) : 0;
-  viewport.style.transform = `translateY(-${offset}px)`;
+  const toolbar = document.getElementById('toolbar');
+  if (show) {
+    // 只偏移键盘高度，不加工具栏高度 → 消除空隙
+    const kbdHeight = keyboard.offsetHeight;
+    viewport.style.transform = `translateY(-${kbdHeight}px)`;
+    // 隐藏工具栏
+    toolbar.style.display = 'none';
+  } else {
+    viewport.style.transform = 'translateY(0)';
+    // 恢复工具栏
+    toolbar.style.display = 'flex';
+  }
 }
 
 // Recalculate container offset on resize when keyboard is visible
