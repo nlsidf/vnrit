@@ -1,7 +1,10 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -13,29 +16,53 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use glib;
-use glib::signal::SignalHandlerId;
-use gstreamer as gst;
-use gstreamer::prelude::*;
-use gstreamer_sdp::SDPMessage;
-use gstreamer_webrtc::{WebRTCSDPType, WebRTCSessionDescription};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use tokio::sync::mpsc;
 use futures_util::StreamExt;
 use std::os::unix::net::UnixStream;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{self};
+use x11rb::protocol::xproto::{self, Window};
+use x11rb::protocol::shm::{self, Seg};
 use x11rb::protocol::xtest;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 use x11rb_protocol::xauth::get_auth;
 
+// ── webrtc-rs types ──
+use webrtc::peer_connection::{
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+    RTCConfigurationBuilder, RTCIceServer, RTCPeerConnectionIceEvent,
+    RTCSessionDescription, RTCIceGatheringState, RTCPeerConnectionState,
+    RTCIceCandidateInit, MediaEngine, register_default_interceptors, Registry,
+};
+use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
+use webrtc::media_stream::track_local::TrackLocal;
+use webrtc::media_stream::{MediaStreamTrack, Track};
+use webrtc::runtime;
+use rtc_media::Sample;
+use rtc::rtp_transceiver::rtp_sender::{
+    RtpCodecKind, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
+    RTCRtpEncodingParameters,
+};
+use rtc::peer_connection::configuration::media_engine::MIME_TYPE_H264;
+
+// ── openh264 ──
+use openh264::encoder::{Encoder, EncoderConfig, BitRate, FrameRate, UsageType, RateControlMode, IntraFramePeriod, Profile};
+use openh264::formats::YUVBuffer;
+use openh264::OpenH264API;
+
+// ── image scaling ──
+use image::RgbaImage;
+
+use bytes::Bytes;
+use rand::Rng;
+use async_trait::async_trait;
+use std::os::fd::IntoRawFd;
+
 /// Shared state passed via axum State to every WebSocket handler.
-/// Parsed once at startup, avoiding repeated work per connection.
 #[derive(Clone)]
 struct ServerState {
-    args: Args,
-    pulseaudio_available: bool,
+    args: Arc<Args>,
     token: Option<String>,
 }
 
@@ -50,7 +77,7 @@ const X11_MOTION_NOTIFY: u8 = 6;
 #[command(
     name = "vnrit",
     version,
-    about = "Lightweight X11 WebRTC streaming server",
+    about = "Lightweight X11 WebRTC streaming server (pure Rust)",
     long_about = "\
 vnrit streams an X11 display to one or more browsers over WebRTC.
 
@@ -60,70 +87,44 @@ vnrit streams an X11 display to one or more browsers over WebRTC.
 
 The frontend supports touch-to-mouse translation (one-finger move,
 two-finger scroll, tap = left click, long-press = right click).
+
+Uses pure Rust: webrtc-rs for WebRTC, openh264 for H.264 encoding,
+x11rb for X11 screen capture and input injection.
+No GStreamer dependency.
 ",
     after_help = "\
 ══════════════════════════════════════════════════════════════════
-                      D E T A I L E D   G U I D E
+                        V N R I T   G U I D E
 ══════════════════════════════════════════════════════════════════
 
-─── CODEC COMPARISON ────────────────────────────────────────────
+─── CODEC ──────────────────────────────���────────────────────────
 
-  openh264 (default)   Cisco open-source H.264/AVC encoder.
-                       Good balance of quality, speed and memory.
-                       Uses constrained-baseline profile.
+  H.264 (only) built-in via openh264 (Cisco OpenH264).
+  Constrained Baseline profile, real-time screen content mode.
 
-  h264                 Android MediaCodec hardware H.264 encoder
-                       (via NDK AMediaCodec). Leverages the GPU
-                       encoder (Adreno on Snapdragon) for lower CPU
-                       usage and potentially better latency.
-                       Use:  --codec h264
+─── RECOMMENDED COMMAND ────────────────────────────────────────
 
-  vp8 / vp9            libvpx VP8/VP9 encoders.
-                       Higher quality per bitrate but more memory
-                       and CPU overhead than H.264 options on ARM.
+  vnrit --height 720 --bitrate 500
 
-  Measured memory (720p 500kbps, client connected):
-    openh264  ~50 MB RSS
-    h264      ~48 MB RSS   (hardware encoder)
-    vp8       ~64 MB RSS
-
-─── RECOMMENDED COMMAND ─────────────────────────────────────────
-
-  vnrit --codec h264 --height 720 --bitrate 500
-
-  This gives the best balance on Snapdragon 835:
-    • Hardware H.264 encoding (lowest CPU + memory)
-    • 720p downscale (good clarity, low bandwidth)
-    • 500 kbps bitrate (smooth GUI at ~3 MB/min)
+  • 720p downscale (good clarity, low bandwidth)
+  • 500 kbps bitrate (smooth GUI at ~3 MB/min)
 
 ─── BITRATE RECOMMENDATIONS ─────────────────────────────────────
 
-  720p @ 24 fps with recommended codec (openh264 / h264):
+  720p @ 24 fps:
 
     300 kbps    Low quality, usable for text terminals
     500 kbps    Good quality for GUI desktops (recommended)
     1000 kbps   High quality, default setting
     2000+ kbps  Near-lossless on static content
 
-  Higher framerates (--framerate 30/60) may require higher bitrate.
-
 ─── STREAM SCALING ──────────────────────────────────────────────
 
   By default vnrit streams at the desktop's native resolution
-  (e.g. 1920×1080). Use --height to downscale on the server side:
+  (e.g. 1920x1080). Use --height to downscale on the server side:
 
     vnrit --height 720       # stream at 720p (maintains aspect ratio)
-    vnrit --height 480       # stream at 480p  (low bandwidth)
-
-  Scaling reduces bandwidth AND encoding CPU, which is valuable
-  on ARM devices. Uses videoscale + capsfilter in the pipeline.
-
-─── AUDIO ────────────────────────────────────────────────────────
-
-  vnrit detects PulseAudio at startup and, if available, adds an
-  audio pipeline: pulsesrc → audio/x-raw → opusenc → rtpopuspay
-  → webrtcbin. The browser receives stereo Opus audio alongside
-  the video stream.
+    vnrit --height 480       # stream at 480p (low bandwidth)
 
 ─── INPUT (WebSocket Protocol) ──────────────────────────────────
 
@@ -143,30 +144,16 @@ two-finger scroll, tap = left click, long-press = right click).
 
 ─── EXAMPLES ────────────────────────────────────────────────────
 
-  # Stream display :1 on port 8080 with defaults (openh264, 1Mbps)
-  vnrit
-
-  # Custom display and port
-  vnrit --display :0 -p 9090
-
-  # Hardware H.264 encoding, 720p stream, 500 kbps
-  vnrit --codec h264 --height 720 --bitrate 500
-
-  # VP9 codec, 30 fps, low bandwidth
-  vnrit --codec vp9 --framerate 30 --bitrate 300
-
-  # Full quality, no scaling, 2 Mbps
-  vnrit --bitrate 2000
+  vnrit --display :1 -p 8080 --height 720 --bitrate 500
+  vnrit --display :0 --stun \"\"    # LAN only, no STUN
 
 ─── NOTES ───────────────────────────────────────────────────────
 
   - vnrit requires a running X11 server (Xvnc, Xvfb, or real X).
   - On Termux, it connects via the Unix socket at
     /data/data/com.termux/files/usr/tmp/.X11-unix/X<display>.
-  - Audio requires PulseAudio running on the system.
-  - Each browser tab creates a separate WebRTC connection: the
-    pipeline is rebuilt per-client (no multi-viewer sharing yet).
-  - Connect from multiple browsers simultaneously for multi-viewer.
+  - No audio supported (video-only).
+  - Each browser tab creates a separate WebRTC connection.
 "
 )]
 struct Args {
@@ -185,56 +172,27 @@ at /data/data/com.termux/files/usr/tmp/.X11-unix/X<number>."
         short = 'p',
         default_value = "8080",
         help = "HTTP/WebSocket listen port",
-        long_help = "TCP port for the HTTP server that serves the frontend page \
-and the WebSocket endpoint (/ws). Both are on the same port."
     )]
     port: u16,
 
     #[arg(
         long,
-        default_value = "openh264",
-        help = "Video codec to use",
-        long_help = "\
-Video encoder codec. Supported values:
-
-  openh264  Cisco H.264/AVC encoder (default).
-            Best all-rounder on ARM: ~50 MB RSS with client.
-
-  h264      Android MediaCodec hardware H.264 encoder.
-            Uses the GPU's hardware video encoder block (e.g. Adreno 540).
-            Slightly lower memory (~48 MB) and CPU usage than openh264.
-
-  vp8       libvpx VP8 encoder. Higher memory (~64 MB).
-
-  vp9       libvpx VP9 encoder. Higher memory, better compression.
-
-All codecs use 24 fps by default and output via RTP to WebRTC."
-    )]
-    codec: String,
-
-    #[arg(
-        long,
         default_value = "24",
         help = "Capture framerate in fps",
-        long_help = "Frames per second for X11 screen capture and encoding. \
-Higher values (30, 60) give smoother motion but increase CPU and bandwidth. \
-Lower values (10, 15) save bandwidth and CPU for mostly-static desktops."
     )]
     framerate: i32,
 
-#[arg(
-    long,
-    default_value = "stun://stun.cloudflare.com:3478",
-    help = "STUN server URL (set empty string to disable)"
-)]
-stun: String,
+    #[arg(
+        long,
+        default_value = "stun:stun.cloudflare.com:3478",
+        help = "STUN server URL (set empty string to disable)"
+    )]
+    stun: String,
 
     #[arg(
         long,
         default_value = "1000",
         help = "Target bitrate in kbps",
-        long_help = "Video encoder target bitrate in kilobits per second. \
-At 720p 24 fps: 300=low, 500=good, 1000=high(default), 2000+=near-lossless."
     )]
     bitrate: i32,
 
@@ -242,28 +200,17 @@ At 720p 24 fps: 300=low, 500=good, 1000=high(default), 2000+=near-lossless."
         long,
         default_value = "0",
         help = "Downscale stream height in pixels (0 = no scaling)",
-        long_help = "\
-If non-zero, the video stream is scaled down to the given height while \
-maintaining aspect ratio. This reduces bandwidth and encoding CPU usage.
-
-Examples: --height 720  produces a 720p stream
-          --height 480  produces a 480p stream
-          --height 0    uses the desktop's native resolution (default)
-
-Uses GStreamer videoscale + capsfilter in the encoding pipeline."
+        long_help = "If non-zero, the video stream is scaled down to the given height while \
+maintaining aspect ratio. This reduces bandwidth and encoding CPU usage."
     )]
     height: i32,
 
     #[arg(
         long,
         help = "Authentication token (if set, all connections require this token)",
-        long_help = "\
-If set, all HTTP and WebSocket connections must include a 'token' query parameter \
+        long_help = "If set, all HTTP and WebSocket connections must include a 'token' query parameter \
 or a 'token' cookie matching this value. The server sets a cookie on first successful \
-authentication so subsequent requests (including the WebSocket upgrade) can reuse it.
-
-Examples: vnrit --token mysecret
-          vnrit --token abc123 --port 9090"
+authentication so subsequent requests (including the WebSocket upgrade) can reuse it."
     )]
     token: Option<String>,
 }
@@ -281,35 +228,423 @@ enum SignalingMessage {
     Ready,
 }
 
-
 struct AppState {
-    conn: x11rb::rust_connection::RustConnection,
-    root: xproto::Window,
+    conn: RustConnection,
+    root: Window,
     cursor_x: AtomicI32,
     cursor_y: AtomicI32,
     // O(1) keysym → keycode lookup, built on init
     keycode_cache: HashMap<u32, u8>,
 }
 
+// ── ScreenCapture: SHM-accelerated X11 screen capture ──
+//
+// Uses MIT-SHM extension with server-allocated FD-based shared memory
+// (shm::create_segment). The X server writes pixels directly into a
+// shared memory buffer, avoiding per-frame socket transfer of pixel data.
+//
+// For a 1920×1080 display at 24 fps, this saves ~200 MB/s of X11 socket
+// bandwidth (1920 × 1080 × 4 B × 24 fps = ~198 MB/s).
+//
+// The FD-based approach (create_segment + mmap) works in Termux proot
+// because it uses mmap internally, unlike SysV IPC (shmget/shmat).
+//
+// Falls back to get_image if MIT-SHM extension is unavailable.
+//
+// ZPixmap format → pixel data is BGRA (4 bytes/pixel).
+
+struct ShmScreenCapture {
+    conn: Arc<Mutex<AppState>>,
+    width: u16,
+    height: u16,
+    shmseg: Seg,
+    shm_ptr: *mut u8,
+    shm_size: usize,
+    bpp: u8,
+}
+
+// Raw pointer access is Send+Sync for u8
+unsafe impl Send for ShmScreenCapture {}
+unsafe impl Sync for ShmScreenCapture {}
+
+impl ShmScreenCapture {
+    /// Try to create an SHM-accelerated capture. Returns None if SHM is
+    /// not available (MIT-SHM extension missing from X server).
+    fn try_new(conn: Arc<Mutex<AppState>>, width: u16, height: u16, depth: u8) -> Result<Option<Self>> {
+        // Calculate bytes-per-pixel for ZPixmap
+        // depth 24 → 4 bytes (32-bit padded), depth >24 → 4 bytes
+        let bpp = if depth >= 24 { 4u8 } else { ((depth as u32 + 7) / 8) as u8 };
+        let shm_size = (width as usize) * (height as usize) * (bpp as usize);
+
+        let s = conn.lock().unwrap();
+
+        // Query MIT-SHM version to verify availability
+        let ver = match shm::query_version(&s.conn) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(reply) => reply,
+                Err(e) => {
+                    eprintln!("[shm] MIT-SHM reply error: {:?}, falling back to get_image", e);
+                    return Ok(None);
+                }
+            },
+            Err(e) => {
+                eprintln!("[shm] MIT-SHM query failed: {}, falling back to get_image", e);
+                return Ok(None);
+            }
+        };
+
+        if ver.major_version == 0 && ver.minor_version == 0 {
+            eprintln!("[shm] MIT-SHM extension missing, falling back to get_image");
+            return Ok(None);
+        }
+
+        eprintln!("[shm] MIT-SHM v{}.{}, allocating {} bytes ({}x{}x{})",
+            ver.major_version, ver.minor_version, shm_size, width, height, depth);
+
+        let shmseg = s.conn.generate_id()
+            .context("failed to generate SHM seg ID")?;
+
+        // Ask the X server to allocate shared memory and return a file descriptor
+        let cookie = shm::create_segment(&s.conn, shmseg, shm_size as u32, false)
+            .context("SHM create_segment failed")?;
+        let reply = cookie.reply()
+            .context("SHM create_segment reply failed")?;
+
+        let raw_fd = reply.shm_fd.into_raw_fd();
+        drop(s); // release X11 lock before mmap
+
+        // Map the FD into our address space
+        let shm_ptr = unsafe {
+            let ptr = libc::mmap(
+                std::ptr::null_mut(),
+                shm_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                raw_fd,
+                0,
+            );
+            if ptr == libc::MAP_FAILED {
+                libc::close(raw_fd);
+                return Err(anyhow::anyhow!("mmap failed for SHM segment: size={}", shm_size));
+            }
+            ptr as *mut u8
+        };
+
+        // Close fd — mmap keeps a reference to the underlying file
+        unsafe { libc::close(raw_fd); }
+
+        eprintln!("[shm] segment allocated at {:?} ({} bytes)", shm_ptr, shm_size);
+
+        Ok(Some(ShmScreenCapture {
+            conn,
+            width,
+            height,
+            shmseg,
+            shm_ptr,
+            shm_size,
+            bpp,
+        }))
+    }
+
+    /// Capture the root window and return raw BGRA pixel data.
+    /// The X server writes directly to shared memory; we memcpy out.
+    fn capture(&self) -> Result<Vec<u8>> {
+        let s = self.conn.lock().unwrap();
+        let cookie = shm::get_image(
+            &s.conn,
+            s.root,   // drawable
+            0,        // x offset
+            0,        // y offset
+            self.width,
+            self.height,
+            !0,       // plane_mask = all planes
+            2,        // format = ZPixmap (hardcoded, matches xproto::ImageFormat::Z_PIXMAP)
+            self.shmseg,
+            0,        // offset in shared memory
+        ).context("SHM get_image failed")?;
+        let _reply = cookie.reply().context("SHM get_image reply failed")?;
+        drop(s); // release lock before memcpy
+
+        // Copy pixel data from shared memory (X server has written it by now)
+        let size = (self.width as usize) * (self.height as usize) * (self.bpp as usize);
+        let mut data = vec![0u8; size];
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.shm_ptr, data.as_mut_ptr(), size);
+        }
+        Ok(data)
+    }
+
+    #[allow(dead_code)]
+    fn dimensions(&self) -> (u16, u16) {
+        (self.width, self.height)
+    }
+}
+
+impl Drop for ShmScreenCapture {
+    fn drop(&mut self) {
+        unsafe {
+            // Unmap the shared memory region
+            libc::munmap(self.shm_ptr as *mut libc::c_void, self.shm_size);
+        }
+        // Detach the SHM segment from the X server
+        if let Ok(s) = self.conn.lock() {
+            let _ = shm::detach(&s.conn, self.shmseg);
+        }
+        eprintln!("[shm] cleaned up segment {:?}", self.shm_ptr);
+    }
+}
+
+/// Fallback screen capture using xproto::get_image (no SHM).
+/// Used when MIT-SHM extension is not available.
+struct FallbackCapture {
+    conn: Arc<Mutex<AppState>>,
+    width: u16,
+    height: u16,
+}
+
+impl FallbackCapture {
+    fn capture(&self) -> Result<Vec<u8>> {
+        let s = self.conn.lock().unwrap();
+        let cookie = xproto::get_image(
+            &s.conn,
+            xproto::ImageFormat::Z_PIXMAP,
+            s.root,
+            0, 0,
+            self.width, self.height,
+            !0, // plane_mask = all planes
+        ).context("get_image failed")?;
+        let reply = cookie.reply().context("get_image reply failed")?;
+        Ok(reply.data)
+    }
+
+    #[allow(dead_code)]
+    fn dimensions(&self) -> (u16, u16) {
+        (self.width, self.height)
+    }
+}
+
+/// Unified interface for both SHM-accelerated and fallback capture.
+enum ScreenCapture {
+    Shm(ShmScreenCapture),
+    Fallback(FallbackCapture),
+}
+
+impl ScreenCapture {
+    fn capture(&self) -> Result<Vec<u8>> {
+        match self {
+            ScreenCapture::Shm(s) => s.capture(),
+            ScreenCapture::Fallback(f) => f.capture(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn dimensions(&self) -> (u16, u16) {
+        match self {
+            ScreenCapture::Shm(s) => s.dimensions(),
+            ScreenCapture::Fallback(f) => f.dimensions(),
+        }
+    }
+}
+
+// ── Color conversion ──
+
+/// Scale BGRA image using the `image` crate.
+/// Converts BGRA → RGBA for scaling (scaling is pixel-position-based,
+/// channel order doesn't affect the interpolation result), then returns
+/// RGBA data.
+fn scale_bgra_image(bgra: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    // BGRA → RGBA: swap R (byte 2) and B (byte 0)
+    let rgba: Vec<u8> = bgra
+        .chunks_exact(4)
+        .flat_map(|p| [p[2], p[1], p[0], p[3]])
+        .collect();
+
+    let img = RgbaImage::from_raw(src_w, src_h, rgba).expect("invalid image dimensions");
+    let scaled = image::imageops::resize(&img, dst_w, dst_h, image::imageops::FilterType::CatmullRom);
+    scaled.into_raw() // RGBA data
+}
+
+/// Convert RGBA pixel data to I420 (YUV 4:2:0) planar format.
+/// Uses BT.601 full-range coefficients.
+fn rgba_to_i420(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let y_size = w * h;
+    let uv_size = (w / 2) * (h / 2);
+    let mut out = vec![0u8; y_size + 2 * uv_size];
+
+    let (y_plane, rest) = out.split_at_mut(y_size);
+    let (u_plane, v_plane) = rest.split_at_mut(uv_size);
+
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            let r = rgba[i] as f32;
+            let g = rgba[i + 1] as f32;
+            let b = rgba[i + 2] as f32;
+
+            let yy = (0.299 * r + 0.587 * g + 0.114 * b) as u8;
+            y_plane[y * w + x] = yy;
+
+            if x % 2 == 0 && y % 2 == 0 {
+                let uu = (-0.1687 * r - 0.3313 * g + 0.5 * b + 128.0) as u8;
+                let vv = (0.5 * r - 0.4187 * g - 0.0813 * b + 128.0) as u8;
+                let uv_idx = (y / 2) * (w / 2) + (x / 2);
+                u_plane[uv_idx] = uu;
+                v_plane[uv_idx] = vv;
+            }
+        }
+    }
+    out
+}
+
+/// Convert BGRA pixel data directly to I420 (YUV 4:2:0) planar format.
+/// Single-pass integer math — faster than two-pass BGRA→RGBA→I420.
+/// Uses BT.601 full-range coefficients.
+fn bgra_to_i420(bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let y_size = w * h;
+    let uv_size = (w / 2) * (h / 2);
+    let mut out = vec![0u8; y_size + 2 * uv_size];
+
+    let (y_plane, rest) = out.split_at_mut(y_size);
+    let (u_plane, v_plane) = rest.split_at_mut(uv_size);
+
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            // BGRA byte order: bgra[i]=B, [i+1]=G, [i+2]=R, [i+3]=A
+            let b = bgra[i] as i32;
+            let g = bgra[i + 1] as i32;
+            let r = bgra[i + 2] as i32;
+
+            // Y = (77*R + 150*G + 29*B) >> 8  (BT.601 full range)
+            let yy = ((77 * r + 150 * g + 29 * b) >> 8).clamp(0, 255) as u8;
+            y_plane[y * w + x] = yy;
+
+            if x % 2 == 0 && y % 2 == 0 {
+                // U = (-43*R - 85*G + 128*B) / 256 + 128
+                let u_val = (128 * b - 43 * r - 85 * g) / 256 + 128;
+                let v_val = (128 * r - 107 * g - 21 * b) / 256 + 128;
+                let uv_idx = (y / 2) * (w / 2) + (x / 2);
+                u_plane[uv_idx] = u_val.clamp(0, 255) as u8;
+                v_plane[uv_idx] = v_val.clamp(0, 255) as u8;
+            }
+        }
+    }
+    out
+}
+
+// ── VideoEncoder: wraps openh264 ──
+
+struct VideoEncoder {
+    inner: Encoder,
+    width: u32,
+    height: u32,
+}
+
+impl VideoEncoder {
+    fn new(args: &Args, width: u32, height: u32) -> Result<Self> {
+        let bitrate_bps = (args.bitrate as u32) * 1000;
+        let framerate = args.framerate as f32;
+
+        let config = EncoderConfig::new()
+            .bitrate(BitRate::from_bps(bitrate_bps))
+            .max_frame_rate(FrameRate::from_hz(framerate))
+            .usage_type(UsageType::ScreenContentRealTime)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(240))
+            .profile(Profile::Baseline);
+
+        let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
+            .context("failed to create openh264 encoder")?;
+
+        Ok(VideoEncoder {
+            inner: encoder,
+            width,
+            height,
+        })
+    }
+
+    fn encode(&mut self, i420: &[u8]) -> Result<Vec<u8>> {
+        let yuv = YUVBuffer::from_vec(i420.to_vec(), self.width as usize, self.height as usize);
+        let bitstream = self.inner
+            .encode(&yuv)
+            .context("openh264 encode failed")?;
+        Ok(bitstream.to_vec())
+    }
+
+    fn force_keyframe(&mut self) {
+        self.inner.force_intra_frame();
+    }
+}
+
+// ── WebrtcHandler: event handler for PeerConnection ──
+
+struct WebrtcHandler {
+    ice_tx: runtime::Sender<String>,
+    gather_complete_tx: runtime::Sender<()>,
+    connected_tx: runtime::Sender<()>,
+    done_tx: runtime::Sender<()>,
+}
+
+#[async_trait]
+impl PeerConnectionEventHandler for WebrtcHandler {
+    async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
+        eprintln!("[ice] candidate: {} ...", &event.candidate.address[..event.candidate.address.len().min(20)]);
+        if let Ok(init) = event.candidate.to_json() {
+            let msg = serde_json::to_string(&SignalingMessage::Ice {
+                candidate: init.candidate,
+                sdp_mline_index: init.sdp_mline_index.unwrap_or(0) as u32,
+            }).unwrap();
+            let _ = self.ice_tx.try_send(msg);
+        }
+    }
+
+    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        eprintln!("[ice] gathering state: {:?}", state);
+        if state == RTCIceGatheringState::Complete {
+            let _ = self.gather_complete_tx.try_send(());
+        }
+    }
+
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        eprintln!("[pc] connection state: {:?}", state);
+        match state {
+            RTCPeerConnectionState::Connected => {
+                let _ = self.connected_tx.try_send(());
+            }
+            RTCPeerConnectionState::Failed
+            | RTCPeerConnectionState::Disconnected
+            | RTCPeerConnectionState::Closed => {
+                let _ = self.done_tx.try_send(());
+            }
+            _ => {}
+        }
+    }
+
+    async fn on_signaling_state_change(&self, state: webrtc::peer_connection::RTCSignalingState) {
+        eprintln!("[pc] signaling state: {:?}", state);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  main() — server entry point
+// ═══════════════════════════════════════════════════════════════
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    gst::init().context("Failed to initialize GStreamer")?;
-
-    // Check PulseAudio availability once at startup, not per-connection
-    let pulseaudio_available = std::process::Command::new("pactl")
-        .arg("info")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
     let token = args.token.clone();
-    let state = ServerState { args, pulseaudio_available, token };
+    let state = ServerState {
+        args: Arc::new(args),
+        token,
+    };
 
     let addr = format!("0.0.0.0:{}", state.args.port);
     println!("vnrit listening on http://{}", addr);
     println!("  Display: {}", state.args.display);
-    println!("  Codec  : {}", state.args.codec);
     println!("  FPS    : {}", state.args.framerate);
     println!("  Bitrate: {} kbps", state.args.bitrate);
     if state.args.height > 0 {
@@ -317,7 +652,6 @@ async fn main() -> Result<()> {
     } else {
         println!("  Scale  : native (no scaling)");
     }
-    println!("  PulseAudio: {}", if state.pulseaudio_available { "yes" } else { "no" });
     match &state.token {
         Some(t) => println!("  Auth token: {} (required)", t),
         None => println!("  Auth token: none (open access)"),
@@ -345,15 +679,6 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<ServerState>) -> i
 }
 
 /// Authentication middleware for token-based access control.
-///
-/// If `state.token` is `None`, all requests pass through (open access).
-/// If a token is set, the middleware checks:
-/// 1. Query parameter `?token=xxx` in the URL
-/// 2. `Cookie: token=xxx` header
-///
-/// On first successful authentication via query parameter, a `Set-Cookie`
-/// header is added so subsequent requests (including WebSocket upgrade)
-/// are authenticated via cookie.
 async fn auth_middleware(
     State(state): State<ServerState>,
     req: Request,
@@ -418,16 +743,131 @@ async fn auth_middleware(
     Ok(response)
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  setup_x11_connection() — factored out for reuse
+// ═══════════════════════════════════════════════════════════════
+
+fn setup_x11_connection(display: &str) -> Result<(Arc<Mutex<AppState>>, u16, u16, u8)> {
+    eprintln!("[x11] connecting to display {}", display);
+
+    let (x11_conn, screen_num) = match RustConnection::connect(Some(display)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[x11] standard connect failed: {}, trying Termux socket path...", e);
+            let display_num: u16 = display.trim_start_matches(':').split('.').next()
+                .and_then(|s| s.parse().ok())
+                .context("invalid display format")?;
+            let sock = format!(
+                "/data/data/com.termux/files/usr/tmp/.X11-unix/X{}", display_num
+            );
+            eprintln!("[x11] connecting to {}", sock);
+            let unix_stream = UnixStream::connect(&sock)
+                .context("cannot connect to Termux X11 socket")?;
+            let (stream, (family, address)) = DefaultStream::from_unix_stream(unix_stream)
+                .context("from_unix_stream failed")?;
+            let (auth_name, auth_data) = get_auth(family, &address, display_num)
+                .unwrap_or(None)
+                .unwrap_or_else(|| (Vec::new(), Vec::new()));
+            let conn = RustConnection::connect_to_stream_with_auth_info(
+                stream, 0, auth_name, auth_data,
+            ).context("connect_to_stream failed")?;
+            eprintln!("[x11] connected via Termux socket path");
+            (conn, 0usize)
+        }
+    };
+
+    let screen = &x11_conn.setup().roots[screen_num];
+    let root = screen.root;
+    let screen_width = screen.width_in_pixels;
+    let screen_height = screen.height_in_pixels;
+    let screen_depth = screen.root_depth;
+    let _ = screen; // explicitly end the borrow on x11_conn
+
+    // Verify XTest extension
+    let xtest_cookie = xtest::get_version(&x11_conn, 2, 2)
+        .context("XTest not available")?;
+    xtest_cookie.reply().context("XTest query failed")?;
+
+    // Get current pointer position
+    let ptr = xproto::query_pointer(&x11_conn, root)
+        .context("query_pointer failed")?
+        .reply()
+        .context("query_pointer reply failed")?;
+
+    // Cache keyboard mapping
+    let setup = x11_conn.setup();
+    let first_keycode = setup.min_keycode;
+    let keycode_count = setup.max_keycode - setup.min_keycode + 1;
+    let kbd = xproto::get_keyboard_mapping(&x11_conn, first_keycode, keycode_count)
+        .context("get_keyboard_mapping failed")?
+        .reply()
+        .context("get_keyboard_mapping reply failed")?;
+
+    eprintln!(
+        "[x11] connected, root=0x{:x}, pointer=({},{}), dims={}x{}, keycodes={}-{}",
+        root, ptr.root_x, ptr.root_y,
+        screen_width, screen_height,
+        first_keycode, setup.max_keycode
+    );
+
+    let keycode_cache = {
+        let kpk = kbd.keysyms_per_keycode as usize;
+        let mut m = HashMap::new();
+        for (i, chunk) in kbd.keysyms.chunks(kpk).enumerate() {
+            let kc = first_keycode + i as u8;
+            for &ks in chunk {
+                if ks != 0 {
+                    m.entry(ks).or_insert(kc);
+                }
+            }
+        }
+        m
+    };
+
+    let state = Arc::new(Mutex::new(AppState {
+        conn: x11_conn,
+        root,
+        cursor_x: AtomicI32::new(ptr.root_x as i32),
+        cursor_y: AtomicI32::new(ptr.root_y as i32),
+        keycode_cache,
+    }));
+
+    Ok((state, screen_width, screen_height, screen_depth))
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  handle_ws() — per‑client WebSocket + WebRTC handler
+// ═══════════════════════════════════════════════════════════════
+
 async fn handle_ws(ws: WebSocket, state: ServerState) {
     eprintln!("[ws] client connected");
 
-    // ── Spawn a dedicated I/O task that owns the WebSocket ──
-    // We use channels to communicate with it, avoiding mutex contention
-    // between GStreamer callbacks (send) and the main loop (recv).
+    // ── X11 connection setup ──
+    let (x11_state, native_w, native_h, depth) = match setup_x11_connection(&state.args.display) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[x11] FATAL: failed to connect: {:#}", e);
+            return;
+        }
+    };
+
+    // ── Determine output dimensions ──
+    let (out_w, out_h) = if state.args.height > 0 {
+        let h = state.args.height as u32;
+        let w = (native_w as u32 * h) / native_h as u32;
+        // Ensure even dimensions for I420
+        (w / 2 * 2, h / 2 * 2)
+    } else {
+        (native_w as u32, native_h as u32)
+    };
+    let needs_scaling = out_w != native_w as u32 || out_h != native_h as u32;
+
+    eprintln!("[capture] native={}x{} output={}x{} scaling={}",
+        native_w, native_h, out_w, out_h, needs_scaling);
+
+    // ── Spawn I/O task for WebSocket ──
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Message, axum::Error>>(256);
-
-    // Clone in_tx so the parent retains a copy for explicit close in cleanup
     let in_tx_task = in_tx.clone();
 
     let io_handle = tokio::spawn(async move {
@@ -465,7 +905,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         eprintln!("[wsio] task ended");
     });
 
-    // Wait for 'ready' message from browser
+    // ── Wait for 'ready' message ──
     loop {
         match in_rx.recv().await {
             Some(Ok(Message::Text(t))) => {
@@ -480,496 +920,362 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             _ => {}
         }
     }
+    eprintln!("[ws] ready received, creating WebRTC peer connection...");
 
-    eprintln!("[ws] ready received, creating pipeline...");
-
-    let args = &state.args;
-    let pa_available = state.pulseaudio_available;
-
-    // ── Direct X11 connection (x11rb) — no xdotool process overhead ──
-    // Every mouse move, click, scroll, and key event is sent straight to the
-    // X server via XTest extension. No pipe, no string formatting, no IPC.
-    eprintln!("[x11] connecting to display {}", args.display);
-
-    // Try standard connection first (/tmp/.X11-unix/X{display}). On Termux,
-    // /tmp may not exist — fall back to the actual Termux socket path.
-    let (x11_conn, screen_num) = match RustConnection::connect(Some(&args.display)) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[x11] standard connect failed: {}, trying Termux socket path...", e);
-            let display_num: u16 = match args.display.trim_start_matches(':').split('.').next()
-                .and_then(|s| s.parse().ok())
-            {
-                Some(n) => n,
-                None => {
-                    eprintln!("[x11] ERROR: invalid display '{}'", args.display);
-                    return;
-                }
-            };
-            let sock = format!("/data/data/com.termux/files/usr/tmp/.X11-unix/X{}", display_num);
-            eprintln!("[x11] connecting to {}", sock);
-            let unix_stream = match UnixStream::connect(&sock) {
-                Ok(s) => s,
-                Err(e2) => {
-                    eprintln!("[x11] ERROR: cannot connect to {}: {}", sock, e2);
-                    return;
-                }
-            };
-            let (stream, (family, address)) = match DefaultStream::from_unix_stream(unix_stream) {
-                Ok(v) => v,
-                Err(e2) => {
-                    eprintln!("[x11] ERROR: from_unix_stream: {}", e2);
-                    return;
-                }
-            };
-            let (auth_name, auth_data) = get_auth(family, &address, display_num)
-                .unwrap_or(None)
-                .unwrap_or_else(|| (Vec::new(), Vec::new()));
-            match RustConnection::connect_to_stream_with_auth_info(stream, 0, auth_name, auth_data) {
-                Ok(conn) => {
-                    eprintln!("[x11] connected via Termux socket path");
-                    (conn, 0usize)
-                }
-                Err(e2) => {
-                    eprintln!("[x11] ERROR: connect_to_stream failed: {}", e2);
-                    return;
-                }
-            }
-        }
+    // ── Build MediaEngine (H.264 only) ──
+    let mut media_engine = MediaEngine::default();
+    let video_codec = RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                .into(),
+            rtcp_feedback: vec![],
+        },
+        payload_type: 102,
+        ..Default::default()
     };
-    let screen = &x11_conn.setup().roots[screen_num];
-    let root = screen.root;
-    // Verify XTest extension is available
-    let xtest_cookie = match xtest::get_version(&x11_conn, 2, 2) {
-        Ok(v) => v,
+    media_engine
+        .register_codec(video_codec.clone(), RtpCodecKind::Video)
+        .expect("failed to register H264 codec");
+    let registry = register_default_interceptors(Registry::new(), &mut media_engine)
+        .expect("failed to register default interceptors");
+
+    // ── RTCConfiguration ──
+    let ice_servers = if state.args.stun.is_empty() {
+        vec![]
+    } else {
+        vec![RTCIceServer {
+            urls: vec![state.args.stun.clone()],
+            ..Default::default()
+        }]
+    };
+    let config = RTCConfigurationBuilder::new()
+        .with_ice_servers(ice_servers)
+        .build();
+
+    // ── Create runtime channels for the handler ──
+    let (ice_tx, mut ice_rx) = runtime::channel::<String>(256);
+    let (gather_complete_tx, mut gather_complete_rx) = runtime::channel::<()>(1);
+    let (connected_tx, mut connected_rx) = runtime::channel::<()>(1);
+    let (done_tx, mut done_rx) = runtime::channel::<()>(1);
+
+    // ── Build PeerConnection ──
+    let handler = Arc::new(WebrtcHandler {
+        ice_tx,
+        gather_complete_tx,
+        connected_tx,
+        done_tx,
+    });
+
+    let rt = runtime::default_runtime().expect("no webrtc runtime available");
+    let pc = match PeerConnectionBuilder::new()
+        .with_configuration(config)
+        .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
+        .with_handler(handler)
+        .with_runtime(rt)
+        .with_udp_addrs(vec![format!("{}:0", get_local_ip())])  
+        .build()
+        .await
+    {
+        Ok(pc) => pc,
         Err(e) => {
-            eprintln!("[x11] ERROR: XTest extension not available: {}", e);
+            eprintln!("[pc] build failed: {:#}", e);
             return;
         }
     };
-    if let Err(e) = xtest_cookie.reply() {
-        eprintln!("[x11] ERROR: XTest query failed: {}", e);
+    eprintln!("[pc] PeerConnection created");
+
+    // ── Create video track ──
+    let ssrc = rand::rng().random::<u32>();
+    let rtp_codec = video_codec.rtp_codec.clone();
+
+    let track = match TrackLocalStaticSample::new(MediaStreamTrack::new(
+        "video-stream".to_owned(),
+        "video-track".to_owned(),
+        "desktop".to_owned(),
+        RtpCodecKind::Video,
+        vec![RTCRtpEncodingParameters {
+            rtp_coding_parameters: RTCRtpCodingParameters {
+                ssrc: Some(ssrc),
+                ..Default::default()
+            },
+            codec: rtp_codec.clone(),
+            ..Default::default()
+        }],
+    )) {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            eprintln!("[pc] failed to create track: {}", e);
+            return;
+        }
+    };
+    let track_local: Arc<dyn TrackLocal> = track.clone();
+    if let Err(e) = pc.add_track(track_local).await {
+        eprintln!("[pc] add_track failed: {}", e);
         return;
     }
-    // Get current pointer position for relative-move tracking
-    let ptr = match xproto::query_pointer(&x11_conn, root) {
-        Ok(v) => v,
+    eprintln!("[pc] video track added, creating offer...");
+
+    // ── Send initial cursor position ──
+    send_cursor_position(&out_tx, &x11_state);
+
+    // ── Create ScreenCapture (SHM-accelerated with fallback) ──
+    let screen_capture = match ShmScreenCapture::try_new(x11_state.clone(), native_w, native_h, depth) {
+        Ok(Some(shm)) => {
+            eprintln!("[capture] using MIT-SHM acceleration");
+            ScreenCapture::Shm(shm)
+        }
+        Ok(None) => {
+            eprintln!("[capture] SHM unavailable, using get_image fallback");
+            ScreenCapture::Fallback(FallbackCapture { conn: x11_state.clone(), width: native_w, height: native_h })
+        }
         Err(e) => {
-            eprintln!("[x11] ERROR: query_pointer failed: {}", e);
+            eprintln!("[capture] SHM init failed: {}, using get_image fallback", e);
+            ScreenCapture::Fallback(FallbackCapture { conn: x11_state.clone(), width: native_w, height: native_h })
+        }
+    };
+
+    // ── Create VideoEncoder ──
+    let mut encoder = match VideoEncoder::new(&state.args, out_w, out_h) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("[encoder] failed to create: {:#}", err);
             return;
         }
     };
-    let ptr = match ptr.reply() {
-        Ok(v) => v,
+    eprintln!("[encoder] created ({}x{}, {}kbps, {}fps)",
+        out_w, out_h, state.args.bitrate, state.args.framerate);
+
+    // ── Create offer and send to browser ──
+    let offer = match pc.create_offer(None).await {
+        Ok(o) => o,
         Err(e) => {
-            eprintln!("[x11] ERROR: query_pointer reply failed: {}", e);
+            eprintln!("[pc] create_offer failed: {}", e);
             return;
         }
     };
-    // Cache keyboard mapping for keysym → keycode conversion
-    let setup = x11_conn.setup();
-    let first_keycode = setup.min_keycode;
-    let keycode_count = setup.max_keycode - setup.min_keycode + 1;
-    let kbd = match xproto::get_keyboard_mapping(&x11_conn, first_keycode, keycode_count) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[x11] ERROR: get_keyboard_mapping failed: {}", e);
-            return;
-        }
-    };
-    let kbd = match kbd.reply() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[x11] ERROR: get_keyboard_mapping reply failed: {}", e);
-            return;
-        }
-    };
-    eprintln!("[x11] connected, root=0x{:x}, pointer=({},{}), keycodes={}-{}",
-        root, ptr.root_x, ptr.root_y, first_keycode, setup.max_keycode);
-    let state = Arc::new(Mutex::new(AppState {
-        conn: x11_conn,
-        root,
-        cursor_x: AtomicI32::new(ptr.root_x as i32),
-        cursor_y: AtomicI32::new(ptr.root_y as i32),
-        keycode_cache: {
-            let kpk = kbd.keysyms_per_keycode as usize;
-            let mut m = HashMap::new();
-            for (i, chunk) in kbd.keysyms.chunks(kpk).enumerate() {
-                let kc = first_keycode + i as u8;
-                for &ks in chunk {
-                    if ks != 0 {
-                        m.entry(ks).or_insert(kc);
-                    }
-                }
-            }
-            m
-        },
-    }));
-
-    let mut pipeline_holder = Some(gst::Pipeline::new());
-    let pipeline = pipeline_holder.as_ref().expect("pipeline_holder should be Some");
-
-    // ── webrtcbin ──
-    let webrtcbin = gst::ElementFactory::make("webrtcbin")
-        .name("webrtcbin")
-        .build()
-        .expect("failed to create webrtcbin");
-    if !args.stun.is_empty() {
-       eprintln!("[config] STUN server: {}", args.stun);
-       webrtcbin.set_property_from_str("stun-server", &args.stun);
-}else {
-    eprintln!("[config] STUN disabled (using host candidates only)");
-}
-// 如果 args.stun 为空字符串，则不设置 stun-server，webrtcbin 将仅使用 host 候选
-    pipeline.add(&webrtcbin).unwrap();
-
-    // ── ximagesrc → videoconvert → encoder → payloader ──
-    let ximagesrc = gst::ElementFactory::make("ximagesrc")
-        .name("ximagesrc")
-        .build()
-        .unwrap();
-    ximagesrc.set_property("display-name", &format!("{}", args.display));
-    ximagesrc.set_property("use-damage", true);
-    ximagesrc.set_property("show-pointer", false);
-
-    let videoconvert = gst::ElementFactory::make("videoconvert").name("videoconvert").build().unwrap();
-    let q1 = gst::ElementFactory::make("queue").name("vqueue").build().unwrap();
-    // Minimize queue buffering to reduce latency: no time-based limit, max 1 buffer
-    q1.set_property("max-size-time", 0u64);
-    q1.set_property("max-size-buffers", 1u32);
-    q1.set_property_from_str("leaky", "downstream"); // drop old frames on backlog
-
-    let capsf = gst::ElementFactory::make("capsfilter").name("capsf").build().unwrap();
-    let caps = gst::Caps::builder("video/x-raw")
-        .field("framerate", gst::Fraction::new(args.framerate, 1))
-        .build();
-    capsf.set_property("caps", &caps);
-
-    let encoder: gst::Element = match args.codec.as_str() {
-        "vp8" => {
-            let e = gst::ElementFactory::make("vp8enc").name("encoder").build().unwrap();
-            e.set_property("target-bitrate", args.bitrate * 1000);
-            e.set_property("deadline", 1i64);
-            e.set_property("keyframe-max-dist", 240i32);
-            e.set_property("min-force-key-unit-interval", 3_000_000_000u64);
-            e
-        }
-        "vp9" => {
-            let e = gst::ElementFactory::make("vp9enc").name("encoder").build().unwrap();
-            e.set_property("target-bitrate", args.bitrate * 1000);
-            e.set_property("deadline", 1i64);
-            e.set_property("keyframe-max-dist", 240i32);
-            e.set_property("min-force-key-unit-interval", 3_000_000_000u64);
-            e
-        }
-        "h264" => {
-            let e = gst::ElementFactory::make("mcenc").name("encoder").build().unwrap();
-            e.set_property("bitrate", args.bitrate);
-            e
-        }
-        _ => {
-            let e = gst::ElementFactory::make("openh264enc").name("encoder").build().unwrap();
-            e.set_property("bitrate", (args.bitrate * 1000) as u32);
-            e.set_property_from_str("usage-type", "screen");
-            e.set_property("gop-size", 240u32);
-            e
-        }
-    };
-
-    let pay_name = match args.codec.as_str() {
-        "vp8" => "rtpvp8pay",
-        "vp9" => "rtpvp9pay",
-        _ => "rtph264pay",
-    };
-    let payloader = gst::ElementFactory::make(pay_name).name("payloader").build().unwrap();
-	
-    // ── 仅当使用 H.264 编码器时，每个 RTP 包都带 SPS/PPS ──
-    if args.codec == "openh264" || args.codec == "h264" {
-    payloader.set_property("config-interval", -1);
+    if let Err(e) = pc.set_local_description(offer).await {
+        eprintln!("[pc] set_local_description failed: {}", e);
+        return;
     }
-    // ── Optional stream downscaling (--height, e.g. 720 for 720p) ──
-    // Fewer pixels encoded = less CPU + less bandwidth, especially valuable on ARM.
-    if args.height > 0 {
-        let vs = gst::ElementFactory::make("videoscale").name("videoscale").build().unwrap();
-        let sc = gst::ElementFactory::make("capsfilter").name("scale_capsf").build().unwrap();
-        sc.set_property("caps", &gst::Caps::builder("video/x-raw")
-            .field("height", args.height)
-            .field("framerate", gst::Fraction::new(args.framerate, 1))
-            .build());
-        let ve = vec![&ximagesrc, &videoconvert, &q1, &capsf, &vs, &sc, &encoder, &payloader];
-        pipeline.add_many(&ve).unwrap();
-        gst::Element::link_many(&ve).unwrap();
+
+    // Send offer to browser via WebSocket
+    if let Some(local) = pc.local_description().await {
+        let offer_msg = serde_json::to_string(&SignalingMessage::Offer {
+            sdp: local.sdp.clone(),
+        }).unwrap();
+        eprintln!("[sdp] sending offer ({} bytes)", local.sdp.len());
+        if out_tx.try_send(Message::Text(offer_msg.into())).is_err() {
+            eprintln!("[ws] failed to send offer");
+            return;
+        }
     } else {
-        let ve = vec![&ximagesrc, &videoconvert, &q1, &capsf, &encoder, &payloader];
-        pipeline.add_many(&ve).unwrap();
-        gst::Element::link_many(&ve).unwrap();
+        eprintln!("[pc] ERROR: no local description after create_offer");
+        return;
     }
 
-    let vpad = webrtcbin.request_pad_simple("sink_%u").unwrap();
-    payloader.static_pad("src").unwrap().link(&vpad).unwrap();
-
-    // ── audio pipeline (optional — skip if PulseAudio not available) ──
-    if pa_available {
-        eprintln!("[audio] PulseAudio detected, adding audio pipeline");
-        let pulsesrc = gst::ElementFactory::make("pulsesrc").name("pulsesrc").build().unwrap();
-        pulsesrc.set_property("client-name", "vnrit");
-        let aq = gst::ElementFactory::make("queue").name("aqueue").build().unwrap();
-        let audioconv = gst::ElementFactory::make("audioconvert").name("audioconvert").build().unwrap();
-        let acapsf = gst::ElementFactory::make("capsfilter").name("acapsf").build().unwrap();
-        let acaps = gst::Caps::builder("audio/x-raw")
-            .field("channels", 1i32)
-            .field("rate", 48000i32)
-            .build();
-        acapsf.set_property("caps", &acaps);
-        let opusenc = gst::ElementFactory::make("opusenc").name("opusenc").build().unwrap();
-        let rtpopus = gst::ElementFactory::make("rtpopuspay").name("rtpopus").build().unwrap();
-
-        let aelements = &[&pulsesrc, &aq, &audioconv, &acapsf, &opusenc, &rtpopus];
-        pipeline.add_many(aelements).unwrap();
-        gst::Element::link_many(aelements).unwrap();
-
-        let apad = webrtcbin.request_pad_simple("sink_%u").unwrap();
-        rtpopus.static_pad("src").unwrap().link(&apad).unwrap();
-    } else {
-        eprintln!("[audio] PulseAudio not available, skipping audio pipeline");
-    }
-
-    // ── Signal handlers: connect before pipeline plays ──
-    let mut signal_handlers = Vec::<SignalHandlerId>::new();
-    let ws_neg = out_tx.clone();
-    let ws_ice = out_tx.clone();
-
-    // on-negotiation-needed (core fix: use weak reference to break circular ref)
-    let wb_weak = webrtcbin.downgrade();
-    let handler_id = webrtcbin.connect_closure(
-        "on-negotiation-needed",
-        false,
-        glib::closure!(|wb: gst::Element| {
-            eprintln!("[webrtc] on-negotiation-needed fired");
-            let ws = ws_neg.clone();
-            // Clone the weak ref for the nested Promise closure
-            let wb_weak_inner = wb_weak.clone();
-
-            // Note: input is now sent via WebSocket, not data channel.
-            // No data channel needed — just video (and optionally audio) media tracks.
-
-            // Promise for create-offer
-            let promise = gst::Promise::with_change_func(move |result| {
-                eprintln!("[webrtc] create-offer promise resolved");
-                // Upgrade weak ref — if webrtcbin is gone, bail out immediately
-                let wb2 = match wb_weak_inner.upgrade() {
-                    Some(w) => w,
-                    None => {
-                        eprintln!("[webrtc] webrtcbin already destroyed, skipping offer creation");
-                        return;
-                    }
-                };
-                if let Ok(Some(reply)) = result {
-                    if let Ok(offer) = reply.get::<gstreamer_webrtc::WebRTCSessionDescription>("offer") {
-                        let sdp_text = offer.sdp().as_text().unwrap().to_string();
-                        eprintln!("[webrtc] offer SDP created ({} bytes)", sdp_text.len());
-
-                        // --- CRITICAL: Set local description to trigger ICE gathering ---
-                        let ws2 = ws.clone();
-                        let set_promise = gst::Promise::with_change_func(move |_| {
-                            eprintln!("[webrtc] local description set, ICE gathering should start now");
-                            // Now send the offer to the browser (ICE candidates will follow)
-                            let msg = serde_json::to_string(&SignalingMessage::Offer {
-                                sdp: sdp_text,
-                            })
-                            .unwrap();
-                            eprintln!("[webrtc] sending offer via WS");
-                            let _ = ws2.try_send(Message::Text(msg.into()));
-                            eprintln!("[webrtc] offer sent (queued)");
-                        });
-                        let _ = wb2.emit_by_name::<()>("set-local-description", &[&offer, &set_promise]);
-                    } else {
-                        eprintln!("[webrtc] reply.get('offer') failed");
-                    }
-                } else {
-                    eprintln!("[webrtc] promise result: {:?}", result);
-                }
-            });
-            let opts = gst::Structure::new_empty("options");
-            wb.emit_by_name::<()>("create-offer", &[&opts, &promise]);
-        }),
-    );
-    signal_handlers.push(handler_id);
-
-    // on-ice-candidate
-    let handler_id = webrtcbin.connect_closure(
-        "on-ice-candidate",
-        false,
-        glib::closure!(|_: gst::Element, mline: u32, cand: String| {
-            eprintln!("[webrtc] ICE candidate: mline={} candidate='{}'", mline, if cand.len() > 30 { &cand[..30] } else { &cand });
-            let ws = ws_ice.clone();
-            let msg = serde_json::to_string(&SignalingMessage::Ice {
-                candidate: cand,
-                sdp_mline_index: mline,
-            })
-            .unwrap();
-            let _ = ws.try_send(Message::Text(msg.into()));
-        }),
-    );
-    signal_handlers.push(handler_id);
-
-    // Start
-    pipeline.set_state(gst::State::Playing).unwrap();
-    eprintln!("[ws] pipeline playing, waiting for answer...");
-
-    // Push initial cursor position to browser (no polling needed — position is
-    // pushed after every input event instead)
-    send_cursor_position(&out_tx, &state);
-
-    // ── ICE state logging via signal (no polling — fires once per state change) ──
-    // We use notify::ice-connection-state so we only print when the state actually
-    // changes, and a one-shot state-read after 2s for the initial state.
-    let ice_handle;
-    {
-        let wb_weak_ice = webrtcbin.downgrade();
-        let handler_id = webrtcbin.connect_closure(
-            "notify::ice-connection-state",
-            false,
-            glib::closure!(|_: gst::Element, _pspec: glib::ParamSpec| {
-                let wb = match wb_weak_ice.upgrade() {
-                    Some(w) => w,
-                    None => {
-                        eprintln!("[ice] webrtcbin already destroyed");
-                        return;
-                    }
-                };
-                let cs: gstreamer_webrtc::WebRTCICEConnectionState =
-                    wb.property("ice-connection-state");
-                let gs: gstreamer_webrtc::WebRTCICEGatheringState =
-                    wb.property("ice-gathering-state");
-                let ss: gstreamer_webrtc::WebRTCSignalingState =
-                    wb.property("signaling-state");
-                eprintln!("[ice] connection={:?} gathering={:?} signaling={:?}",
-                    cs, gs, ss);
-            }),
-        );
-        signal_handlers.push(handler_id);
-        // Also read one-shot after initial delay so the browser gets a known starting state
-        let wb_init = webrtcbin.clone();
-        ice_handle = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let cs: gstreamer_webrtc::WebRTCICEConnectionState =
-                wb_init.property("ice-connection-state");
-            let gs: gstreamer_webrtc::WebRTCICEGatheringState =
-                wb_init.property("ice-gathering-state");
-            let ss: gstreamer_webrtc::WebRTCSignalingState =
-                wb_init.property("signaling-state");
-            eprintln!("[ice] connection={:?} gathering={:?} signaling={:?}",
-                cs, gs, ss);
-        });
-    }
-
-    // ── Read messages (signaling + input via WebSocket) ──
-    // Input was previously sent via WebRTC data channel (SCTP over DTLS).
-    // Now it's sent directly over the WebSocket — much lower overhead on localhost.
-    loop {
-        let msg = in_rx.recv().await;
-
-        match msg {
+    // ── Receive browser's answer ──
+    let answer_sdp = loop {
+        match in_rx.recv().await {
             Some(Ok(Message::Text(t))) => {
-                // Try signaling first (answer / ICE)
-                if let Ok(sig) = serde_json::from_str::<SignalingMessage>(&t) {
-                    match sig {
-                        SignalingMessage::Answer { sdp } => {
-                            eprintln!("[ws] got answer ({} bytes SDP)", sdp.len());
-                            if let Ok(sdp_msg) = SDPMessage::parse_buffer(sdp.as_bytes()) {
-                                let answer =
-                                    WebRTCSessionDescription::new(WebRTCSDPType::Answer, sdp_msg);
-                                let set_promise = gst::Promise::new();
-                                let _ = webrtcbin
-                                    .emit_by_name::<()>("set-remote-description", &[&answer, &set_promise]);
-                                eprintln!("[ws] answer set, streaming!");
-                            }
-                        }
-                        SignalingMessage::Ice { candidate, sdp_mline_index } => {
-                            eprintln!("[ws] got ICE from client: mline={} candidate='{}'", sdp_mline_index, if candidate.len() > 40 { &candidate[..40] } else { &candidate });
-                            let (idx, cand): (&dyn glib::prelude::ToValue, &dyn glib::prelude::ToValue) =
-                                (&sdp_mline_index, &candidate);
-                            let args: [&dyn glib::prelude::ToValue; 2] = [idx, cand];
-                            let _ = webrtcbin.emit_by_name::<()>("add-ice-candidate", &args);
-                        }
-                        _ => {
-                            eprintln!("[ws] unexpected sig variant");
-                        }
-                    }
-                } else {
-                    // Not signaling → input message (mousemove_rel, mousedown, keydown, etc.)
-                    handle_input_message(&t, &state);
-                    // Push current cursor position to browser after every input.
-                    // No polling needed — the browser tracks locally between updates,
-                    // and this push corrects any drift (edge-clamping, lost messages, etc.).
-                    send_cursor_position(&out_tx, &state);
+                if let Ok(SignalingMessage::Answer { sdp }) = serde_json::from_str(&t) {
+                    eprintln!("[sdp] received answer ({} bytes)", sdp.len());
+                    break sdp;
                 }
             }
-            Some(Ok(Message::Close(_))) | None => break,
+            Some(Ok(Message::Close(_))) | None => {
+                eprintln!("[ws] disconnected waiting for answer");
+                return;
+            }
             _ => {}
         }
+    };
+
+    // ── Set remote description from answer ──
+    let answer = RTCSessionDescription::answer(answer_sdp)
+        .expect("invalid answer SDP");
+    if let Err(e) = pc.set_remote_description(answer).await {
+        eprintln!("[pc] set_remote_description failed: {}", e);
+        return;
+    }
+    eprintln!("[sdp] remote description set");
+
+    // ── Forward ICE candidates from handler → WebSocket ──
+    // Spawn a task that reads ice_rx and forwards to WebSocket
+    let ice_out_tx = out_tx.clone();
+    let ice_forward = tokio::spawn(async move {
+        while let Some(candidate_msg) = ice_rx.recv().await {
+            if ice_out_tx.try_send(Message::Text(candidate_msg.into())).is_err() {
+                break;
+            }
+        }
+    });
+
+    // ── Wait for ICE gathering complete ──
+    tokio::select! {
+        _ = gather_complete_rx.recv() => {
+            eprintln!("[ice] gathering complete");
+        }
+        _ = done_rx.recv() => {
+            eprintln!("[ice] connection ended during gathering");
+            return;
+        }
     }
 
-    // ── CLEANUP: deterministic resource release ──
+    // ── Wait for ICE connected state ──
+    tokio::select! {
+        _ = connected_rx.recv() => {
+            eprintln!("[pc] connection established!");
+        }
+        _ = done_rx.recv() => {
+            eprintln!("[pc] connection failed before connected");
+            return;
+        }
+    }
+
+    // ── Main capture + encode + send loop ──
+    let frame_duration = std::time::Duration::from_millis(1000 / state.args.framerate as u64);
+    let capture = screen_capture;
+    let track_ssrc = *track.ssrcs().await.first().unwrap_or(&0);
+    if track_ssrc == 0 {
+        eprintln!("[pc] ERROR: no SSRC available for video track");
+        return;
+    }
+
+    eprintln!("[loop] starting capture loop at {:?} intervals, ssrc={}", frame_duration, track_ssrc);
+
+    let mut frame_count: u64 = 0;
+    loop {
+        let frame_start = std::time::Instant::now();
+
+        // 1. Read WebSocket messages (input + signaling)
+        //    Check for incoming messages with non-blocking-like approach
+        //    (short timeout so we don't stall capture)
+        loop {
+            match in_rx.try_recv() {
+                Ok(Ok(Message::Text(t))) => {
+                    // Try signaling first
+                    if let Ok(sig) = serde_json::from_str::<SignalingMessage>(&t) {
+                        match sig {
+                            SignalingMessage::Ice { candidate, sdp_mline_index } => {
+                                eprintln!("[ws] ICE from client: mline={}", sdp_mline_index);
+                                let init = RTCIceCandidateInit {
+                                    candidate,
+                                    sdp_mline_index: Some(sdp_mline_index as u16),
+                                    ..Default::default()
+                                };
+                                let _ = pc.add_ice_candidate(init).await;
+                            }
+                            SignalingMessage::Offer { .. } => {
+                                eprintln!("[ws] unexpected duplicate offer, ignoring");
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        // Input message
+                        handle_input_message(&t, &x11_state);
+                        send_cursor_position(&out_tx, &x11_state);
+                    }
+                }
+                Ok(Ok(Message::Close(_))) => {
+                    eprintln!("[ws] client sent close");
+                    break;
+                }
+                Ok(Err(_)) => break,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    eprintln!("[ws] channel disconnected");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // 2. Check if connection is still alive
+        match done_rx.try_recv() {
+            Ok(()) => {
+                eprintln!("[loop] connection closed, exiting");
+                break;
+            }
+            Err(_) => {} // no message yet
+        }
+
+        // 3. Capture screen
+        let frame_data = match capture.capture() {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("[capture] error: {:#}", e);
+                tokio::time::sleep(frame_duration).await;
+                continue;
+            }
+        };
+
+        // 4. Scale if needed, then convert to I420 in one pass
+        let i420 = if needs_scaling {
+            // scale_bgra_image does BGRA→RGBA internally and returns RGBA
+            let rgba = scale_bgra_image(&frame_data, native_w as u32, native_h as u32, out_w, out_h);
+            rgba_to_i420(&rgba, out_w, out_h)
+        } else {
+            // Direct BGRA→I420: one pass, no intermediate allocation, integer math
+            bgra_to_i420(&frame_data, out_w, out_h)
+        };
+
+        // 6. Encode to H.264
+        let h264_data = match encoder.encode(&i420) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("[encoder] error: {:#}", e);
+                tokio::time::sleep(frame_duration).await;
+                continue;
+            }
+        };
+
+        // 7. Write sample to webrtc track
+        if !h264_data.is_empty() {
+            if let Err(e) = track.sample_writer(track_ssrc).write_sample(&Sample {
+                data: Bytes::from(h264_data),
+                duration: frame_duration,
+                ..Default::default()
+            }).await {
+                eprintln!("[send] write_sample error: {}", e);
+                break;
+            }
+        }
+
+        // 8. Maintain target framerate
+        frame_count += 1;
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_duration {
+            tokio::time::sleep(frame_duration - elapsed).await;
+        }
+
+        // Periodic keyframe (every 240 frames ≈ 10s at 24fps)
+        if frame_count % 240 == 0 {
+            encoder.force_keyframe();
+        }
+    }
+
+    // ── CLEANUP ──
     eprintln!("[cleanup] client disconnected, starting cleanup...");
 
-    // 0. Abort I/O task first — ensures the spawned WebSocket loop terminates,
-    //    preventing the main loop from blocking forever on channel recv.
-    eprintln!("[cleanup] aborting I/O task");
+    ice_forward.abort();
+    let _ = ice_forward.await;
+
     io_handle.abort();
     let _ = io_handle.await;
     drop(out_tx);
     drop(in_tx);
-    eprintln!("[cleanup] I/O task terminated");
 
-    // Abort the one-shot ICE state reader if still pending (2s sleep)
-    ice_handle.abort();
-    let _ = ice_handle.await;
-
-    // 1. Disconnect all signal handlers to break signal → closure references
-    for handler_id in signal_handlers {
-        webrtcbin.disconnect(handler_id);
-    }
-    eprintln!("[cleanup] signal handlers disconnected");
-
-    // 2. Stop pipeline, flush bus, release elements
-    if let Some(p) = pipeline_holder.take() {
-        eprintln!("[cleanup] setting pipeline to NULL");
-        let _ = p.set_state(gst::State::Null);
-        // Wait up to 2 seconds for the NULL state transition to complete
-        let _ = p.state(gst::ClockTime::from_seconds(2));
-
-        // Drain bus messages (timed pop up to 2 seconds, then force flush)
-        if let Some(bus) = p.bus() {
-            for _ in 0..20 {
-                if bus.timed_pop(gst::ClockTime::from_mseconds(100)).is_some() {
-                    // Continue draining
-                } else {
-                    break;
-                }
-            }
-            while bus.pop().is_some() {}
-        }
-        eprintln!("[cleanup] bus drained");
-
-        // Remove webrtcbin from pipeline and force NULL state
-        let _ = p.remove(&webrtcbin);
-        let _ = webrtcbin.set_state(gst::State::Null);
-        eprintln!("[cleanup] webrtcbin set to NULL explicitly");
-
-        // Explicitly drop the pipeline
-        drop(p);
-        eprintln!("[cleanup] pipeline dropped");
-    }
-
-    // 3. Flush X11 connection
-    if let Ok(s) = state.lock() {
-        let _ = s.conn.flush();
-    }
-    drop(state);
-    eprintln!("[ws] client disconnected, cleanup complete");
+    let _ = pc.close().await;
+    eprintln!("[ws] cleanup complete");
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  Input handling (unchanged from GStreamer version)
+// ═══════════════════════════════════════════════════════════════
 
 fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
     let parts: Vec<&str> = raw.split(',').collect();
@@ -977,23 +1283,22 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
         return;
     }
 
-    // ── Direct X11 via XTest extension (no xdotool, no pipe, no IPC) ──
     let s = state.lock().unwrap();
 
     match parts[0] {
         "mr" if parts.len() >= 3 => {
-            // mr,dx,dy — relative mouse move: update internal cursor, send absolute
+            // mr,dx,dy — relative mouse move
             let dx: i32 = parts[1].parse().unwrap_or(0);
             let dy: i32 = parts[2].parse().unwrap_or(0);
             let new_x = s.cursor_x.load(Ordering::Relaxed).saturating_add(dx).max(0);
             let new_y = s.cursor_y.load(Ordering::Relaxed).saturating_add(dy).max(0);
             s.cursor_x.store(new_x, Ordering::Relaxed);
-	    s.cursor_y.store(new_y, Ordering::Relaxed);
+            s.cursor_y.store(new_y, Ordering::Relaxed);
             let _ = xtest::fake_input(&s.conn, X11_MOTION_NOTIFY,
-                0, 0, s.root, 
+                0, 0, s.root,
                 s.cursor_x.load(Ordering::Relaxed) as i16,
                 s.cursor_y.load(Ordering::Relaxed) as i16,
-		0);
+                0);
             let _ = s.conn.flush();
         }
         "ma" if parts.len() >= 3 => {
@@ -1003,11 +1308,11 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
             s.cursor_x.store(new_x, Ordering::Relaxed);
             s.cursor_y.store(new_y, Ordering::Relaxed);
             let _ = xtest::fake_input(&s.conn, X11_MOTION_NOTIFY,
-		0, 0, s.root,
-		s.cursor_x.load(Ordering::Relaxed) as i16,
-		s.cursor_y.load(Ordering::Relaxed) as i16,
+                0, 0, s.root,
+                s.cursor_x.load(Ordering::Relaxed) as i16,
+                s.cursor_y.load(Ordering::Relaxed) as i16,
                 0);
-	    let _ = s.conn.flush();
+            let _ = s.conn.flush();
         }
         "md" if parts.len() >= 2 => {
             // md,button — mouse button down
@@ -1033,7 +1338,6 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
         }
         "ms" if parts.len() >= 2 => {
             // ms,deltaY — scroll wheel (click 4=up, 5=down)
-            // Scale: every ~40 pixels = 1 click, clamp to 1-20 to handle fast swipes
             let delta: f64 = parts[1].parse().unwrap_or(0.0);
             let steps = (delta.abs() / 40.0).round().clamp(1.0, 20.0) as u32;
             let btn = if delta > 0.0 { 5_u8 } else { 4_u8 };
@@ -1048,7 +1352,7 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
             let _ = s.conn.flush();
         }
         "kd" if parts.len() >= 2 => {
-            // kd,code — key down (convert browser .code → X11 keycode via keysym)
+            // kd,code — key down
             let keysym = code_to_keysym(parts[1]);
             if keysym != 0 {
                 let kc = find_keycode(&s, keysym);
@@ -1074,10 +1378,6 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
     }
 }
 
-/// Send current cursor position to browser via WebSocket.
-/// Called after every input message and once on initial connection.
-/// This replaces polling — the cursor position is pushed on every state change,
-/// so the browser's overlay always stays in sync between local event updates.
 fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &Arc<Mutex<AppState>>) {
     let s = state.lock().unwrap();
     let x = s.cursor_x.load(Ordering::Relaxed);
@@ -1091,13 +1391,10 @@ fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &Arc<Mutex<AppSta
     let _ = out_tx.try_send(Message::Text(msg.into()));
 }
 
-/// Look up X11 keycode for a given keysym using the pre-built HashMap cache.
 fn find_keycode(s: &AppState, keysym: u32) -> u8 {
     s.keycode_cache.get(&keysym).copied().unwrap_or(0)
 }
 
-/// Convert browser KeyboardEvent.code to X11 keysym (u32).
-/// Returns 0 for unknown codes (event is silently dropped).
 fn code_to_keysym(code: &str) -> u32 {
     match code {
         "Enter" => 0xff0d,
@@ -1109,10 +1406,10 @@ fn code_to_keysym(code: &str) -> u32 {
         "ArrowDown" => 0xff54,
         "ArrowLeft" => 0xff51,
         "ArrowRight" => 0xff53,
-        "ShiftLeft" | "ShiftRight" => 0xffe1, // XK_Shift_L
-        "ControlLeft" | "ControlRight" => 0xffe3, // XK_Control_L
-        "AltLeft" | "AltRight" => 0xffe9, // XK_Alt_L
-        "MetaLeft" | "MetaRight" => 0xffeb, // XK_Super_L
+        "ShiftLeft" | "ShiftRight" => 0xffe1,
+        "ControlLeft" | "ControlRight" => 0xffe3,
+        "AltLeft" | "AltRight" => 0xffe9,
+        "MetaLeft" | "MetaRight" => 0xffeb,
         "CapsLock" => 0xffe5,
         "Delete" => 0xffff,
         "Insert" => 0xff63,
@@ -1127,12 +1424,12 @@ fn code_to_keysym(code: &str) -> u32 {
         "Semicolon" => 0x003b,
         "Quote" => 0x0027,
         "Backquote" => 0x0060,
-        "PrintScreen" => 0xff61,   // XK_Print
-        "ScrollLock" => 0xff14,    // XK_Scroll_Lock
-        "Pause" => 0xff13,         // XK_Pause
-        "Break" => 0xff6b,         // XK_Break
-        "SysRq" => 0xff15,         // XK_Sys_Req
-        "NumLock" => 0xff7f,       // XK_Num_Lock
+        "PrintScreen" => 0xff61,
+        "ScrollLock" => 0xff14,
+        "Pause" => 0xff13,
+        "Break" => 0xff6b,
+        "SysRq" => 0xff15,
+        "NumLock" => 0xff7f,
         "Comma" => 0x002c,
         "Period" => 0x002e,
         "Slash" => 0x002f,
@@ -1166,20 +1463,33 @@ fn code_to_keysym(code: &str) -> u32 {
         }
         "Digit0" | "Digit1" | "Digit2" | "Digit3" | "Digit4"
         | "Digit5" | "Digit6" | "Digit7" | "Digit8" | "Digit9" => {
-            // "Digit5" → '5' → 0x0035 = XK_5
             code.as_bytes()[5] as u32
         }
         _ => {
-            // "KeyA"-"KeyZ" → uppercase letter → XK_A-XK_Z
             if let Some(c) = code.strip_prefix("Key") {
                 if c.len() == 1 {
                     let b = c.as_bytes()[0];
                     if b.is_ascii_alphabetic() {
-                        return b as u32; // 'A' = 0x41 = XK_A
+                        return b as u32;
                     }
                 }
             }
-            0 // unknown
+            0
         }
     }
+}
+
+/// Detect local IP address by creating a UDP socket and querying its local address.
+/// Connects to Google DNS (8.8.8.8:80) to determine the routing interface,
+/// without actually sending any data.
+fn get_local_ip() -> String {
+    let fallback = "127.0.0.1".to_string();
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                return addr.ip().to_string();
+            }
+        }
+    }
+    fallback
 }

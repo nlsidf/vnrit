@@ -1,8 +1,8 @@
 [package]
 name = "vnrit"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
-description = "Lightweight X11 desktop WebRTC streaming server"
+description = "Lightweight X11 desktop WebRTC streaming server (pure Rust, no GStreamer)"
 license = "Apache-2.0"  
 repository = "https://github.com/nlsidf/vnrit.git"
 
@@ -17,11 +17,6 @@ strip = "symbols"
 opt-level = 1
 
 [dependencies]
-gstreamer = { version = "0.23", features = ["v1_22"] }
-gstreamer-webrtc = { version = "0.23", features = ["v1_22"] }
-gstreamer-sdp = { version = "0.23", features = ["v1_22"] }
-glib = "0.20"
-
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
@@ -29,6 +24,29 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-x11rb = { version = "0.13", features = ["xtest", "allow-unsafe-code"] }
+x11rb = { version = "0.13", features = ["xtest", "allow-unsafe-code", "shm"] }
 x11rb-protocol = "0.13"
+
+# WebRTC pure Rust stack
+webrtc = "0.20.0-beta.1"
+rtc = "0.20.0-beta.1"
+rtc-media = "0.20.0-beta.1"
+
+# async-trait for PeerConnectionEventHandler
+async-trait = "0.1"
+
+# Video encoding
+openh264 = { version = "0.9", features = ["source"] }
+
+# Image scaling (replaces GStreamer videoscale)
+image = "0.25"
+
+# Utilities for webrtc-rs
+bytes = "1"
+rand = "0.9"
+
+# mmap for SHM shared memory
+libc = "0.2"
+
+# Memory allocator
 mimalloc = "0.1.52"
