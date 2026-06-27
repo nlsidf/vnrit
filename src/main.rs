@@ -19,6 +19,7 @@ use axum::{
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::time::{self, Duration};
 use futures_util::StreamExt;
 use std::os::unix::net::UnixStream;
 use x11rb::connection::Connection;
@@ -258,6 +259,11 @@ struct InputState {
     screen_h: u16,
     cursor_x: AtomicI32,
     cursor_y: AtomicI32,
+    /// Cache of the last cursor position sent to the browser, so we can skip
+    /// redundant sends when the cursor hasn't moved. Initialized to -1 to
+    /// guarantee the first send always goes through.
+    last_sent_x: AtomicI32,
+    last_sent_y: AtomicI32,
     keycode_cache: HashMap<u32, u8>,
     /// Track currently pressed keycodes so we can release them on disconnect,
     /// preventing "stuck key" on the X server (especially from virtual keyboard).
@@ -892,6 +898,8 @@ fn setup_x11_connections(display: &str) -> Result<(Arc<CaptureState>, Arc<InputS
         screen_h: screen_height,
         cursor_x: AtomicI32::new(ptr.root_x as i32),
         cursor_y: AtomicI32::new(ptr.root_y as i32),
+        last_sent_x: AtomicI32::new(-1),
+        last_sent_y: AtomicI32::new(-1),
         keycode_cache,
         pressed_keys: std::sync::Mutex::new(std::collections::HashSet::new()),
     });
@@ -1561,9 +1569,19 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         log::debug!("[audio] send task ended");
     });
 
+    // ── Periodic cursor position sync ──
+    // Push real X11 cursor position to browser every ~50ms so the overlay
+    // stays in sync even when an X11 application warps the cursor.
+    let mut cursor_timer = time::interval(Duration::from_millis(50));
+
     // ── Input handling runs in main task (non-blocking) ──
     loop {
         tokio::select! {
+            // Periodic cursor sync: query X11 and push position to browser
+            _ = cursor_timer.tick() => {
+                sync_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
+            }
+
             // Handle incoming WebSocket messages (input + signaling)
             msg = in_rx.recv() => {
                 match msg {
@@ -1588,7 +1606,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                             || t.starts_with("ms,") || t.starts_with("kd,")
                             || t.starts_with("ku,")
                         {
-                            handle_input_message(&t, &input_state);
+                            let scale_x = native_w as f64 / out_w as f64;
+                            let scale_y = native_h as f64 / out_h as f64;
+                            handle_input_message(&t, &input_state, scale_x, scale_y);
                             send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
                         } else {
                             let preview: String = t.chars().take(100).collect();
@@ -1673,7 +1693,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 //  Input handling — keyboard/mouse injection via XTest
 // ═══════════════════════════════════════════════════════════════
 
-fn handle_input_message(raw: &str, state: &InputState) {
+fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f64) {
     let parts: Vec<&str> = raw.split(',').collect();
     if parts.is_empty() {
         return;
@@ -1697,17 +1717,18 @@ fn handle_input_message(raw: &str, state: &InputState) {
             let _ = state.conn.flush();
         }
         "ma" if parts.len() >= 3 => {
-            let max_x = state.screen_w as i32 - 1;
-            let max_y = state.screen_h as i32 - 1;
-            let new_x = parts[1].parse::<i32>().unwrap_or(0).clamp(0, max_x);
-            let new_y = parts[2].parse::<i32>().unwrap_or(0).clamp(0, max_y);
+            // Browser sends coordinates in output space (0..out_w, 0..out_h).
+            // Convert to native X11 coordinates (0..screen_w, 0..screen_h)
+            // so that scaling is transparent: browser always works in
+            // displayWidth×displayHeight which equals the encoded video size.
+            let raw_x = parts[1].parse::<i32>().unwrap_or(0);
+            let raw_y = parts[2].parse::<i32>().unwrap_or(0);
+            let new_x = ((raw_x as f64 * scale_x) as i32).clamp(0, state.screen_w as i32 - 1);
+            let new_y = ((raw_y as f64 * scale_y) as i32).clamp(0, state.screen_h as i32 - 1);
             state.cursor_x.store(new_x, Ordering::Relaxed);
             state.cursor_y.store(new_y, Ordering::Relaxed);
             let _ = xtest::fake_input(&state.conn, X11_MOTION_NOTIFY,
-                0, 0, state.root,
-                state.cursor_x.load(Ordering::Relaxed) as i16,
-                state.cursor_y.load(Ordering::Relaxed) as i16,
-                0);
+                0, 0, state.root, new_x as i16, new_y as i16, 0);
             let _ = state.conn.flush();
         }
         "md" if parts.len() >= 2 => {
@@ -1772,11 +1793,22 @@ fn handle_input_message(raw: &str, state: &InputState) {
     }
 }
 
+/// Send current cursor position to browser — reads from the in-memory
+/// cursor_x/cursor_y (set by browser input or X11 sync).  Does NOT query
+/// X11 itself; use sync_cursor_position for periodic X11 reads.
 fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &InputState,
     native_w: u16, native_h: u16, out_w: u32, out_h: u32)
 {
     let x = state.cursor_x.load(Ordering::Relaxed);
     let y = state.cursor_y.load(Ordering::Relaxed);
+    // Skip redundant sends — only push to browser when coordinates actually changed
+    if x == state.last_sent_x.load(Ordering::Relaxed)
+        && y == state.last_sent_y.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    state.last_sent_x.store(x, Ordering::Relaxed);
+    state.last_sent_y.store(y, Ordering::Relaxed);
     // Scale from native X11 coordinates to encoded video coordinates
     let sx = if native_w > 0 { x as u64 * out_w as u64 / native_w as u64 } else { x as u64 };
     let sy = if native_h > 0 { y as u64 * out_h as u64 / native_h as u64 } else { y as u64 };
@@ -1786,6 +1818,21 @@ fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &InputState,
         "y": sy
     })) else { return };
     let _ = out_tx.try_send(Message::Text(msg.into()));
+}
+
+/// Query X11 for the actual cursor position, update the in-memory state,
+/// and send the updated position to the browser.  Used for periodic sync
+/// so the overlay follows cursor movements initiated by X11 applications.
+fn sync_cursor_position(out_tx: &mpsc::Sender<Message>, state: &InputState,
+    native_w: u16, native_h: u16, out_w: u32, out_h: u32)
+{
+    if let Ok(q) = xproto::query_pointer(&state.conn, state.root) {
+        if let Ok(r) = q.reply() {
+            state.cursor_x.store(r.root_x as i32, Ordering::Relaxed);
+            state.cursor_y.store(r.root_y as i32, Ordering::Relaxed);
+        }
+    }
+    send_cursor_position(out_tx, state, native_w, native_h, out_w, out_h);
 }
 
 fn find_keycode(s: &InputState, keysym: u32) -> u8 {

@@ -148,6 +148,8 @@
   /* ── Browser-side cursor overlay ── */
   #cursor-overlay {
     position: absolute;
+    top: 0;
+    left: 0;
     width: 22px;
     height: 22px;
     pointer-events: none;
@@ -520,22 +522,106 @@ let localCursorY = 0;
 const cursorOverlay = document.getElementById('cursor-overlay');
 const CURSOR_CENTER = 11; // half of 22px width — precomputed for translate(-50%, -50%)
 
-function updateCursorOverlay() {
+// ── Smooth cursor correction animation ──
+let animFrameId = null;
+let animStartX = 0, animStartY = 0;
+let animTargetX = 0, animTargetY = 0;
+let animStartTime = 0;
+const ANIM_DURATION = 40; // ms — constant convergence time regardless of distance
+
+/// Render helper: convert display-coordinate (x, y) to a CSS transform and show the overlay.
+/// Pure render function — does NOT mutate localCursorX/Y.
+function applyCursorPos(x, y) {
   if (displayWidth > 0 && displayHeight > 0) {
     const r = getVideoRenderRect();
     if (r) {
-      const cssX = r.renderX + (localCursorX / displayWidth) * r.renderW;
-      const cssY = r.renderY + (localCursorY / displayHeight) * r.renderH;
-      cursorOverlay.style.transform = `translate(${cssX - CURSOR_CENTER}px, ${cssY - CURSOR_CENTER}px)`;
+      const cssX = r.renderX + (x / displayWidth) * r.renderW;
+      const cssY = r.renderY + (y / displayHeight) * r.renderH;
+      cursorOverlay.style.transform =
+        `translate(${cssX - CURSOR_CENTER}px, ${cssY - CURSOR_CENTER}px)`;
     }
   }
   cursorOverlay.style.display = 'block';
 }
 
+/// Single-frame override refresh: snapshot localCursorX/Y and render immediately.
+/// Used by local input (mouse/touch) for instant response.
+function updateCursorOverlay() {
+  applyCursorPos(localCursorX, localCursorY);
+}
+
+/// Clamp localCursorX/Y to display bounds (only when dimensions are known)
+/// and refresh the overlay.  Also cancels any running correction animation
+/// because local input always wins.
 function capLocalCursor() {
-  localCursorX = Math.max(0, Math.min(displayWidth - 1, localCursorX));
-  localCursorY = Math.max(0, Math.min(displayHeight - 1, localCursorY));
+  cancelCursorAnim();
+  if (displayWidth > 0 && displayHeight > 0) {
+    localCursorX = Math.max(0, Math.min(displayWidth - 1, localCursorX));
+    localCursorY = Math.max(0, Math.min(displayHeight - 1, localCursorY));
+  }
   updateCursorOverlay();
+}
+
+/// Cancel any in-flight cursor correction animation.
+function cancelCursorAnim() {
+  if (animFrameId !== null) {
+    cancelAnimationFrame(animFrameId);
+    animFrameId = null;
+  }
+}
+
+/// Per-frame step of the cursor correction animation.
+/// Uses ease-out cubic easing: fast initial catch-up, smooth deceleration.
+/// Always reaches exact target within ANIM_DURATION ms.
+function animStep(now) {
+  const elapsed = now - animStartTime;
+
+  if (elapsed >= ANIM_DURATION) {
+    // Snap to exact target
+    localCursorX = animTargetX;
+    localCursorY = animTargetY;
+    updateCursorOverlay();
+    animFrameId = null;
+    return;
+  }
+
+  // Ease-out cubic: 1 - (1-t)^3  →  reaches 1.0 at t=1
+  const t = elapsed / ANIM_DURATION;
+  const eased = 1 - Math.pow(1 - t, 3);
+
+  localCursorX = animStartX + (animTargetX - animStartX) * eased;
+  localCursorY = animStartY + (animTargetY - animStartY) * eased;
+  updateCursorOverlay();
+
+  animFrameId = requestAnimationFrame(animStep);
+}
+
+/// Start a cursor correction animation from the current localCursorX/Y to (targetX, targetY).
+/// - If deviation < 1 px on both axes → jump directly (no animation).
+/// - Otherwise begin a fixed-duration (ANIM_DURATION) easing animation.
+/// - Cancels any previously running animation first.
+function startCursorAnim(targetX, targetY) {
+  const dx = targetX - localCursorX;
+  const dy = targetY - localCursorY;
+
+  // Below 1-pixel threshold: snap directly
+  if (Math.abs(dx) < 1 && Math.abs(dy) < 1) {
+    localCursorX = targetX;
+    localCursorY = targetY;
+    updateCursorOverlay();
+    return;
+  }
+
+  // Cancel any running animation and start fresh from current position
+  cancelCursorAnim();
+
+  animStartX = localCursorX;
+  animStartY = localCursorY;
+  animTargetX = targetX;
+  animTargetY = targetY;
+  animStartTime = performance.now();
+
+  animFrameId = requestAnimationFrame(animStep);
 }
 
 // Shared: compute video render rect (letterboxed area accounting for aspect ratio)
@@ -666,9 +752,7 @@ function connect() {
         break;
       case 'cursor':
         if (typeof msg.x === 'number' && typeof msg.y === 'number') {
-          localCursorX = msg.x;
-          localCursorY = msg.y;
-          capLocalCursor();
+          startCursorAnim(msg.x, msg.y);
         }
         break;
       case 'error':
@@ -1191,14 +1275,15 @@ function handleModKey(code) {
 }
 
 function handleNormalKey(code) {
-  // 1. Send key press (modifier keys are still active, enabling combos)
   sendInput(`kd,${code}`);
-  // 2. Send key release
   sendInput(`ku,${code}`);
-  // 3. Release all latched modifiers (single-click auto-release)
+
   for (const modCode of Object.keys(modState)) {
     const m = modState[modCode];
-    if (m.active && m.latched) {
+    if (!m.active) continue;
+
+    // Latched (300ms timer fired): auto-release after first key
+    if (m.latched) {
       sendInput(`ku,${modCode}`);
       m.active = false;
       m.latched = false;
@@ -1206,6 +1291,15 @@ function handleNormalKey(code) {
       m.timer = null;
       updateModVisual(modCode);
     }
+    // Quick-press (timer still ticking): release instantly — Shift+/ → ?
+    else if (m.timer) {
+      clearTimeout(m.timer);
+      m.timer = null;
+      sendInput(`ku,${modCode}`);
+      m.active = false;
+      updateModVisual(modCode);
+    }
+    // Locked (double-tap, no timer): leave active for subsequent keys
   }
 }
 
