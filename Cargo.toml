@@ -46,8 +46,8 @@ shiguredo_libyuv = { version = "2026.2.0-canary.1", features = ["source-build"] 
 libpulse-binding = { version = "2.29", default-features = false }
 libpulse-simple-binding = { version = "2.29", default-features = false }
 
-# Opus audio encoding
-opus = "0.3"
+# Opus audio encoding (forked for Android compatibility)
+opus = { version = "0.3", package = "vnrit-opus" }
 
 # Utilities for webrtc-rs
 bytes = "1"
@@ -62,6 +62,3 @@ mimalloc = "0.1.52"
 # Structured logging
 log = "0.4"
 env_logger = "0.11"
-
-[patch.crates-io]
-audiopus_sys = { path = "vendor/audiopus_sys" }
