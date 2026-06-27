@@ -18,6 +18,7 @@ opt-level = 1
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -38,8 +39,15 @@ async-trait = "0.1"
 # Video encoding
 openh264 = { version = "0.9", features = ["source"] }
 
-# Image scaling (replaces GStreamer videoscale)
-image = "0.25"
+# shiguredo_libyuv — Rust bindings for Google's libyuv (SIMD-accelerated conversion + scaling)
+shiguredo_libyuv = { version = "2026.2.0-canary.1", features = ["source-build"] }
+
+# Audio capture via PulseAudio
+libpulse-binding = { version = "2.29", default-features = false }
+libpulse-simple-binding = { version = "2.29", default-features = false }
+
+# Opus audio encoding
+opus = "0.3"
 
 # Utilities for webrtc-rs
 bytes = "1"
@@ -50,3 +58,10 @@ libc = "0.2"
 
 # Memory allocator
 mimalloc = "0.1.52"
+
+# Structured logging
+log = "0.4"
+env_logger = "0.11"
+
+[patch.crates-io]
+audiopus_sys = { path = "vendor/audiopus_sys" }

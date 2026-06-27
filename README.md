@@ -1,76 +1,96 @@
-# vnrit — Lightweight X11 WebRTC Streaming Server
+# vnrit — Pure Rust X11 WebRTC Streaming Server
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-vnrit streams an X11 desktop to one or more browsers over **WebRTC** with low-latency keyboard and mouse input forwarding. Designed for ARM Linux environments (Termux, Raspberry Pi, etc.) where hardware resources are constrained.
+**vnrit** streams an X11 desktop to browsers over **WebRTC** with low-latency keyboard/mouse input forwarding. Built entirely in Rust — no GStreamer, no FFmpeg, no system codec dependencies.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  X11 Server  ──→  ximagesrc  ──→  videoconvert  ──→  encoder   │
-│  (Xvnc/Xvfb)              GStreamer pipeline                    │
-│                                                                │
-│                     ┌── WebSocket (signaling + input)          │
-│  Browser  ←──WebRTC──┤                                          │
-│                     └── ICE/STUN/TURN (p2p media)              │
+│                        vnrit Server                              │
+│                                                                  │
+│  X11 Server ──→ SHM Capture ──→ libyuv I420 ──→ openh264 H.264  │
+│  (Xvnc/Xvfb)     (MIT-SHM)        (SIMD ARM NEON)  (Screen RT)  │
+│                                                                  │
+│  PulseAudio ──→ Opus Encoder ───→ WebRTC                         │
+│  (monitor src)     (libopus)       (webrtc-rs)                   │
+│                                                                  │
+│                        ↓                                         │
+│  Browser ←──WebRTC─── WebSocket (signaling + input) → XTest      │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 ## Features
 
-- **WebRTC streaming** — low-latency video via `webrtcbin` with adaptive quality
-- **Multiple codecs** — openh264 (default), Android MediaCodec H.264, VP8, VP9
-- **Audio support** — Opus audio via PulseAudio (auto-detected)
-- **Input forwarding** — keyboard + mouse injected directly via X11 XTest extension (no `xdotool`)
-- **Touch-to-mouse** — trackpad mode: tap, long-press, drag, scroll — all on a touchscreen
-- **Browser cursor overlay** — synced cursor position without encoding the cursor into video
-- **Optional token-auth** — passwordless access control with cookie-based sessions
+- **Pure Rust** — zero GStreamer/FFmpeg dependency, ~6.6 MB release binary
+- **WebRTC H.264** — openh264 encoder with screen content optimization
+- **SIMD color conversion** — Google libyuv via ARM NEON
+- **4-stage pipeline** — capture → convert → encode → send, fully parallel
+- **Audio support** — PulseAudio → Opus (48kHz stereo, 20ms frames)
+- **X11 input injection** — keyboard + mouse via XTest extension
+- **MIT-SHM capture** — zero-copy shared memory screen capture
+- **Browser cursor overlay** — CSS cursor synced separately, never encoded in video
+- **Dual X11 connections** — separate sockets for capture and input (no lock contention)
+- **Memory pool reuse** — zero per-frame allocations in steady state
+- **Token authentication** — optional passwordless access control
+- **Auto-reconnection** — exponential backoff (1s → 30s)
+- **Touch-to-mouse** — tap, long-press, drag, scroll on touchscreens
+- **Virtual keyboard** — on-screen keyboard for mobile/touch devices
 
 ## Quick Start
 
 ```bash
-# Recommended: hardware H.264, 720p, 500 kbps
-vnrit --codec h264 --height 720 --bitrate 500
+# Build
+./build.sh --release
 
-# Open the printed URL (default http://0.0.0.0:8080) in a browser.
-# Tap/click to send mouse and keyboard events back.
+# Run (default: X11 :1, port 8080, 1000 kbps)
+target/release/vnrit --display :1
+
+# Recommended settings for remote access
+target/release/vnrit --display :1 --height 720 --bitrate 500
+
+# Open http://<host>:8080 in a browser
 ```
 
-## Installation
+## Prerequisites
 
-### Prerequisites
-
-- **Rust** 1.70+ (`rustup` or system package)
-- **GStreamer** 1.22+ with plugins:
-  - `gstreamer`, `gst-plugins-base`, `gst-plugins-good`, `gst-plugins-bad`
-  - `gst-plugins-ugly` (for x264enc, optional)
-  - **openh264** (`gst-openh264` or system package)
-  - VP8/VP9 support via `gst-plugins-good` (libvpx)
-  - Android MediaCodec encoder (`mcenc` plugin, Termux only)
-- **X11 server** (Xvnc, Xvfb, or real X display)
-- **pkg-config** (for GStreamer build linkage)
-
-### Build
-
-```bash
-git clone https://github.com/nlsidf/vnrit.git
-cd vnrit
-cargo build --release
-./target/release/vnrit --help
-```
+| Dependency | Purpose | Install |
+|-----------|---------|---------|
+| Rust 1.82+ | Compiler | `rustup` or system package |
+| cmake 3.20+ | libyuv build | `apt install cmake` / `pkg install cmake` |
+| X11 server | Display to capture | Xvnc, Xvfb, or real X server |
+| PulseAudio | Audio capture (optional) | `pulseaudio` server running |
 
 ### Termux (Android)
 
-On Termux, install dependencies via apt:
-
 ```bash
-pkg install rust gstreamer gst-plugins-base gst-plugins-good \
-  gst-plugins-bad gst-plugins-ugly openh264 mcenc x11-repo \
-  tur-repo pulseaudio
+pkg install rust cmake x11-repo tur-repo pulseaudio
 ```
 
-The X11 display connection uses the Unix socket at
-`/data/data/com.termux/files/usr/tmp/.X11-unix/X<display>`. vnrit
-auto-detects this path.
+The X11 socket path at `/data/data/com.termux/files/usr/tmp/.X11-unix/X<display>` is auto-detected.
+
+## Build
+
+```bash
+# Using build script
+./build.sh --release
+
+# Manual
+CMAKE=$(which cmake) cargo build --release
+```
+
+The `CMAKE` environment variable is required — `shiguredo_libyuv`'s build system
+needs to find cmake on Android. Without it, the build.rs attempts to download
+a prebuilt cmake binary, which fails on Termux.
+
+### Git mirror for libyuv source
+
+`shiguredo_libyuv` clones libyuv from `chromium.googlesource.com` during build.
+If that's blocked on your network, configure a mirror:
+
+```bash
+git config --global url."https://gitee.com/zhang_wang_wu/libyuv".insteadOf \
+  "https://chromium.googlesource.com/libyuv/libyuv"
+```
 
 ## Usage
 
@@ -79,78 +99,42 @@ Usage: vnrit [OPTIONS]
 
 Options:
       --display <DISPLAY>    X11 display to capture [default: :1]
-  -p, --port <PORT>          HTTP/WebSocket port [default: 8080]
-      --codec <CODEC>        Video encoder: openh264, h264, vp8, vp9 [default: openh264]
+  -p, --port <PORT>          HTTP/WebSocket listen port [default: 8080]
       --framerate <FPS>      Capture framerate [default: 24]
       --bitrate <KBPS>       Target bitrate in kbps [default: 1000]
       --height <PX>          Downscale height (0 = native) [default: 0]
-      --token <TOKEN>        Authentication token (optional, for access control)
-  -h, --help                 Print detailed help
-  -V, --version              Print version
+      --stun <URL>           STUN server URL (empty to disable) [default: stun:stun.cloudflare.com:3478]
+      --token <TOKEN>        Authentication token (optional)
+      --log-level <LEVEL>    Log level: off, error, warn, info, debug, trace [default: warn]
+  -h, --help                 Print help
 ```
 
 ### Examples
 
 ```bash
-# Default: openh264 at desktop resolution, 1 Mbps
+# Basic: stream :1 at native resolution
 vnrit
 
-# Recommended: hardware H.264, 720p, 500 kbps
-vnrit --codec h264 --height 720 --bitrate 500
+# Stream at 720p, 500 kbps (recommended for remote access)
+vnrit --height 720 --bitrate 500
 
-# Low bandwidth: VP9, 480p, 300 kbps
-vnrit --codec vp9 --height 480 --bitrate 300
-
-# High quality: no scaling, 2 Mbps
+# Higher quality for LAN
 vnrit --bitrate 2000
 
 # Custom display and port
 vnrit --display :0 -p 9090
 
-# With token authentication
+# With authentication
 vnrit --token mysecret
 
-# Full setup with auth + recommended codec
-vnrit --token abc123 --codec h264 --height 720 --bitrate 500
+# Debug logging
+vnrit --log-level debug
+
+# Disable STUN (LAN-only)
+vnrit --stun ""
 ```
 
-### Token Authentication
-
-When `--token <TOKEN>` is specified, all HTTP and WebSocket connections must present the token.
-
-**How it works:**
-
-```
-Browser → http://host:8080/?token=xxx    # initial visit with token
-   ↓
-Server: validates ?token=xxx, sets HttpOnly cookie
-   ↓
-Browser → ws://host:8080/ws?token=xxx    # WebSocket upgrade (or via cookie)
-   ↓
-Server: validates token → WebRTC streaming begins
-```
-
-- **First visit**: append `?token=<value>` to the URL
-- **Subsequent visits**: the browser's cookie handles authentication automatically
-- **No token**: server returns HTTP 401 Unauthorized
-- **No `--token` specified**: server operates in open-access mode (no auth)
-
-## Codec Comparison
-
-Measured on Snapdragon 835 (Adreno 540) at 720p 500 kbps with a connected
-client:
-
-| Codec | Element | RSS | Type | Notes |
-|-------|---------|-----|------|-------|
-| openh264 | `openh264enc` | ~50 MB | Software H.264 (Cisco) | Default, good balance |
-| **h264** | **`mcenc`** | **~48 MB** | **Hardware H.264** | **Lowest CPU/memory** |
-| vp8 | `vp8enc` | ~64 MB | Software VP8 (libvpx) | Higher memory |
-| vp9 | `vp9enc` | ~64 MB | Software VP9 (libvpx) | Better compression |
-
-The hardware H.264 encoder (`mcenc`) uses the GPU's dedicated video encoding
-block, consuming the least CPU and memory.
-
-### Bitrate Guidelines (720p @ 24 fps)
+## Bitrate Guidelines (720p @ 24 fps)
 
 | Bitrate | Quality | Use Case |
 |---------|---------|----------|
@@ -161,27 +145,41 @@ block, consuming the least CPU and memory.
 
 ## Architecture
 
-### Pipeline
-
-The GStreamer pipeline is constructed dynamically per WebRTC connection:
+### Video Pipeline
 
 ```
-Video:
-ximagesrc → videoconvert → queue → capsfilter
-                                        ↓ (optional)
-                              videoscale → capsfilter (--height)
-                                        ↓
-                              encoder → payloader → webrtcbin
-
-Audio (if PulseAudio detected):
-pulsesrc → audio/x-raw (mono/48kHz) → opusenc → rtpopuspay → webrtcbin
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│ Capture  │───→│ Convert  │───→│ Encode   │───→│ Send     │
+│ SHM/X11  │    │ libyuv   │    │ openh264 │    │ WebRTC   │
+│ BGRA     │    │ I420     │    │ H.264    │    │ track    │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘
+  spawn_         spawn_          spawn_          async
+  blocking       blocking        blocking
 ```
+
+- **Capture**: X11 MIT-SHM extension reads screen pixels into shared memory (zero-copy). Falls back to `get_image` if SHM unavailable.
+- **Convert**: libyuv SIMD converts BGRA → I420. Supports I420-scaling for `--height` downscale.
+- **Encode**: openh264 H.264 encoder with `ScreenContentRealTime` profile and configurable bitrate.
+- **Send**: Asynchronously writes encoded frames to webrtc-rs `TrackLocalStaticSample`.
+
+All 4 stages run in parallel connected by bounded channels (capacity 4). Each stage holds its own pre-allocated buffer pool.
+
+### Audio Pipeline
+
+```
+┌──────────────┐    ┌──────────┐    ┌──────────┐
+│ PulseAudio   │───→│ Opus     │───→│ WebRTC   │
+│ Simple API   │    │ Encoder  │    │ track    │
+│ PCM S16LE    │    │ 48kHz    │    │ 20ms     │
+│ 3840 B/frame │    │ stereo   │    │ frames   │
+└──────────────┘    └──────────┘    └──────────┘
+```
+
+Audio is captured from the **default PulseAudio sink monitor** (system audio output). Falls back to default source (microphone) if monitor detection fails.
 
 ### Input Protocol
 
-Keyboard and mouse events are sent from the browser to the server over the
-same WebSocket used for WebRTC signaling. Messages are CSV lines for minimal
-overhead:
+Commands are sent from the browser over the WebSocket as CSV:
 
 | Command | Format | Description |
 |---------|--------|-------------|
@@ -189,76 +187,95 @@ overhead:
 | Mouse move (absolute) | `ma,x,y` | Absolute cursor position |
 | Mouse down | `md,button` | Button press (1=left, 2=middle, 3=right) |
 | Mouse up | `mu,button` | Button release |
-| Scroll | `ms,deltaY` | Scroll wheel (positive=down, negative=up) |
-| Key down | `kd,code` | KeyboardEvent.code press |
-| Key up | `ku,code` | KeyboardEvent.code release |
+| Scroll | `ms,deltaY` | Scroll wheel |
+| Key down | `kd,code` | `KeyboardEvent.code` (e.g. `KeyA`, `Digit2`) |
+| Key up | `ku,code` | Key release |
 
-Input is injected directly into X11 via the **XTest extension** — no `xdotool`,
-no subprocess, no string parsing overhead.
-
-### Frontend
-
-The built-in web UI provides:
-
-- **WebRTC video rendering** via `RTCPeerConnection`
-- **Browser cursor overlay** — a CSS-rendered cursor synced with the server position, so the system cursor (and its latency) is never encoded in the video
-- **Input throttling** — relative mouse movements are accumulated and flushed at ~50fps to avoid flooding X11
-- **Touch-to-mouse translation**:
-  - One-finger slide → relative cursor move
-  - Tap (<300ms) → left click
-  - Long-press (>700ms) → right click
-  - Long-press + vertical move → scroll
-  - Double-tap (<400ms) + hold + move → drag selection
-- **Keyboard forwarding** — all keyboard events mapped to X11 keysyms
-- **Auto-reconnection** — exponential backoff (1s → 30s max)
-- **Negotiation watchdog** — 15s timeout on WebRTC connection
+Keycodes are physical (not character-based), so keyboard layout handling is done by the X server. Shift+2 produces `@` on a US layout, regardless of the browser's locale.
 
 ### WebSocket Signaling
 
 ```
-Client → Server:  {"type":"ready"}                          ready to connect
-Server → Client:  {"type":"offer","sdp":"..."}              SDP offer
-Client → Server:  {"type":"answer","sdp":"..."}             SDP answer
-Both:             {"type":"ice","candidate":"...","sdp_mline_index":0}
+Client → Server:  {"type":"ready"}
+Server → Client:  {"type":"offer","sdp":"..."}
+Client → Server:  {"type":"answer","sdp":"..."}
+Both:             {"type":"ice","candidate":"...", "sdp_mline_index":0}
 ```
 
-After signaling completes, the WebSocket switches to carrying input CSV lines
-and cursor position updates (`{"type":"cursor","x":<x>,"y":<y>}`).
+### Frontend
 
-## Security
+The built-in web UI (`src/index.html`) provides:
 
-### Token Authentication
+- **WebRTC video** via `RTCPeerConnection` with H.264/Opus
+- **CSS cursor overlay** — synced to server cursor position, never encoded in video
+- **Relative input throttling** — accumulated via `requestAnimationFrame`, not `setInterval`
+- **ResizeObserver** — real-time container resize tracking (no layout thrash)
+- **Touch-to-mouse**: tap, long-press, drag, scroll
+- **Virtual keyboard**: main/func/num layers with modifier latching
+- **Auto-reconnection** with exponential backoff
+- **Negotiation watchdog**: 15s timeout
 
-`--token <TOKEN>` provides **passwordless access control** suitable for
-internal/VPN networks:
+### Cancellation & Cleanup
 
-| Measure | Detail |
-|---------|--------|
-| Cookie | `HttpOnly` + `SameSite=Lax`, 24h expiry |
-| No server-side session | Stateless, no session leakage |
-| Token in query param | Auto-converted to cookie on first successful auth |
-| No token set | Server operates in open-access mode |
+All pipeline tasks share a `CancellationToken`. On disconnect:
+1. `cancel.cancel()` signals all tasks
+2. Channel senders are dropped, waking blocked receivers
+3. Each task checks cancellation and exits cleanly
+4. `ice_forward` task exits naturally when its sender is dropped (no `abort()`)
+5. All `spawn_blocking` handles are awaited
 
-**Limitations:**
-- Token is transmitted in plaintext on HTTP — use behind VPN or HTTPS for production
-- Token is static — rotate by restarting with a new `--token` value
-- No rate-limiting on auth attempts — use a long random token (>16 chars)
-- Cookie `Secure` flag not set (HTTP-only environments)
+## Performance Optimizations
 
-> **Recommendation**: Pair with Tailscale/WireGuard VPN, or put behind nginx
-> HTTPS reverse proxy for public-facing deployments.
+| Technique | Detail |
+|-----------|--------|
+| Memory pool reuse | Pre-allocated Vecs per pipeline stage, no per-frame allocation |
+| Zero-copy capture | MIT-SHM shared memory (no X11 socket transfer for pixels) |
+| SIMD color conversion | libyuv ARGBToI420 + I420Scale via ARM NEON |
+| Dual X11 connections | Separate sockets for capture and input (no mutex) |
+| I420-domain scaling | Scale in YUV space (1.5 B/px vs 4 B/px for ARGB) |
+| `with_resize_uninit` | Skip zero-initialization for buffers immediately overwritten |
+| `SyncSender::send()` | Condition-variable-based blocking (no busy-wait) |
+| `CancellationToken` | Unified cancellation for blocking + async tasks |
+| Atomic memory ordering | `Release`/`Acquire` for ARM weak memory model |
+| `Release`/`Acquire` | Correctness on ARM (phone) vs x86 |
+| Repeat frame on error | If capture fails, repeat last frame (prevents decoder crash) |
+| Force keyframe on error | If encode fails, reset encoder state immediately |
+| `try_send` instead of `blocking_send` | No thread pool deadlock risk |
 
-## Notes
+## Resource Usage
 
-- Each browser tab creates a separate WebRTC pipeline (no multi-viewer
-  sharing yet). Multiple viewers work simultaneously.
-- Requires a running X11 server (Xvnc, Xvfb, or real X).
-- On Termux, the X socket path is auto-detected.
-- Audio requires PulseAudio running on the system.
-- Stale wineserver processes with ESYNC on Termux can cause
-  `virtual_setup_exception` crashes — clear them with `kill -9` if needed.
-- Termux linker namespace restrictions require `LD_PRELOAD` tricks for
-  GPU-accelerated encoding — see the [proton11 guide](https://github.com/nlsidf/proton11) for details.
+Measured on Snapdragon 835 (Adreno 540) at 720p 500 kbps:
+
+| Metric | Value |
+|--------|-------|
+| Binary size | ~6.6 MB (release, stripped) |
+| Memory (steady) | ~50-80 MB RSS |
+| CPU (video, 24 fps) | 2-3 cores at ~1.5 GHz |
+| CPU (audio, 20ms frames) | <5% of one core |
+| Network bandwidth | ~500 kbps video + ~40 kbps audio |
+
+## Troubleshooting
+
+### Connection fails
+
+1. Check X11 server is running: `echo $DISPLAY`
+2. Confirm XTest extension: `xdpyinfo | grep XTest`
+3. Try direct connection: `vnrit --display :0 --stun ""`
+
+### No audio
+
+1. Verify PulseAudio is running: `pactl info`
+2. Check default sink has a monitor: `pactl list sinks short`
+3. Set default source to monitor: `pactl set-default-source <sink>.monitor`
+
+### Build errors
+
+| Error | Fix |
+|-------|-----|
+| `cmake not found` | `apt install cmake` / `pkg install cmake` |
+| `libclang not found` | `apt install libclang-dev` / `pkg install libclang` |
+| `audiopus_sys build.rs` | Already patched in `vendor/` — no action needed |
+| `chromium.googlesource.com timeout` | Configure git mirror (see Build section) |
 
 ## License
 

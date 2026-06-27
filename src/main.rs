@@ -3,6 +3,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::mpsc as block_mpsc;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -17,7 +18,6 @@ use axum::{
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
 use tokio::sync::mpsc;
 use futures_util::StreamExt;
 use std::os::unix::net::UnixStream;
@@ -44,20 +44,31 @@ use rtc::rtp_transceiver::rtp_sender::{
     RtpCodecKind, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
     RTCRtpEncodingParameters,
 };
-use rtc::peer_connection::configuration::media_engine::MIME_TYPE_H264;
+use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS};
 
 // ── openh264 ──
 use openh264::encoder::{Encoder, EncoderConfig, BitRate, FrameRate, UsageType, RateControlMode, IntraFramePeriod, Profile};
 use openh264::formats::YUVBuffer;
 use openh264::OpenH264API;
 
-// ── image scaling ──
-use image::RgbaImage;
 
 use bytes::Bytes;
 use rand::Rng;
 use async_trait::async_trait;
 use std::os::fd::IntoRawFd;
+
+use shiguredo_libyuv::{self, FilterMode, ImageSize, ArgbImage, I420Image, I420ImageMut};
+
+/// Resize `buf` to `size` without zero-initialization, then call `write` with the mutable slice.
+/// The write closure must write all `size` bytes before returning — reading uninit bytes is UB.
+/// After `write` returns, the Vec is guaranteed to contain `size` initialized bytes.
+fn with_resize_uninit(buf: &mut Vec<u8>, size: usize, write: impl FnOnce(&mut [u8])) {
+    buf.clear();
+    buf.reserve(size);
+    // SAFETY: reserve guarantees capacity >= size. write() fills all bytes.
+    unsafe { buf.set_len(size); }
+    write(&mut buf[..size]);
+}
 
 /// Shared state passed via axum State to every WebSocket handler.
 #[derive(Clone)]
@@ -213,6 +224,13 @@ or a 'token' cookie matching this value. The server sets a cookie on first succe
 authentication so subsequent requests (including the WebSocket upgrade) can reuse it."
     )]
     token: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "info",
+        help = "Log level (off, error, warn, info, debug, trace)",
+    )]
+    log_level: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -228,13 +246,22 @@ enum SignalingMessage {
     Ready,
 }
 
-struct AppState {
+struct CaptureState {
     conn: RustConnection,
     root: Window,
+}
+
+struct InputState {
+    conn: RustConnection,
+    root: Window,
+    screen_w: u16,
+    screen_h: u16,
     cursor_x: AtomicI32,
     cursor_y: AtomicI32,
-    // O(1) keysym → keycode lookup, built on init
     keycode_cache: HashMap<u32, u8>,
+    /// Track currently pressed keycodes so we can release them on disconnect,
+    /// preventing "stuck key" on the X server (especially from virtual keyboard).
+    pressed_keys: std::sync::Mutex<std::collections::HashSet<u8>>,
 }
 
 // ── ScreenCapture: SHM-accelerated X11 screen capture ──
@@ -254,64 +281,66 @@ struct AppState {
 // ZPixmap format → pixel data is BGRA (4 bytes/pixel).
 
 struct ShmScreenCapture {
-    conn: Arc<Mutex<AppState>>,
+    conn: Arc<CaptureState>,
     width: u16,
     height: u16,
     shmseg: Seg,
+    // SAFETY: shm_ptr is a valid mmap'd region of shm_size bytes, owned by this struct.
+    // It is only accessed from the single spawn_blocking capture task via capture().
+    // Drop calls munmap which is safe as long as no concurrent access exists —
+    // guaranteed because capture() and Drop run sequentially in the same task.
     shm_ptr: *mut u8,
     shm_size: usize,
     bpp: u8,
 }
 
-// Raw pointer access is Send+Sync for u8
+// Required because ShmScreenCapture is moved into spawn_blocking (crosses thread boundary).
+// The *mut u8 is only accessed from one thread at a time — see SAFETY above.
 unsafe impl Send for ShmScreenCapture {}
 unsafe impl Sync for ShmScreenCapture {}
 
 impl ShmScreenCapture {
     /// Try to create an SHM-accelerated capture. Returns None if SHM is
     /// not available (MIT-SHM extension missing from X server).
-    fn try_new(conn: Arc<Mutex<AppState>>, width: u16, height: u16, depth: u8) -> Result<Option<Self>> {
+    fn try_new(capture: Arc<CaptureState>, width: u16, height: u16, depth: u8) -> Result<Option<Self>> {
         // Calculate bytes-per-pixel for ZPixmap
         // depth 24 → 4 bytes (32-bit padded), depth >24 → 4 bytes
         let bpp = if depth >= 24 { 4u8 } else { ((depth as u32 + 7) / 8) as u8 };
         let shm_size = (width as usize) * (height as usize) * (bpp as usize);
 
-        let s = conn.lock().unwrap();
-
         // Query MIT-SHM version to verify availability
-        let ver = match shm::query_version(&s.conn) {
+        let ver = match shm::query_version(&capture.conn) {
             Ok(cookie) => match cookie.reply() {
                 Ok(reply) => reply,
                 Err(e) => {
-                    eprintln!("[shm] MIT-SHM reply error: {:?}, falling back to get_image", e);
+                    log::debug!("[shm] MIT-SHM reply error: {:?}, falling back to get_image", e);
                     return Ok(None);
                 }
             },
             Err(e) => {
-                eprintln!("[shm] MIT-SHM query failed: {}, falling back to get_image", e);
+                log::debug!("[shm] MIT-SHM query failed: {}, falling back to get_image", e);
                 return Ok(None);
             }
         };
 
         if ver.major_version == 0 && ver.minor_version == 0 {
-            eprintln!("[shm] MIT-SHM extension missing, falling back to get_image");
+            log::debug!("[shm] MIT-SHM extension missing, falling back to get_image");
             return Ok(None);
         }
 
-        eprintln!("[shm] MIT-SHM v{}.{}, allocating {} bytes ({}x{}x{})",
+        log::debug!("[shm] MIT-SHM v{}.{}, allocating {} bytes ({}x{}x{})",
             ver.major_version, ver.minor_version, shm_size, width, height, depth);
 
-        let shmseg = s.conn.generate_id()
+        let shmseg = capture.conn.generate_id()
             .context("failed to generate SHM seg ID")?;
 
         // Ask the X server to allocate shared memory and return a file descriptor
-        let cookie = shm::create_segment(&s.conn, shmseg, shm_size as u32, false)
+        let cookie = shm::create_segment(&capture.conn, shmseg, shm_size as u32, false)
             .context("SHM create_segment failed")?;
         let reply = cookie.reply()
             .context("SHM create_segment reply failed")?;
 
         let raw_fd = reply.shm_fd.into_raw_fd();
-        drop(s); // release X11 lock before mmap
 
         // Map the FD into our address space
         let shm_ptr = unsafe {
@@ -333,10 +362,10 @@ impl ShmScreenCapture {
         // Close fd — mmap keeps a reference to the underlying file
         unsafe { libc::close(raw_fd); }
 
-        eprintln!("[shm] segment allocated at {:?} ({} bytes)", shm_ptr, shm_size);
+        log::debug!("[shm] segment allocated at {:?} ({} bytes)", shm_ptr, shm_size);
 
         Ok(Some(ShmScreenCapture {
-            conn,
+            conn: capture,
             width,
             height,
             shmseg,
@@ -346,35 +375,36 @@ impl ShmScreenCapture {
         }))
     }
 
-    /// Capture the root window and return raw BGRA pixel data.
-    /// The X server writes directly to shared memory; we memcpy out.
-    fn capture(&self) -> Result<Vec<u8>> {
-        let s = self.conn.lock().unwrap();
+    /// Capture the root window and write raw BGRA pixel data to `out`.
+    fn capture(&self, out: &mut Vec<u8>) -> Result<()> {
         let cookie = shm::get_image(
-            &s.conn,
-            s.root,   // drawable
+            &self.conn.conn,
+            self.conn.root, // drawable
             0,        // x offset
             0,        // y offset
             self.width,
             self.height,
             !0,       // plane_mask = all planes
-            2,        // format = ZPixmap (hardcoded, matches xproto::ImageFormat::Z_PIXMAP)
+            2,        // format = ZPixmap
             self.shmseg,
             0,        // offset in shared memory
         ).context("SHM get_image failed")?;
         let _reply = cookie.reply().context("SHM get_image reply failed")?;
-        drop(s); // release lock before memcpy
 
-        // Copy pixel data from shared memory (X server has written it by now)
+        // Copy pixel data from shared memory into pre-allocated buffer
         let size = (self.width as usize) * (self.height as usize) * (self.bpp as usize);
-        let mut data = vec![0u8; size];
+        out.clear();
+        out.reserve(size);
+        // SAFETY: shm_ptr points to X server's shared memory (written by get_image reply).
+        // out has reserved capacity >= size. copy_nonoverlapping writes all `size` bytes.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.shm_ptr, data.as_mut_ptr(), size);
+            out.set_len(size);
+            std::ptr::copy_nonoverlapping(self.shm_ptr, out.as_mut_ptr(), size);
         }
-        Ok(data)
+        Ok(())
     }
 
-    #[allow(dead_code)]
+    /// Return the capture dimensions (width, height).
     fn dimensions(&self) -> (u16, u16) {
         (self.width, self.height)
     }
@@ -383,41 +413,37 @@ impl ShmScreenCapture {
 impl Drop for ShmScreenCapture {
     fn drop(&mut self) {
         unsafe {
-            // Unmap the shared memory region
             libc::munmap(self.shm_ptr as *mut libc::c_void, self.shm_size);
         }
-        // Detach the SHM segment from the X server
-        if let Ok(s) = self.conn.lock() {
-            let _ = shm::detach(&s.conn, self.shmseg);
-        }
-        eprintln!("[shm] cleaned up segment {:?}", self.shm_ptr);
+        let _ = shm::detach(&self.conn.conn, self.shmseg);
+        log::debug!("[shm] cleaned up segment {:?}", self.shm_ptr);
     }
 }
 
 /// Fallback screen capture using xproto::get_image (no SHM).
 /// Used when MIT-SHM extension is not available.
 struct FallbackCapture {
-    conn: Arc<Mutex<AppState>>,
+    conn: Arc<CaptureState>,
     width: u16,
     height: u16,
 }
 
 impl FallbackCapture {
-    fn capture(&self) -> Result<Vec<u8>> {
-        let s = self.conn.lock().unwrap();
+    fn capture(&self, out: &mut Vec<u8>) -> Result<()> {
         let cookie = xproto::get_image(
-            &s.conn,
+            &self.conn.conn,
             xproto::ImageFormat::Z_PIXMAP,
-            s.root,
+            self.conn.root,
             0, 0,
             self.width, self.height,
             !0, // plane_mask = all planes
         ).context("get_image failed")?;
         let reply = cookie.reply().context("get_image reply failed")?;
-        Ok(reply.data)
+        *out = reply.data;
+        Ok(())
     }
 
-    #[allow(dead_code)]
+    /// Return the capture dimensions (width, height).
     fn dimensions(&self) -> (u16, u16) {
         (self.width, self.height)
     }
@@ -430,14 +456,14 @@ enum ScreenCapture {
 }
 
 impl ScreenCapture {
-    fn capture(&self) -> Result<Vec<u8>> {
+    fn capture(&self, out: &mut Vec<u8>) -> Result<()> {
         match self {
-            ScreenCapture::Shm(s) => s.capture(),
-            ScreenCapture::Fallback(f) => f.capture(),
+            ScreenCapture::Shm(s) => s.capture(out),
+            ScreenCapture::Fallback(f) => f.capture(out),
         }
     }
 
-    #[allow(dead_code)]
+    /// Return the capture dimensions (width, height).
     fn dimensions(&self) -> (u16, u16) {
         match self {
             ScreenCapture::Shm(s) => s.dimensions(),
@@ -446,94 +472,88 @@ impl ScreenCapture {
     }
 }
 
-// ── Color conversion ──
+// ── Color conversion (libyuv SIMD-accelerated via shiguredo_libyuv) ──
+//
+// X11 ZPixmap returns BGRA bytes: [B,G,R,A]. libyuv calls this "ARGB".
+// No-scaling path:  BGRA → ARGBToI420 → I420 (SIMD, 1 pass)
+// Scaling path:     BGRA → ARGBToI420 → I420 native → I420Scale → I420 output
 
-/// Scale BGRA image using the `image` crate.
-/// Converts BGRA → RGBA for scaling (scaling is pixel-position-based,
-/// channel order doesn't affect the interpolation result), then returns
-/// RGBA data.
-fn scale_bgra_image(bgra: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
-    // BGRA → RGBA: swap R (byte 2) and B (byte 0)
-    let rgba: Vec<u8> = bgra
-        .chunks_exact(4)
-        .flat_map(|p| [p[2], p[1], p[0], p[3]])
-        .collect();
-
-    let img = RgbaImage::from_raw(src_w, src_h, rgba).expect("invalid image dimensions");
-    let scaled = image::imageops::resize(&img, dst_w, dst_h, image::imageops::FilterType::CatmullRom);
-    scaled.into_raw() // RGBA data
-}
-
-/// Convert RGBA pixel data to I420 (YUV 4:2:0) planar format.
-/// Uses BT.601 full-range coefficients.
-fn rgba_to_i420(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+/// Convert BGRA (X11 ZPixmap) to I420 planar YUV via libyuv SIMD.
+/// Output buffer is reused (cleared and resized if needed).
+fn bgra_to_i420(bgra: &[u8], width: u32, height: u32, out: &mut Vec<u8>) {
     let w = width as usize;
     let h = height as usize;
     let y_size = w * h;
     let uv_size = (w / 2) * (h / 2);
-    let mut out = vec![0u8; y_size + 2 * uv_size];
-
-    let (y_plane, rest) = out.split_at_mut(y_size);
-    let (u_plane, v_plane) = rest.split_at_mut(uv_size);
-
-    for y in 0..h {
-        for x in 0..w {
-            let i = (y * w + x) * 4;
-            let r = rgba[i] as f32;
-            let g = rgba[i + 1] as f32;
-            let b = rgba[i + 2] as f32;
-
-            let yy = (0.299 * r + 0.587 * g + 0.114 * b) as u8;
-            y_plane[y * w + x] = yy;
-
-            if x % 2 == 0 && y % 2 == 0 {
-                let uu = (-0.1687 * r - 0.3313 * g + 0.5 * b + 128.0) as u8;
-                let vv = (0.5 * r - 0.4187 * g - 0.0813 * b + 128.0) as u8;
-                let uv_idx = (y / 2) * (w / 2) + (x / 2);
-                u_plane[uv_idx] = uu;
-                v_plane[uv_idx] = vv;
-            }
-        }
-    }
-    out
+    let total = y_size + 2 * uv_size;
+    with_resize_uninit(out, total, |buf| {
+        let src = ArgbImage { data: bgra, stride: (width * 4) as usize };
+        let (y_plane, rest) = buf.split_at_mut(y_size);
+        let (u_plane, v_plane) = rest.split_at_mut(uv_size);
+        let mut dst = I420ImageMut {
+            y: y_plane, y_stride: width as usize,
+            u: u_plane, u_stride: (width / 2) as usize,
+            v: v_plane, v_stride: (width / 2) as usize,
+        };
+        let size = ImageSize::new(width as usize, height as usize);
+        let _ = shiguredo_libyuv::argb_to_i420(&src, &mut dst, size);
+    });
 }
 
-/// Convert BGRA pixel data directly to I420 (YUV 4:2:0) planar format.
-/// Single-pass integer math — faster than two-pass BGRA→RGBA→I420.
-/// Uses BT.601 full-range coefficients.
-fn bgra_to_i420(bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let w = width as usize;
-    let h = height as usize;
-    let y_size = w * h;
-    let uv_size = (w / 2) * (h / 2);
-    let mut out = vec![0u8; y_size + 2 * uv_size];
+/// Scale BGRA to target size via I420-domain pipeline:
+///   1. BGRA → ARGBToI420 → native I420   (1.5 bytes/px intermediate)
+///   2. I420Scale → target I420
+/// Uses less memory bandwidth than ARGBScale path (1.5 vs 4 bytes/px intermediate).
+/// temp holds the native-resolution I420 frame (reused across frames).
+fn scale_bgra_direct(bgra: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32,
+    i420_out: &mut Vec<u8>, temp: &mut Vec<u8>) {
+    // Step 1: BGRA → I420 at native resolution
+    let src_y_size = (src_w * src_h) as usize;
+    let src_uv_size = ((src_w / 2) * (src_h / 2)) as usize;
+    let native_i420_size = src_y_size + 2 * src_uv_size;
+    with_resize_uninit(temp, native_i420_size, |t| {
+        bgra_to_i420_into(bgra, src_w, src_h, t);
+    });
 
+    // Step 2: I420 scale to target resolution
+    let dst_y_size = (dst_w * dst_h) as usize;
+    let dst_uv_size = ((dst_w / 2) * (dst_h / 2)) as usize;
+    with_resize_uninit(i420_out, dst_y_size + 2 * dst_uv_size, |out| {
+        let (src_y, rest) = temp.split_at(src_y_size);
+        let (src_u, src_v) = rest.split_at(src_uv_size);
+        let src_img = I420Image {
+            y: src_y, y_stride: src_w as usize,
+            u: src_u, u_stride: (src_w / 2) as usize,
+            v: src_v, v_stride: (src_w / 2) as usize,
+        };
+        let (dst_y, rest) = out.split_at_mut(dst_y_size);
+        let (dst_u, dst_v) = rest.split_at_mut(dst_uv_size);
+        let mut dst_img = I420ImageMut {
+            y: dst_y, y_stride: dst_w as usize,
+            u: dst_u, u_stride: (dst_w / 2) as usize,
+            v: dst_v, v_stride: (dst_w / 2) as usize,
+        };
+        let src_size = ImageSize::new(src_w as usize, src_h as usize);
+        let dst_size = ImageSize::new(dst_w as usize, dst_h as usize);
+        let _ = shiguredo_libyuv::i420_scale(&src_img, src_size, &mut dst_img, dst_size, FilterMode::Bilinear);
+    });
+}
+
+/// BGRA → I420, writing into a pre-sized buffer (no resize).
+/// Buffer must have capacity >= width * height * 3 / 2.
+fn bgra_to_i420_into(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let src = ArgbImage { data: bgra, stride: (width * 4) as usize };
+    let y_size = (width * height) as usize;
+    let uv_size = ((width / 2) * (height / 2)) as usize;
     let (y_plane, rest) = out.split_at_mut(y_size);
     let (u_plane, v_plane) = rest.split_at_mut(uv_size);
-
-    for y in 0..h {
-        for x in 0..w {
-            let i = (y * w + x) * 4;
-            // BGRA byte order: bgra[i]=B, [i+1]=G, [i+2]=R, [i+3]=A
-            let b = bgra[i] as i32;
-            let g = bgra[i + 1] as i32;
-            let r = bgra[i + 2] as i32;
-
-            // Y = (77*R + 150*G + 29*B) >> 8  (BT.601 full range)
-            let yy = ((77 * r + 150 * g + 29 * b) >> 8).clamp(0, 255) as u8;
-            y_plane[y * w + x] = yy;
-
-            if x % 2 == 0 && y % 2 == 0 {
-                // U = (-43*R - 85*G + 128*B) / 256 + 128
-                let u_val = (128 * b - 43 * r - 85 * g) / 256 + 128;
-                let v_val = (128 * r - 107 * g - 21 * b) / 256 + 128;
-                let uv_idx = (y / 2) * (w / 2) + (x / 2);
-                u_plane[uv_idx] = u_val.clamp(0, 255) as u8;
-                v_plane[uv_idx] = v_val.clamp(0, 255) as u8;
-            }
-        }
-    }
-    out
+    let mut dst = I420ImageMut {
+        y: y_plane, y_stride: width as usize,
+        u: u_plane, u_stride: (width / 2) as usize,
+        v: v_plane, v_stride: (width / 2) as usize,
+    };
+    let size = ImageSize::new(width as usize, height as usize);
+    let _ = shiguredo_libyuv::argb_to_i420(&src, &mut dst, size);
 }
 
 // ── VideoEncoder: wraps openh264 ──
@@ -549,16 +569,28 @@ impl VideoEncoder {
         let bitrate_bps = (args.bitrate as u32) * 1000;
         let framerate = args.framerate as f32;
 
+        let intra_period = (args.framerate as u32) * 10; // GOP = 10× framerate
+
+        // Detect available parallelism, cap at 2 threads for encoder
+        // (pipeline already parallelizes at a higher level; encoder multi-threading
+        //  helps but too many threads on mobile cause cache contention)
+        let enc_threads = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).min(4).max(1) as u16)
+            .unwrap_or(0); // 0 = auto mode if detection fails
+
         let config = EncoderConfig::new()
+            .num_threads(enc_threads)
             .bitrate(BitRate::from_bps(bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(framerate))
             .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Bitrate)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(240))
+            .rate_control_mode(RateControlMode::Quality)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(intra_period))
             .profile(Profile::Baseline);
 
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
             .context("failed to create openh264 encoder")?;
+
+        log::info!("[encoder] {} threads configured", enc_threads);
 
         Ok(VideoEncoder {
             inner: encoder,
@@ -567,12 +599,14 @@ impl VideoEncoder {
         })
     }
 
-    fn encode(&mut self, i420: &[u8]) -> Result<Vec<u8>> {
-        let yuv = YUVBuffer::from_vec(i420.to_vec(), self.width as usize, self.height as usize);
+    fn encode(&mut self, i420: Vec<u8>, out: &mut Vec<u8>) -> Result<()> {
+        let yuv = YUVBuffer::from_vec(i420, self.width as usize, self.height as usize);
         let bitstream = self.inner
             .encode(&yuv)
             .context("openh264 encode failed")?;
-        Ok(bitstream.to_vec())
+        out.clear();
+        bitstream.write_vec(out);
+        Ok(())
     }
 
     fn force_keyframe(&mut self) {
@@ -592,25 +626,27 @@ struct WebrtcHandler {
 #[async_trait]
 impl PeerConnectionEventHandler for WebrtcHandler {
     async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
-        eprintln!("[ice] candidate: {} ...", &event.candidate.address[..event.candidate.address.len().min(20)]);
+        log::debug!("[ice] candidate: {} ...", &event.candidate.address[..event.candidate.address.len().min(20)]);
         if let Ok(init) = event.candidate.to_json() {
             let msg = serde_json::to_string(&SignalingMessage::Ice {
                 candidate: init.candidate,
                 sdp_mline_index: init.sdp_mline_index.unwrap_or(0) as u32,
-            }).unwrap();
-            let _ = self.ice_tx.try_send(msg);
+            }).ok();
+            if let Some(msg) = msg {
+                let _ = self.ice_tx.try_send(msg);
+            }
         }
     }
 
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
-        eprintln!("[ice] gathering state: {:?}", state);
+        log::debug!("[ice] gathering state: {:?}", state);
         if state == RTCIceGatheringState::Complete {
             let _ = self.gather_complete_tx.try_send(());
         }
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        eprintln!("[pc] connection state: {:?}", state);
+        log::info!("[pc] connection state: {:?}", state);
         match state {
             RTCPeerConnectionState::Connected => {
                 let _ = self.connected_tx.try_send(());
@@ -625,7 +661,7 @@ impl PeerConnectionEventHandler for WebrtcHandler {
     }
 
     async fn on_signaling_state_change(&self, state: webrtc::peer_connection::RTCSignalingState) {
-        eprintln!("[pc] signaling state: {:?}", state);
+        log::info!("[pc] signaling state: {:?}", state);
     }
 }
 
@@ -636,6 +672,19 @@ impl PeerConnectionEventHandler for WebrtcHandler {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Init logging from --log-level arg (falls back to RUST_LOG env var).
+    // Suppress noisy third-party library warnings (expected behavior, not actionable).
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(&args.log_level)
+    )
+    .filter(Some("rtc_ice"), log::LevelFilter::Error)
+    .filter(Some("rtc::peer_connection"), log::LevelFilter::Error)
+    .filter(Some("rtc_dtls"), log::LevelFilter::Error)
+    .filter(Some("openh264"), log::LevelFilter::Error)
+    .format_timestamp(None)
+    .init();
+
     let token = args.token.clone();
     let state = ServerState {
         args: Arc::new(args),
@@ -735,32 +784,31 @@ async fn auth_middleware(
             "token={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400",
             expected_token
         );
-        response
-            .headers_mut()
-            .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+        if let Ok(hv) = cookie.parse() {
+            response.headers_mut().insert(axum::http::header::SET_COOKIE, hv);
+        }
     }
 
     Ok(response)
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  setup_x11_connection() — factored out for reuse
-// ═══════════════════════════════════════════════════════════════
+//  setup_x11_connection() — creates two connections (capture + input)
+//  ═══════════════════════════════════════════════════════════════
 
-fn setup_x11_connection(display: &str) -> Result<(Arc<Mutex<AppState>>, u16, u16, u8)> {
-    eprintln!("[x11] connecting to display {}", display);
-
-    let (x11_conn, screen_num) = match RustConnection::connect(Some(display)) {
-        Ok(v) => v,
+/// Connect to an X11 display, trying standard method first then Termux socket.
+fn connect_to_display(display: &str) -> Result<(RustConnection, usize)> {
+    match RustConnection::connect(Some(display)) {
+        Ok(v) => Ok(v),
         Err(e) => {
-            eprintln!("[x11] standard connect failed: {}, trying Termux socket path...", e);
+            log::info!("[x11] standard connect failed: {}, trying Termux socket path...", e);
             let display_num: u16 = display.trim_start_matches(':').split('.').next()
                 .and_then(|s| s.parse().ok())
                 .context("invalid display format")?;
             let sock = format!(
                 "/data/data/com.termux/files/usr/tmp/.X11-unix/X{}", display_num
             );
-            eprintln!("[x11] connecting to {}", sock);
+            log::info!("[x11] connecting to {}", sock);
             let unix_stream = UnixStream::connect(&sock)
                 .context("cannot connect to Termux X11 socket")?;
             let (stream, (family, address)) = DefaultStream::from_unix_stream(unix_stream)
@@ -771,39 +819,47 @@ fn setup_x11_connection(display: &str) -> Result<(Arc<Mutex<AppState>>, u16, u16
             let conn = RustConnection::connect_to_stream_with_auth_info(
                 stream, 0, auth_name, auth_data,
             ).context("connect_to_stream failed")?;
-            eprintln!("[x11] connected via Termux socket path");
-            (conn, 0usize)
+            log::info!("[x11] connected via Termux socket path");
+            Ok((conn, 0usize))
         }
-    };
+    }
+}
 
-    let screen = &x11_conn.setup().roots[screen_num];
+fn setup_x11_connections(display: &str) -> Result<(Arc<CaptureState>, Arc<InputState>, u16, u16, u8)> {
+    log::info!("[x11] connecting to display {} (capture connection)", display);
+
+    let (cap_conn, screen_num) = connect_to_display(display)?;
+    let screen = &cap_conn.setup().roots[screen_num];
     let root = screen.root;
     let screen_width = screen.width_in_pixels;
     let screen_height = screen.height_in_pixels;
     let screen_depth = screen.root_depth;
-    let _ = screen; // explicitly end the borrow on x11_conn
 
-    // Verify XTest extension
-    let xtest_cookie = xtest::get_version(&x11_conn, 2, 2)
+    // Second connection for input injection (keyboard/mouse)
+    log::info!("[x11] connecting to display {} (input connection)", display);
+    let (inp_conn, _) = connect_to_display(display)?;
+
+    // Verify XTest extension on input connection
+    let xtest_cookie = xtest::get_version(&inp_conn, 2, 2)
         .context("XTest not available")?;
     xtest_cookie.reply().context("XTest query failed")?;
 
-    // Get current pointer position
-    let ptr = xproto::query_pointer(&x11_conn, root)
+    // Get current pointer position on input connection
+    let ptr = xproto::query_pointer(&inp_conn, root)
         .context("query_pointer failed")?
         .reply()
         .context("query_pointer reply failed")?;
 
-    // Cache keyboard mapping
-    let setup = x11_conn.setup();
+    // Cache keyboard mapping on input connection
+    let setup = inp_conn.setup();
     let first_keycode = setup.min_keycode;
     let keycode_count = setup.max_keycode - setup.min_keycode + 1;
-    let kbd = xproto::get_keyboard_mapping(&x11_conn, first_keycode, keycode_count)
+    let kbd = xproto::get_keyboard_mapping(&inp_conn, first_keycode, keycode_count)
         .context("get_keyboard_mapping failed")?
         .reply()
         .context("get_keyboard_mapping reply failed")?;
 
-    eprintln!(
+    log::info!(
         "[x11] connected, root=0x{:x}, pointer=({},{}), dims={}x{}, keycodes={}-{}",
         root, ptr.root_x, ptr.root_y,
         screen_width, screen_height,
@@ -824,15 +880,81 @@ fn setup_x11_connection(display: &str) -> Result<(Arc<Mutex<AppState>>, u16, u16
         m
     };
 
-    let state = Arc::new(Mutex::new(AppState {
-        conn: x11_conn,
+    let capture_state = Arc::new(CaptureState {
+        conn: cap_conn,
         root,
+    });
+
+    let input_state = Arc::new(InputState {
+        conn: inp_conn,
+        root,
+        screen_w: screen_width,
+        screen_h: screen_height,
         cursor_x: AtomicI32::new(ptr.root_x as i32),
         cursor_y: AtomicI32::new(ptr.root_y as i32),
         keycode_cache,
+        pressed_keys: std::sync::Mutex::new(std::collections::HashSet::new()),
+    });
+
+    Ok((capture_state, input_state, screen_width, screen_height, screen_depth))
+}
+
+/// Try to auto-detect the default PulseAudio sink's monitor source for system audio capture.
+/// Returns `Some("sink_name.monitor")` on success, `None` to fall back to default record source.
+fn find_default_monitor() -> Option<String> {
+    use libpulse_binding as pulse;
+    use std::sync::mpsc as block_mpsc;
+
+    let mut mainloop = pulse::mainloop::standard::Mainloop::new()?;
+    let mut ctx = pulse::context::Context::new(&mainloop, "vnrit-monitor-detect")?;
+
+    let (tx, rx) = block_mpsc::channel();
+
+    ctx.set_state_callback(Some(Box::new(move || {
+        let _ = tx.send(());
+    })));
+
+    if ctx.connect(None, pulse::context::FlagSet::NOFLAGS, None).is_err() {
+        log::info!("[audio] PA connect failed");
+        return None;
+    }
+
+    // Run mainloop until ready or timeout (~2s)
+    for _ in 0..200 {
+        if mainloop.iterate(false).is_error() { break; }
+        if rx.try_recv().is_ok() && ctx.get_state() == pulse::context::State::Ready {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    ctx.set_state_callback(None);
+
+    if ctx.get_state() != pulse::context::State::Ready {
+        log::info!("[audio] PA context not ready, fallback to default source");
+        return None;
+    }
+
+    // Query server info to get default sink name
+    let (info_tx, info_rx) = block_mpsc::channel();
+    let introspect = ctx.introspect();
+    introspect.get_server_info(Box::new(move |info: &pulse::context::introspect::ServerInfo| {
+        if let Some(ref name) = info.default_sink_name {
+            let _ = info_tx.send(name.to_string());
+        }
     }));
 
-    Ok((state, screen_width, screen_height, screen_depth))
+    for _ in 0..50 {
+        if mainloop.iterate(false).is_error() { break; }
+        if let Ok(name) = info_rx.try_recv() {
+            let monitor = format!("{}.monitor", name);
+            log::info!("[audio] detected default sink '{}', monitor '{}'", name, monitor);
+            return Some(monitor);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    log::info!("[audio] failed to detect monitor source");
+    None
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -840,13 +962,13 @@ fn setup_x11_connection(display: &str) -> Result<(Arc<Mutex<AppState>>, u16, u16
 // ═══════════════════════════════════════════════════════════════
 
 async fn handle_ws(ws: WebSocket, state: ServerState) {
-    eprintln!("[ws] client connected");
+    log::info!("[ws] client connected");
 
-    // ── X11 connection setup ──
-    let (x11_state, native_w, native_h, depth) = match setup_x11_connection(&state.args.display) {
+    // ── X11 connection setup (dual connections: capture + input) ──
+    let (capture_state, input_state, native_w, native_h, depth) = match setup_x11_connections(&state.args.display) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[x11] FATAL: failed to connect: {:#}", e);
+            log::error!("[x11] FATAL: failed to connect: {:#}", e);
             return;
         }
     };
@@ -855,14 +977,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let (out_w, out_h) = if state.args.height > 0 {
         let h = state.args.height as u32;
         let w = (native_w as u32 * h) / native_h as u32;
-        // Ensure even dimensions for I420
         (w / 2 * 2, h / 2 * 2)
     } else {
         (native_w as u32, native_h as u32)
     };
     let needs_scaling = out_w != native_w as u32 || out_h != native_h as u32;
 
-    eprintln!("[capture] native={}x{} output={}x{} scaling={}",
+    log::info!("[capture] native={}x{} output={}x{} scaling={}",
         native_w, native_h, out_w, out_h, needs_scaling);
 
     // ── Spawn I/O task for WebSocket ──
@@ -879,7 +1000,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     match outgoing {
                         Some(msg) => {
                             if let Err(e) = ws_sink.send(msg).await {
-                                eprintln!("[wsio] send error: {}", e);
+                                log::debug!("[wsio] send error: {}", e);
                                 break;
                             }
                         }
@@ -894,7 +1015,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                             }
                         }
                         Some(Err(e)) => {
-                            eprintln!("[wsio] recv error: {}", e);
+                            log::debug!("[wsio] recv error: {}", e);
                             break;
                         }
                         None => break,
@@ -902,7 +1023,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 }
             }
         }
-        eprintln!("[wsio] task ended");
+        log::debug!("[wsio] task ended");
     });
 
     // ── Wait for 'ready' message ──
@@ -914,13 +1035,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 }
             }
             Some(Ok(Message::Close(_))) | None => {
-                eprintln!("[ws] disconnected before ready");
+                log::debug!("[ws] disconnected before ready");
                 return;
             }
             _ => {}
         }
     }
-    eprintln!("[ws] ready received, creating WebRTC peer connection...");
+    log::info!("[ws] ready received, creating WebRTC peer connection...");
 
     // ── Build MediaEngine (H.264 only) ──
     let mut media_engine = MediaEngine::default();
@@ -939,6 +1060,22 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     media_engine
         .register_codec(video_codec.clone(), RtpCodecKind::Video)
         .expect("failed to register H264 codec");
+
+    // ── Register Opus audio codec ──
+    let audio_codec = RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: 48000,
+            channels: 2,
+            sdp_fmtp_line: "minptime=10;useinbandfec=1".into(),
+            rtcp_feedback: vec![],
+        },
+        payload_type: 111,
+        ..Default::default()
+    };
+    media_engine
+        .register_codec(audio_codec.clone(), RtpCodecKind::Audio)
+        .expect("failed to register Opus codec");
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)
         .expect("failed to register default interceptors");
 
@@ -974,19 +1111,19 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         .with_configuration(config)
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
-        .with_handler(handler)
+        .with_handler(handler.clone())
         .with_runtime(rt)
-        .with_udp_addrs(vec![format!("{}:0", get_local_ip())])  
+        .with_udp_addrs(vec![format!("{}:0", get_local_ip())])
         .build()
         .await
     {
         Ok(pc) => pc,
         Err(e) => {
-            eprintln!("[pc] build failed: {:#}", e);
+            log::info!("[pc] build failed: {:#}", e);
             return;
         }
     };
-    eprintln!("[pc] PeerConnection created");
+    log::info!("[pc] PeerConnection created");
 
     // ── Create video track ──
     let ssrc = rand::rng().random::<u32>();
@@ -1008,72 +1145,112 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     )) {
         Ok(t) => Arc::new(t),
         Err(e) => {
-            eprintln!("[pc] failed to create track: {}", e);
+            log::info!("[pc] failed to create track: {}", e);
             return;
         }
     };
     let track_local: Arc<dyn TrackLocal> = track.clone();
     if let Err(e) = pc.add_track(track_local).await {
-        eprintln!("[pc] add_track failed: {}", e);
+        log::info!("[pc] add_track (video) failed: {}", e);
         return;
     }
-    eprintln!("[pc] video track added, creating offer...");
+    log::info!("[pc] video track added");
+
+    // ── Create audio track ──
+    let audio_ssrc = rand::rng().random::<u32>();
+    let audio_rtp_codec = audio_codec.rtp_codec.clone();
+    let audio_track = match TrackLocalStaticSample::new(MediaStreamTrack::new(
+        "audio-stream".to_owned(),
+        "audio-track".to_owned(),
+        "microphone".to_owned(),
+        RtpCodecKind::Audio,
+        vec![RTCRtpEncodingParameters {
+            rtp_coding_parameters: RTCRtpCodingParameters {
+                ssrc: Some(audio_ssrc),
+                ..Default::default()
+            },
+            codec: audio_rtp_codec,
+            ..Default::default()
+        }],
+    )) {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            log::info!("[pc] failed to create audio track: {}", e);
+            return;
+        }
+    };
+    let audio_track_local: Arc<dyn TrackLocal> = audio_track.clone();
+    if let Err(e) = pc.add_track(audio_track_local).await {
+        log::info!("[pc] add_track (audio) failed: {}", e);
+        return;
+    }
+    log::info!("[pc] audio track added, creating offer...");
 
     // ── Send initial cursor position ──
-    send_cursor_position(&out_tx, &x11_state);
+    send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
 
     // ── Create ScreenCapture (SHM-accelerated with fallback) ──
-    let screen_capture = match ShmScreenCapture::try_new(x11_state.clone(), native_w, native_h, depth) {
+    let screen_capture = match ShmScreenCapture::try_new(capture_state.clone(), native_w, native_h, depth) {
         Ok(Some(shm)) => {
-            eprintln!("[capture] using MIT-SHM acceleration");
+            log::info!("[capture] using MIT-SHM acceleration");
             ScreenCapture::Shm(shm)
         }
         Ok(None) => {
-            eprintln!("[capture] SHM unavailable, using get_image fallback");
-            ScreenCapture::Fallback(FallbackCapture { conn: x11_state.clone(), width: native_w, height: native_h })
+            log::info!("[capture] SHM unavailable, using get_image fallback");
+            ScreenCapture::Fallback(FallbackCapture { conn: capture_state.clone(), width: native_w, height: native_h })
         }
         Err(e) => {
-            eprintln!("[capture] SHM init failed: {}, using get_image fallback", e);
-            ScreenCapture::Fallback(FallbackCapture { conn: x11_state.clone(), width: native_w, height: native_h })
+            log::info!("[capture] SHM init failed: {}, using get_image fallback", e);
+            ScreenCapture::Fallback(FallbackCapture { conn: capture_state.clone(), width: native_w, height: native_h })
         }
     };
+
+    // Use dimensions from the actual screen_capture (may differ from native_w/native_h in theory)
+    let (cap_w, cap_h) = screen_capture.dimensions();
+    let cap_w32 = cap_w as u32;
+    let cap_h32 = cap_h as u32;
 
     // ── Create VideoEncoder ──
     let mut encoder = match VideoEncoder::new(&state.args, out_w, out_h) {
         Ok(e) => e,
         Err(err) => {
-            eprintln!("[encoder] failed to create: {:#}", err);
+            log::info!("[encoder] failed to create: {:#}", err);
             return;
         }
     };
-    eprintln!("[encoder] created ({}x{}, {}kbps, {}fps)",
+    log::info!("[encoder] created ({}x{}, {}kbps, {}fps)",
         out_w, out_h, state.args.bitrate, state.args.framerate);
 
     // ── Create offer and send to browser ──
     let offer = match pc.create_offer(None).await {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("[pc] create_offer failed: {}", e);
+            log::info!("[pc] create_offer failed: {}", e);
             return;
         }
     };
     if let Err(e) = pc.set_local_description(offer).await {
-        eprintln!("[pc] set_local_description failed: {}", e);
+        log::info!("[pc] set_local_description failed: {}", e);
         return;
     }
 
-    // Send offer to browser via WebSocket
     if let Some(local) = pc.local_description().await {
-        let offer_msg = serde_json::to_string(&SignalingMessage::Offer {
+        let offer_msg = match serde_json::to_string(&SignalingMessage::Offer {
             sdp: local.sdp.clone(),
-        }).unwrap();
-        eprintln!("[sdp] sending offer ({} bytes)", local.sdp.len());
+        }) {
+            Ok(m) => m,
+            Err(e) => {
+                log::error!("[sdp] failed to serialize offer: {}", e);
+                return;
+            }
+        };
+        log::info!("[sdp] sending offer ({} bytes)", local.sdp.len());
         if out_tx.try_send(Message::Text(offer_msg.into())).is_err() {
-            eprintln!("[ws] failed to send offer");
+            log::info!("[ws] failed to send offer");
             return;
         }
     } else {
-        eprintln!("[pc] ERROR: no local description after create_offer");
+        log::info!("[pc] ERROR: no local description after create_offer");
         return;
     }
 
@@ -1082,12 +1259,12 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         match in_rx.recv().await {
             Some(Ok(Message::Text(t))) => {
                 if let Ok(SignalingMessage::Answer { sdp }) = serde_json::from_str(&t) {
-                    eprintln!("[sdp] received answer ({} bytes)", sdp.len());
+                    log::info!("[sdp] received answer ({} bytes)", sdp.len());
                     break sdp;
                 }
             }
             Some(Ok(Message::Close(_))) | None => {
-                eprintln!("[ws] disconnected waiting for answer");
+                log::info!("[ws] disconnected waiting for answer");
                 return;
             }
             _ => {}
@@ -1098,13 +1275,12 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let answer = RTCSessionDescription::answer(answer_sdp)
         .expect("invalid answer SDP");
     if let Err(e) = pc.set_remote_description(answer).await {
-        eprintln!("[pc] set_remote_description failed: {}", e);
+        log::info!("[pc] set_remote_description failed: {}", e);
         return;
     }
-    eprintln!("[sdp] remote description set");
+    log::info!("[sdp] remote description set");
 
-    // ── Forward ICE candidates from handler → WebSocket ──
-    // Spawn a task that reads ice_rx and forwards to WebSocket
+    // ── Forward ICE candidates ──
     let ice_out_tx = out_tx.clone();
     let ice_forward = tokio::spawn(async move {
         while let Some(candidate_msg) = ice_rx.recv().await {
@@ -1116,261 +1292,479 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
     // ── Wait for ICE gathering complete ──
     tokio::select! {
-        _ = gather_complete_rx.recv() => {
-            eprintln!("[ice] gathering complete");
-        }
-        _ = done_rx.recv() => {
-            eprintln!("[ice] connection ended during gathering");
-            return;
-        }
+        _ = gather_complete_rx.recv() => { log::debug!("[ice] gathering complete"); }
+        _ = done_rx.recv() => { log::debug!("[ice] connection ended during gathering"); return; }
     }
 
     // ── Wait for ICE connected state ──
     tokio::select! {
-        _ = connected_rx.recv() => {
-            eprintln!("[pc] connection established!");
-        }
-        _ = done_rx.recv() => {
-            eprintln!("[pc] connection failed before connected");
-            return;
-        }
+        _ = connected_rx.recv() => { log::info!("[pc] connection established!"); }
+        _ = done_rx.recv() => { log::info!("[pc] connection failed before connected"); return; }
     }
 
-    // ── Main capture + encode + send loop ──
+    // ── Pipeline: 4-stage capture → convert → encode → send ──
     let frame_duration = std::time::Duration::from_millis(1000 / state.args.framerate as u64);
-    let capture = screen_capture;
     let track_ssrc = *track.ssrcs().await.first().unwrap_or(&0);
     if track_ssrc == 0 {
-        eprintln!("[pc] ERROR: no SSRC available for video track");
+        log::info!("[pc] ERROR: no SSRC available for video track");
         return;
     }
 
-    eprintln!("[loop] starting capture loop at {:?} intervals, ssrc={}", frame_duration, track_ssrc);
+    log::info!("[pipeline] starting 4-stage pipeline (cap→conv→enc→send), {} fps", state.args.framerate);
 
-    let mut frame_count: u64 = 0;
-    loop {
-        let frame_start = std::time::Instant::now();
+    // Pipeline channels (capacity 4 for buffering)
+    // Standard mpsc sync channels used for blocking pipeline stages (recv_timeout available)
+    let (raw_tx, raw_rx) = block_mpsc::sync_channel::<Bytes>(4);
+    let (yuv_tx, yuv_rx) = block_mpsc::sync_channel::<Vec<u8>>(4);
+    let (enc_tx, mut enc_rx) = tokio::sync::mpsc::channel::<Bytes>(32);
 
-        // 1. Read WebSocket messages (input + signaling)
-        //    Check for incoming messages with non-blocking-like approach
-        //    (short timeout so we don't stall capture)
+    // Shutdown signal — unified CancellationToken for all pipeline tasks
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    // ── Stage 1: Capture (spawn_blocking) ──
+    let cap_stop = cancel.clone();
+    let cap_raw_tx = raw_tx.clone();
+    let cap_handle = tokio::task::spawn_blocking(move || {
+        let mut raw_buf = vec![0u8; cap_w as usize * cap_h as usize * 4];
+        let mut last_raw = raw_buf.clone(); // repeat frame on capture failure
         loop {
-            match in_rx.try_recv() {
-                Ok(Ok(Message::Text(t))) => {
-                    // Try signaling first
-                    if let Ok(sig) = serde_json::from_str::<SignalingMessage>(&t) {
-                        match sig {
-                            SignalingMessage::Ice { candidate, sdp_mline_index } => {
-                                eprintln!("[ws] ICE from client: mline={}", sdp_mline_index);
-                                let init = RTCIceCandidateInit {
-                                    candidate,
-                                    sdp_mline_index: Some(sdp_mline_index as u16),
-                                    ..Default::default()
-                                };
-                                let _ = pc.add_ice_candidate(init).await;
-                            }
-                            SignalingMessage::Offer { .. } => {
-                                eprintln!("[ws] unexpected duplicate offer, ignoring");
-                            }
-                            _ => {}
-                        }
+            if cap_stop.is_cancelled() { break; }
+
+            let frame_start = std::time::Instant::now();
+            if let Err(e) = screen_capture.capture(&mut raw_buf) {
+                log::info!("[capture] error: {:#}, repeating last frame", e);
+                // Repeat last frame to prevent decoder from losing reference frames
+                raw_buf.clone_from(&last_raw);
+            } else {
+                last_raw.clone_from(&raw_buf);
+            }
+            // Send via Bytes (zero-copy Vec→Bytes transfer), next frame reallocates via mimalloc (fast)
+            if cap_stop.is_cancelled() { return; }
+            if cap_raw_tx.send(Bytes::from(std::mem::take(&mut raw_buf))).is_err() { break; }
+            let elapsed = frame_start.elapsed();
+            if elapsed < frame_duration {
+                std::thread::sleep(frame_duration - elapsed);
+            }
+        }
+        log::debug!("[capture] task ended");
+    });
+
+    // ── Stage 2: Convert (spawn_blocking) ──
+    let conv_stop = cancel.clone();
+    let conv_yuv_tx = yuv_tx.clone();
+    let conv_handle = tokio::task::spawn_blocking(move || {
+        let mut i420_buf = vec![0u8; (out_w * out_h * 3 / 2) as usize];
+        let mut tmp_argb = Vec::new();
+        loop {
+            if conv_stop.is_cancelled() { break; }
+            match raw_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+                Ok(raw) => {
+                    if needs_scaling {
+                        scale_bgra_direct(raw.as_ref(), cap_w32, cap_h32,
+                            out_w, out_h, &mut i420_buf, &mut tmp_argb);
                     } else {
-                        // Input message
-                        handle_input_message(&t, &x11_state);
-                        send_cursor_position(&out_tx, &x11_state);
+                        bgra_to_i420(raw.as_ref(), out_w, out_h, &mut i420_buf);
+                    }
+                    // Use take — mimalloc reuses freed memory instantly
+                    if conv_stop.is_cancelled() { return; }
+                    if conv_yuv_tx.send(std::mem::take(&mut i420_buf)).is_err() { return; }
+                }
+                Err(block_mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(block_mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        log::debug!("[convert] task ended");
+    });
+
+    // ── Stage 3: Encode (spawn_blocking, single-threaded) ──
+    let enc_stop = cancel.clone();
+    let enc_tx_clone = enc_tx.clone();
+    let enc_handle = tokio::task::spawn_blocking(move || {
+        let mut enc_buf = Vec::with_capacity(65536);
+        let mut frame_count: u64 = 0;
+        loop {
+            if enc_stop.is_cancelled() { break; }
+            match yuv_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+                Ok(yuv) => {
+                    enc_buf.clear();
+                    if let Err(e) = encoder.encode(yuv, &mut enc_buf) {
+                        log::error!("[encoder] error: {:#}, forcing keyframe", e);
+                        encoder.force_keyframe();
+                        continue;
+                    }
+                    let frame = Bytes::from(std::mem::take(&mut enc_buf));
+                    // blocking_send provides backpressure: encoder backs off when channel is full.
+                    // The send task runs in the tokio async runtime, so it will eventually drain
+                    // the channel, waking this blocking_send. Channel capacity 32 = ~1.3s @ 24fps.
+                    if enc_stop.is_cancelled() { return; }
+                    if enc_tx_clone.blocking_send(frame).is_err() { return; }
+                    frame_count += 1;
+                    let period = state.args.framerate as u64 * 10;
+                    if frame_count % period == 0 {
+                        encoder.force_keyframe();
                     }
                 }
-                Ok(Ok(Message::Close(_))) => {
-                    eprintln!("[ws] client sent close");
-                    break;
-                }
-                Ok(Err(_)) => break,
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    eprintln!("[ws] channel disconnected");
-                    break;
-                }
-                _ => {}
+                Err(block_mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(block_mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        log::debug!("[encoder] task ended");
+    });
 
-        // 2. Check if connection is still alive
-        match done_rx.try_recv() {
-            Ok(()) => {
-                eprintln!("[loop] connection closed, exiting");
+    // ── Stage 4: Send (async) ──
+    let send_stop = cancel.clone();
+    let send_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(h264) = enc_rx.recv() => {
+                    if h264.is_empty() { continue; }
+                    if let Err(e) = track.sample_writer(track_ssrc).write_sample(&Sample {
+                        data: h264,
+                        duration: frame_duration,
+                        ..Default::default()
+                    }).await {
+                        log::info!("[send] write_sample error: {}", e);
+                        break;
+                    }
+                }
+                _ = send_stop.cancelled() => { break; }
+            }
+        }
+        log::debug!("[send] task ended");
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  Audio pipeline: PulseAudio → Opus → WebRTC (parallel to video)
+    // ═══════════════════════════════════════════════════════════
+
+    use libpulse_binding as pulse;
+    use libpulse_simple_binding as psimple;
+
+    // Auto-detect default sink monitor source for system audio capture
+    let audio_source = find_default_monitor();
+    if let Some(ref src) = audio_source {
+        log::info!("[audio] using monitor source: {}", src);
+    } else {
+        log::info!("[audio] no monitor found, falling back to default record source");
+    }
+
+    let audio_frame_duration = std::time::Duration::from_millis(20);
+
+    // Audio channels — std sync_channel for blocking pipeline (recv_timeout available)
+    let (pcm_tx, pcm_rx) = block_mpsc::sync_channel::<Vec<u8>>(8);
+    let (opus_tx, mut opus_rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+
+    // ── Audio Stage 1: PulseAudio capture (spawn_blocking) ──
+    let audio_cap_stop = cancel.clone();
+    let audio_pcm_tx = pcm_tx.clone();
+    let audio_source = audio_source.clone();
+    let audio_cap_handle = tokio::task::spawn_blocking(move || {
+        let spec = pulse::sample::Spec {
+            format: pulse::sample::Format::S16NE,
+            channels: 2,
+            rate: 48000,
+        };
+        if !spec.is_valid() {
+            log::info!("[audio] invalid PulseAudio sample spec");
+            return;
+        }
+        let dev = audio_source.as_deref();
+        let pa = match psimple::Simple::new(
+            None, "vnrit", pulse::stream::Direction::Record,
+            dev, "audio-capture", &spec, None, None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("[audio] PulseAudio init failed: {} — audio disabled", e);
+                return;
+            }
+        };
+        log::info!("[audio] PulseAudio capture started");
+
+        const PCM_FRAME_BYTES: usize = 3840;
+        let mut buf = vec![0u8; PCM_FRAME_BYTES];
+        loop {
+            if audio_cap_stop.is_cancelled() { break; }
+            if let Err(e) = pa.read(&mut buf) {
+                log::info!("[audio] read error: {}", e);
                 break;
             }
-            Err(_) => {} // no message yet
+            // Clone PCM data — buf retains capacity for next frame (3840 bytes, cheap clone)
+            if audio_cap_stop.is_cancelled() { return; }
+            if audio_pcm_tx.send(buf.clone()).is_err() { return; }
         }
+        log::debug!("[audio] capture task ended");
+    });
 
-        // 3. Capture screen
-        let frame_data = match capture.capture() {
-            Ok(data) => data,
+    // ── Audio Stage 2: Opus encode (spawn_blocking) ──
+    let audio_enc_stop = cancel.clone();
+    let audio_opus_tx = opus_tx.clone();
+    let audio_enc_handle = tokio::task::spawn_blocking(move || {
+        let mut encoder = match opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::Audio) {
+            Ok(e) => e,
             Err(e) => {
-                eprintln!("[capture] error: {:#}", e);
-                tokio::time::sleep(frame_duration).await;
-                continue;
+                log::info!("[audio] Opus encoder init failed: {}", e);
+                return;
             }
         };
-
-        // 4. Scale if needed, then convert to I420 in one pass
-        let i420 = if needs_scaling {
-            // scale_bgra_image does BGRA→RGBA internally and returns RGBA
-            let rgba = scale_bgra_image(&frame_data, native_w as u32, native_h as u32, out_w, out_h);
-            rgba_to_i420(&rgba, out_w, out_h)
-        } else {
-            // Direct BGRA→I420: one pass, no intermediate allocation, integer math
-            bgra_to_i420(&frame_data, out_w, out_h)
-        };
-
-        // 6. Encode to H.264
-        let h264_data = match encoder.encode(&i420) {
-            Ok(data) => data,
-            Err(e) => {
-                eprintln!("[encoder] error: {:#}", e);
-                tokio::time::sleep(frame_duration).await;
-                continue;
+        let mut opus_out = Vec::with_capacity(4096);
+        loop {
+            if audio_enc_stop.is_cancelled() { break; }
+            match pcm_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+                Ok(pcm) => {
+                    // Safety: pcm comes from PulseAudio which always returns multiples of frame size
+                    // (3840 bytes = 1920 i16 samples @ 20ms stereo 48kHz). Assert to prevent UB.
+                    assert_eq!(pcm.len() % 2, 0, "PCM buffer length must be even for i16 samples");
+                    let samples = unsafe {
+                        std::slice::from_raw_parts(pcm.as_ptr() as *const i16, pcm.len() / 2)
+                    };
+                    opus_out.clear();
+                    opus_out.resize(4096, 0);
+                    match encoder.encode(samples, &mut opus_out) {
+                        Ok(n) => {
+                            opus_out.truncate(n);
+                            // Copy to Bytes — opus_out retains capacity for next frame
+                            let frame = Bytes::copy_from_slice(&opus_out);
+                            // try_send — if full, drop packet to avoid blocking spawn_blocking
+                            if audio_enc_stop.is_cancelled() { return; }
+                            let _ = audio_opus_tx.try_send(frame);
+                        }
+                        Err(e) => log::info!("[audio] encode error: {}", e),
+                    }
+                }
+                Err(block_mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(block_mpsc::RecvTimeoutError::Disconnected) => break,
             }
-        };
+        }
+        log::debug!("[audio] encode task ended");
+    });
 
-        // 7. Write sample to webrtc track
-        if !h264_data.is_empty() {
-            if let Err(e) = track.sample_writer(track_ssrc).write_sample(&Sample {
-                data: Bytes::from(h264_data),
-                duration: frame_duration,
-                ..Default::default()
-            }).await {
-                eprintln!("[send] write_sample error: {}", e);
+    // ── Audio Stage 3: Send Opus packets via WebRTC (async) ──
+    let audio_send_stop = cancel.clone();
+    let audio_send_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(opus_packet) = opus_rx.recv() => {
+                    if opus_packet.is_empty() { continue; }
+                    if let Err(e) = audio_track.sample_writer(audio_ssrc).write_sample(&Sample {
+                        data: opus_packet,
+                        duration: audio_frame_duration,
+                        ..Default::default()
+                    }).await {
+                        log::info!("[audio] write_sample error: {}", e);
+                        break;
+                    }
+                }
+                _ = audio_send_stop.cancelled() => { break; }
+            }
+        }
+        log::debug!("[audio] send task ended");
+    });
+
+    // ── Input handling runs in main task (non-blocking) ──
+    loop {
+        tokio::select! {
+            // Handle incoming WebSocket messages (input + signaling)
+            msg = in_rx.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(t))) => {
+                        if let Ok(sig) = serde_json::from_str::<SignalingMessage>(&t) {
+                            match sig {
+                                SignalingMessage::Ice { candidate, sdp_mline_index } => {
+                                    let init = RTCIceCandidateInit {
+                                        candidate,
+                                        sdp_mline_index: Some(sdp_mline_index as u16),
+                                        ..Default::default()
+                                    };
+                                    let _ = pc.add_ice_candidate(init).await;
+                                }
+                                SignalingMessage::Offer { .. } => {
+                                    log::debug!("[ws] unexpected duplicate offer, ignoring");
+                                }
+                                _ => {}
+                            }
+                        } else if t.starts_with("mr,") || t.starts_with("ma,")
+                            || t.starts_with("md,") || t.starts_with("mu,")
+                            || t.starts_with("ms,") || t.starts_with("kd,")
+                            || t.starts_with("ku,")
+                        {
+                            handle_input_message(&t, &input_state);
+                            send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
+                        } else {
+                            let preview: String = t.chars().take(100).collect();
+                            log::debug!("[ws] unrecognized message: '{}'", preview);
+                            let _ = out_tx.try_send(Message::Text(
+                                serde_json::json!({"type":"error","message":"invalid message format"}).to_string().into()
+                            ));
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        log::debug!("[ws] client sent close");
+                        break;
+                    }
+                    Some(Err(_)) | None => {
+                        log::debug!("[ws] channel disconnected");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Check peer connection state
+            _ = async {
+                match done_rx.try_recv() {
+                    Ok(()) => {}
+                    Err(_) => futures_util::future::pending::<()>().await,
+                }
+            } => {
+                log::debug!("[loop] connection closed, exiting");
                 break;
             }
-        }
-
-        // 8. Maintain target framerate
-        frame_count += 1;
-        let elapsed = frame_start.elapsed();
-        if elapsed < frame_duration {
-            tokio::time::sleep(frame_duration - elapsed).await;
-        }
-
-        // Periodic keyframe (every 240 frames ≈ 10s at 24fps)
-        if frame_count % 240 == 0 {
-            encoder.force_keyframe();
         }
     }
 
     // ── CLEANUP ──
-    eprintln!("[cleanup] client disconnected, starting cleanup...");
+    log::info!("[cleanup] client disconnected, shutting down pipeline...");
 
-    ice_forward.abort();
+    // Signal all pipeline tasks to stop via CancellationToken
+    cancel.cancel();
+
+    // Release all pressed keys on the X server to prevent stuck keys
+    // (e.g. from virtual keyboard clicks where ku is lost on disconnect)
+    {
+        let keys = input_state.pressed_keys.lock().unwrap();
+        for &kc in keys.iter() {
+            let _ = xtest::fake_input(&input_state.conn, X11_KEY_RELEASE,
+                kc, 0, input_state.root, 0, 0, 0);
+        }
+        if !keys.is_empty() {
+            let _ = input_state.conn.flush();
+        }
+    }
+
+    // Drop channel senders so receivers stop blocking
+    drop(raw_tx);
+    drop(yuv_tx);
+    drop(enc_tx);
+    drop(pcm_tx);
+    drop(opus_tx);
+
+    // Wait for pipeline tasks to finish
+    let _ = cap_handle.await;
+    let _ = conv_handle.await;
+    let _ = enc_handle.await;
+    let _ = send_handle.await;
+    let _ = audio_cap_handle.await;
+    let _ = audio_enc_handle.await;
+    let _ = audio_send_handle.await;
+
+    // ICE forward: drop handler to close ice channel, then await task completion
+    drop(handler);
     let _ = ice_forward.await;
 
     io_handle.abort();
     let _ = io_handle.await;
-    drop(out_tx);
-    drop(in_tx);
 
     let _ = pc.close().await;
-    eprintln!("[ws] cleanup complete");
+    log::info!("[ws] cleanup complete");
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Input handling (unchanged from GStreamer version)
+//  Input handling — keyboard/mouse injection via XTest
 // ═══════════════════════════════════════════════════════════════
 
-fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
+fn handle_input_message(raw: &str, state: &InputState) {
     let parts: Vec<&str> = raw.split(',').collect();
     if parts.is_empty() {
         return;
     }
 
-    let s = state.lock().unwrap();
-
     match parts[0] {
         "mr" if parts.len() >= 3 => {
-            // mr,dx,dy — relative mouse move
             let dx: i32 = parts[1].parse().unwrap_or(0);
             let dy: i32 = parts[2].parse().unwrap_or(0);
-            let new_x = s.cursor_x.load(Ordering::Relaxed).saturating_add(dx).max(0);
-            let new_y = s.cursor_y.load(Ordering::Relaxed).saturating_add(dy).max(0);
-            s.cursor_x.store(new_x, Ordering::Relaxed);
-            s.cursor_y.store(new_y, Ordering::Relaxed);
-            let _ = xtest::fake_input(&s.conn, X11_MOTION_NOTIFY,
-                0, 0, s.root,
-                s.cursor_x.load(Ordering::Relaxed) as i16,
-                s.cursor_y.load(Ordering::Relaxed) as i16,
+            let max_x = state.screen_w as i32 - 1;
+            let max_y = state.screen_h as i32 - 1;
+            let new_x = state.cursor_x.load(Ordering::Relaxed).saturating_add(dx).clamp(0, max_x);
+            let new_y = state.cursor_y.load(Ordering::Relaxed).saturating_add(dy).clamp(0, max_y);
+            state.cursor_x.store(new_x, Ordering::Relaxed);
+            state.cursor_y.store(new_y, Ordering::Relaxed);
+            let _ = xtest::fake_input(&state.conn, X11_MOTION_NOTIFY,
+                0, 0, state.root,
+                state.cursor_x.load(Ordering::Relaxed) as i16,
+                state.cursor_y.load(Ordering::Relaxed) as i16,
                 0);
-            let _ = s.conn.flush();
+            let _ = state.conn.flush();
         }
         "ma" if parts.len() >= 3 => {
-            // ma,x,y — absolute mouse move
-            let new_x = parts[1].parse::<i32>().unwrap_or(0).max(0);
-            let new_y = parts[2].parse::<i32>().unwrap_or(0).max(0);
-            s.cursor_x.store(new_x, Ordering::Relaxed);
-            s.cursor_y.store(new_y, Ordering::Relaxed);
-            let _ = xtest::fake_input(&s.conn, X11_MOTION_NOTIFY,
-                0, 0, s.root,
-                s.cursor_x.load(Ordering::Relaxed) as i16,
-                s.cursor_y.load(Ordering::Relaxed) as i16,
+            let max_x = state.screen_w as i32 - 1;
+            let max_y = state.screen_h as i32 - 1;
+            let new_x = parts[1].parse::<i32>().unwrap_or(0).clamp(0, max_x);
+            let new_y = parts[2].parse::<i32>().unwrap_or(0).clamp(0, max_y);
+            state.cursor_x.store(new_x, Ordering::Relaxed);
+            state.cursor_y.store(new_y, Ordering::Relaxed);
+            let _ = xtest::fake_input(&state.conn, X11_MOTION_NOTIFY,
+                0, 0, state.root,
+                state.cursor_x.load(Ordering::Relaxed) as i16,
+                state.cursor_y.load(Ordering::Relaxed) as i16,
                 0);
-            let _ = s.conn.flush();
+            let _ = state.conn.flush();
         }
         "md" if parts.len() >= 2 => {
-            // md,button — mouse button down
             let btn: u8 = match parts[1] {
                 "2" => 2,
                 "3" => 3,
                 _ => 1,
             };
-            let _ = xtest::fake_input(&s.conn, X11_BUTTON_PRESS,
-                btn, 0, s.root, s.cursor_x.load(Ordering::Relaxed) as i16, s.cursor_y.load(Ordering::Relaxed) as i16, 0);
-            let _ = s.conn.flush();
+            let _ = xtest::fake_input(&state.conn, X11_BUTTON_PRESS,
+                btn, 0, state.root, state.cursor_x.load(Ordering::Relaxed) as i16, state.cursor_y.load(Ordering::Relaxed) as i16, 0);
+            let _ = state.conn.flush();
         }
         "mu" if parts.len() >= 2 => {
-            // mu,button — mouse button up
             let btn: u8 = match parts[1] {
                 "2" => 2,
                 "3" => 3,
                 _ => 1,
             };
-            let _ = xtest::fake_input(&s.conn, X11_BUTTON_RELEASE,
-                btn, 0, s.root, s.cursor_x.load(Ordering::Relaxed) as i16, s.cursor_y.load(Ordering::Relaxed) as i16, 0);
-            let _ = s.conn.flush();
+            let _ = xtest::fake_input(&state.conn, X11_BUTTON_RELEASE,
+                btn, 0, state.root, state.cursor_x.load(Ordering::Relaxed) as i16, state.cursor_y.load(Ordering::Relaxed) as i16, 0);
+            let _ = state.conn.flush();
         }
         "ms" if parts.len() >= 2 => {
-            // ms,deltaY — scroll wheel (click 4=up, 5=down)
             let delta: f64 = parts[1].parse().unwrap_or(0.0);
             let steps = (delta.abs() / 40.0).round().clamp(1.0, 20.0) as u32;
             let btn = if delta > 0.0 { 5_u8 } else { 4_u8 };
-            let cx = s.cursor_x.load(Ordering::Relaxed) as i16;
-            let cy = s.cursor_y.load(Ordering::Relaxed) as i16;
+            let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
+            let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
             for _ in 0..steps {
-                let _ = xtest::fake_input(&s.conn, X11_BUTTON_PRESS,
-                    btn, 0, s.root, cx, cy, 0);
-                let _ = xtest::fake_input(&s.conn, X11_BUTTON_RELEASE,
-                    btn, 0, s.root, cx, cy, 0);
+                let _ = xtest::fake_input(&state.conn, X11_BUTTON_PRESS,
+                    btn, 0, state.root, cx, cy, 0);
+                let _ = xtest::fake_input(&state.conn, X11_BUTTON_RELEASE,
+                    btn, 0, state.root, cx, cy, 0);
             }
-            let _ = s.conn.flush();
+            let _ = state.conn.flush();
         }
         "kd" if parts.len() >= 2 => {
-            // kd,code — key down
             let keysym = code_to_keysym(parts[1]);
             if keysym != 0 {
-                let kc = find_keycode(&s, keysym);
+                let kc = find_keycode(state, keysym);
                 if kc > 0 {
-                    let _ = xtest::fake_input(&s.conn, X11_KEY_PRESS,
-                        kc, 0, s.root, s.cursor_x.load(Ordering::Relaxed) as i16, s.cursor_y.load(Ordering::Relaxed) as i16, 0);
-                    let _ = s.conn.flush();
+                    state.pressed_keys.lock().unwrap().insert(kc);
+                    let _ = xtest::fake_input(&state.conn, X11_KEY_PRESS,
+                        kc, 0, state.root, state.cursor_x.load(Ordering::Relaxed) as i16, state.cursor_y.load(Ordering::Relaxed) as i16, 0);
+                    let _ = state.conn.flush();
                 }
             }
         }
         "ku" if parts.len() >= 2 => {
             let keysym = code_to_keysym(parts[1]);
             if keysym != 0 {
-                let kc = find_keycode(&s, keysym);
+                let kc = find_keycode(state, keysym);
                 if kc > 0 {
-                    let _ = xtest::fake_input(&s.conn, X11_KEY_RELEASE,
-                        kc, 0, s.root, s.cursor_x.load(Ordering::Relaxed) as i16, s.cursor_y.load(Ordering::Relaxed) as i16, 0);
-                    let _ = s.conn.flush();
+                    state.pressed_keys.lock().unwrap().remove(&kc);
+                    let _ = xtest::fake_input(&state.conn, X11_KEY_RELEASE,
+                        kc, 0, state.root, state.cursor_x.load(Ordering::Relaxed) as i16, state.cursor_y.load(Ordering::Relaxed) as i16, 0);
+                    let _ = state.conn.flush();
                 }
             }
         }
@@ -1378,20 +1772,23 @@ fn handle_input_message(raw: &str, state: &Arc<Mutex<AppState>>) {
     }
 }
 
-fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &Arc<Mutex<AppState>>) {
-    let s = state.lock().unwrap();
-    let x = s.cursor_x.load(Ordering::Relaxed);
-    let y = s.cursor_y.load(Ordering::Relaxed);
-    drop(s);
-    let msg = serde_json::to_string(&serde_json::json!({
+fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &InputState,
+    native_w: u16, native_h: u16, out_w: u32, out_h: u32)
+{
+    let x = state.cursor_x.load(Ordering::Relaxed);
+    let y = state.cursor_y.load(Ordering::Relaxed);
+    // Scale from native X11 coordinates to encoded video coordinates
+    let sx = if native_w > 0 { x as u64 * out_w as u64 / native_w as u64 } else { x as u64 };
+    let sy = if native_h > 0 { y as u64 * out_h as u64 / native_h as u64 } else { y as u64 };
+    let Ok(msg) = serde_json::to_string(&serde_json::json!({
         "type": "cursor",
-        "x": x,
-        "y": y
-    })).unwrap();
+        "x": sx,
+        "y": sy
+    })) else { return };
     let _ = out_tx.try_send(Message::Text(msg.into()));
 }
 
-fn find_keycode(s: &AppState, keysym: u32) -> u8 {
+fn find_keycode(s: &InputState, keysym: u32) -> u8 {
     s.keycode_cache.get(&keysym).copied().unwrap_or(0)
 }
 

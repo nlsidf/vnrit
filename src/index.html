@@ -64,6 +64,8 @@
     image-rendering: auto;
     touch-action: none;
   }
+  /* Hidden audio element for Opus playback */
+  #remote-audio { display: none; }
   #info {
     position: fixed;
     bottom: 8px;
@@ -151,7 +153,8 @@
     pointer-events: none;
     z-index: 999;
     display: none;
-    transform: translate(-50%, -50%);
+    /* Use transform instead of left/top to avoid layout thrash */
+    will-change: transform;
     box-shadow: 0 0 6px rgba(0,0,0,0.5);
     background: radial-gradient(
       circle at 50% 50%,
@@ -162,8 +165,6 @@
       transparent 5px
     );
     border-radius: 50%;
-    transition: left 0.015s ease-out, top 0.015s ease-out;
-    will-change: left, top; 
   }
   /* ── Custom Virtual Keyboard ── */
   #custom-keyboard {
@@ -319,6 +320,7 @@
 <div id="container">
   <div id="viewport">
     <video id="remote-video" autoplay playsinline muted></video>
+    <audio id="remote-audio" autoplay playsinline></audio>
     <div id="cursor-overlay"></div>
     <div id="pointer-hint">Click to interact<br><small>(right-click for menu)</small></div>
     <div id="audio-hint">Tap to enable audio</div>
@@ -508,41 +510,37 @@ let displayWidth = 0;
 let displayHeight = 0;
 let reconnectDelay = 1000;
 
+// Cached render rect — recomputed only on resize/orientationchange
+let cachedRenderRect = null;
+let cachedRectVersion = 0;
+
 // ── Browser-side cursor overlay tracking ──
 let localCursorX = 0;
 let localCursorY = 0;
 const cursorOverlay = document.getElementById('cursor-overlay');
+const CURSOR_CENTER = 11; // half of 22px width — precomputed for translate(-50%, -50%)
 
 function updateCursorOverlay() {
-  const rect = video.getBoundingClientRect();
-  const elW = rect.width, elH = rect.height;
-  if (elW <= 0 || elH <= 0) return;
-
-  if (displayWidth <= 0 || displayHeight <= 0) {
-    cursorOverlay.style.left = (elW / 2) + 'px';
-    cursorOverlay.style.top = (elH / 2) + 'px';
-    cursorOverlay.style.display = 'block';
-    return;
+  if (displayWidth > 0 && displayHeight > 0) {
+    const r = getVideoRenderRect();
+    if (r) {
+      const cssX = r.renderX + (localCursorX / displayWidth) * r.renderW;
+      const cssY = r.renderY + (localCursorY / displayHeight) * r.renderH;
+      cursorOverlay.style.transform = `translate(${cssX - CURSOR_CENTER}px, ${cssY - CURSOR_CENTER}px)`;
+    }
   }
-
-  const r = getVideoRenderRect();
-  if (!r) return;
-
-  const cssX = r.renderX + (localCursorX / displayWidth) * r.renderW;
-  const cssY = r.renderY + (localCursorY / displayHeight) * r.renderH;
-
-  cursorOverlay.style.left = cssX + 'px';
-  cursorOverlay.style.top = cssY + 'px';
   cursorOverlay.style.display = 'block';
 }
 
 function capLocalCursor() {
   localCursorX = Math.max(0, Math.min(displayWidth - 1, localCursorX));
   localCursorY = Math.max(0, Math.min(displayHeight - 1, localCursorY));
+  updateCursorOverlay();
 }
 
 // Shared: compute video render rect (letterboxed area accounting for aspect ratio)
 function getVideoRenderRect() {
+  if (cachedRenderRect) return cachedRenderRect;
   const rect = video.getBoundingClientRect();
   const elW = rect.width, elH = rect.height;
   if (elW <= 0 || elH <= 0) return null;
@@ -565,7 +563,13 @@ function getVideoRenderRect() {
     renderY = 0;
   }
 
-  return { renderW, renderH, renderX, renderY };
+  cachedRenderRect = { renderW, renderH, renderX, renderY };
+  return cachedRenderRect;
+}
+
+function invalidateRenderRect() {
+  cachedRenderRect = null;
+  ++cachedRectVersion;
 }
 
 function setStatus(text, connected) {
@@ -573,13 +577,14 @@ function setStatus(text, connected) {
   dot.className = connected ? 'connected' : '';
 }
 
-// ── Throttled input ──
+// ── On-demand input throttle (requestAnimationFrame, no idle firing) ──
 let relAccDx = 0, relAccDy = 0;
-let throttleTimer = null;
+let relFlushPending = false;
 let lastAbsMoveTs = 0;
 const THROTTLE_MS = 20;
 
 function flushRelInput() {
+  relFlushPending = false;
   const dx = relAccDx;
   const dy = relAccDy;
   relAccDx = 0;
@@ -589,17 +594,17 @@ function flushRelInput() {
   }
 }
 
-function startInputThrottle() {
-  stopInputThrottle();
-  throttleTimer = setInterval(flushRelInput, THROTTLE_MS);
+function scheduleRelFlush() {
+  if (!relFlushPending) {
+    relFlushPending = true;
+    requestAnimationFrame(flushRelInput);
+  }
 }
 
-function stopInputThrottle() {
-  if (throttleTimer) {
-    clearInterval(throttleTimer);
-    throttleTimer = null;
-  }
-  flushRelInput();
+function cancelPendingInputs() {
+  relAccDx = 0;
+  relAccDy = 0;
+  relFlushPending = false;
 }
 
 function sendInput(csv) {
@@ -632,7 +637,13 @@ function connect() {
   };
 
   ws.onmessage = async (event) => {
-    const msg = JSON.parse(event.data);
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      console.warn('[ws] non-JSON message:', event.data);
+      return;
+    }
 
     switch (msg.type) {
       case 'offer':
@@ -658,7 +669,6 @@ function connect() {
           localCursorX = msg.x;
           localCursorY = msg.y;
           capLocalCursor();
-          updateCursorOverlay();
         }
         break;
       case 'error':
@@ -704,11 +714,18 @@ async function handleOffer(sdp) {
         displayWidth = video.videoWidth;
         displayHeight = video.videoHeight;
         console.log(`[video] ${displayWidth}x${displayHeight}`);
+        invalidateRenderRect();
+        cursorOverlay.style.display = 'block';
         updateCursorOverlay();
       };
       setStatus('●', true);
       document.getElementById('status-text').style.opacity = '0';
       pointerHint.style.display = 'block';
+    } else if (event.track.kind === 'audio') {
+      const audio = document.getElementById('remote-audio');
+      audio.srcObject = event.streams[0];
+      audio.play().catch(() => {}); // user gesture may be required
+      document.getElementById('audio-hint').style.display = 'block';
     }
   };
 
@@ -768,9 +785,10 @@ async function handleOffer(sdp) {
 }
 
 function videoPos(clientX, clientY) {
-  const rect = video.getBoundingClientRect();
+  invalidateRenderRect(); // ensure rect is fresh for this frame
   const r = getVideoRenderRect();
   if (!r) return null;
+  const rect = video.getBoundingClientRect();
 
   const x = (clientX - rect.left - r.renderX) / r.renderW;
   const y = (clientY - rect.top - r.renderY) / r.renderH;
@@ -789,6 +807,7 @@ function refreshDisplaySize() {
   if (w > 0 && h > 0) {
     displayWidth = w;
     displayHeight = h;
+    invalidateRenderRect();
     updateCursorOverlay();
   }
 }
@@ -796,12 +815,15 @@ function refreshDisplaySize() {
 function cancelPendingInputs() {
   relAccDx = 0;
   relAccDy = 0;
+  relFlushPending = false;
 }
 
-window.addEventListener('resize', refreshDisplaySize);
-window.addEventListener('orientationchange', () => {
-  setTimeout(refreshDisplaySize, 300);
+// ── ResizeObserver for real-time container tracking ──
+const resizeObserver = new ResizeObserver(() => {
+  invalidateRenderRect();
+  if (displayWidth > 0) updateCursorOverlay();
 });
+resizeObserver.observe(viewport);
 
 // ── Mouse events ──
 let lastTouchEndTime = 0;
@@ -817,13 +839,11 @@ function isOnUI(el) {
 
 document.addEventListener('mousemove', (e) => {
   if (isSyntheticFromTouch() || isOnUI(e.target)) return;
-  refreshDisplaySize();
   const pos = videoPos(e.clientX, e.clientY);
   if (pos) {
     localCursorX = pos.x;
     localCursorY = pos.y;
-    capLocalCursor();
-    updateCursorOverlay();
+    capLocalCursor(); // calls updateCursorOverlay
     const now = Date.now();
     if (now - lastAbsMoveTs >= THROTTLE_MS) {
       sendInput(`ma,${pos.x},${pos.y}`);
@@ -834,7 +854,6 @@ document.addEventListener('mousemove', (e) => {
 
 document.addEventListener('mousedown', (e) => {
   if (isSyntheticFromTouch() || isOnUI(e.target)) return;
-  refreshDisplaySize();
   const pos = videoPos(e.clientX, e.clientY);
   if (pos) {
     sendInput(`ma,${pos.x},${pos.y}`);
@@ -888,7 +907,6 @@ video.addEventListener('touchstart', (e) => {
   e.preventDefault();
   lastTouchEndTime = Date.now();
   const t = e.touches[0];
-  refreshDisplaySize();
   clearTimeout(longPressTimer);
 
   const now = Date.now();
@@ -950,8 +968,8 @@ video.addEventListener('touchmove', (e) => {
       relAccDy += deltaYDrag;
       localCursorX += deltaXDrag;
       localCursorY += deltaYDrag;
-      capLocalCursor();
-      updateCursorOverlay();
+      capLocalCursor(); // calls updateCursorOverlay
+      scheduleRelFlush();
     }
   } else if (isLongPress) {
     longPressMoved = true;
@@ -975,8 +993,8 @@ video.addEventListener('touchmove', (e) => {
       relAccDy += deltaY;
       localCursorX += deltaX;
       localCursorY += deltaY;
-      capLocalCursor();
-      updateCursorOverlay();
+      capLocalCursor(); // calls updateCursorOverlay
+      scheduleRelFlush();
     }
   }
 }, { passive: false });
@@ -1032,6 +1050,17 @@ document.addEventListener('keydown', (e) => {
 
 document.addEventListener('keyup', (e) => {
   sendInput(`ku,${e.code}`);
+});
+
+// ── Page unload: release modifier keys before connection drops ──
+window.addEventListener('beforeunload', () => {
+  releaseAllModifiers();
+  // Flush any pending relative input
+  flushRelInput();
+  // Attempt synchronous close to ensure WebSocket flush
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.close(); } catch (_) {}
+  }
 });
 
 // Auto-hide hint after 4 seconds
@@ -1342,9 +1371,8 @@ document.addEventListener('click', enableAudio);
 document.addEventListener('touchstart', enableAudio);
 
 // ── Start ──
-connect();
-startInputThrottle();
-setTimeout(updateCursorOverlay, 100);
+// Defer initial connection to avoid blocking first paint / layout
+requestIdleCallback(connect, { timeout: 2000 });
 
 window.econsole = console;
 </script>
