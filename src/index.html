@@ -52,7 +52,17 @@
     height: 100%;
     position: relative;
     overflow: hidden;
-    transition: transform 0.22s cubic-bezier(0.33, 1, 0.68, 1);
+  }
+  #zoom-layer {
+    width: 100%;
+    height: 100%;
+    transform-origin: 0 0;
+  }
+  #zoom-layer.smooth {
+    transition: transform 0.15s cubic-bezier(0.33, 1, 0.68, 1);
+  }
+  #zoom-layer.follow {
+    transition: transform 0.06s ease-out;
   }
   video {
     width: 100%;
@@ -125,6 +135,11 @@
   #toolbar button:hover {
     background: rgba(255,255,255,0.12);
     color: #fff;
+  }
+  #toolbar button.active {
+    background: rgba(255,255,255,0.25);
+    color: #fff;
+    border-color: rgba(255,255,255,0.4);
   }
   #kbd-btn {
     font-size: 14px;
@@ -321,8 +336,10 @@
 
 <div id="container">
   <div id="viewport">
-    <video id="remote-video" autoplay playsinline muted></video>
-    <audio id="remote-audio" autoplay playsinline></audio>
+    <div id="zoom-layer">
+      <video id="remote-video" autoplay playsinline muted></video>
+      <audio id="remote-audio" autoplay playsinline></audio>
+    </div>
     <div id="cursor-overlay"></div>
     <div id="pointer-hint">Click to interact<br><small>(right-click for menu)</small></div>
     <div id="audio-hint">Tap to enable audio</div>
@@ -330,6 +347,7 @@
   <!-- 工具栏移入 container 内部，全屏时可见 -->
   <div id="toolbar">
     <button id="fullscreen-btn">Fullscreen</button>
+    <button id="zoom-btn">+</button>
     <button id="kbd-btn">⌨️</button>
   </div>
   <!-- ── Custom Virtual Keyboard (inside container for fullscreen) ── -->
@@ -503,18 +521,126 @@ const dot = document.getElementById('dot');
 const statusText = document.getElementById('status-text');
 const pointerHint = document.getElementById('pointer-hint');
 const fsBtn = document.getElementById('fullscreen-btn');
+const zoomBtn = document.getElementById('zoom-btn');
 const container = document.getElementById('container');
 const viewport = document.getElementById('viewport');
 
 let pc = null;
 let ws = null;
+let reconnectTimer = null;
+let negotiationTimer = null;
 let displayWidth = 0;
 let displayHeight = 0;
 let reconnectDelay = 1000;
 
-// Cached render rect — recomputed only on resize/orientationchange
-let cachedRenderRect = null;
-let cachedRectVersion = 0;
+// ── Frontend zoom & pan ──
+let zoomLevel = 1.0;
+let zoomPanX = 0;
+let zoomPanY = 0;
+let altHeld = false;
+let buttonZoom = false;
+let zoomActive = false;
+
+function syncZoomActive() {
+  zoomActive = altHeld || buttonZoom;
+}
+
+const ZOOM_MIN = 1.0;
+const ZOOM_MAX = 5.0;
+const ZOOM_STEP = 0.1;
+
+// ── Pinch-to-zoom state ──
+let pinchActive = false;
+let pinchDist0 = 0;
+let pinchZoom0 = 1;
+let pinchPanX0 = 0;
+let pinchPanY0 = 0;
+let pinchWorldCX = 0;
+let pinchWorldCY = 0;
+
+// ── Layout cache — updated only on resize / metadata change ──
+let layoutVersion = 0;           // bumped on every LayoutCache.update()
+let layoutFlushedVersion = -1;   // version used by last flushRender
+const LayoutCache = {
+  rect: null,          // video.getBoundingClientRect()
+  viewRect: null,      // viewport.getBoundingClientRect()
+  renderW: 0, renderH: 0, renderX: 0, renderY: 0,
+  viewW: 0, viewH: 0,  // viewport.clientWidth / clientHeight
+  valid: false,
+  update() {
+    this.rect = video.getBoundingClientRect();
+    this.viewRect = viewport.getBoundingClientRect();
+    const elW = this.rect.width, elH = this.rect.height;
+    this.viewW = viewport.clientWidth;
+    this.viewH = viewport.clientHeight;
+    if (elW <= 0 || elH <= 0 || displayWidth <= 0 || displayHeight <= 0) {
+      this.valid = false;
+      return;
+    }
+    const elAspect = elW / elH;
+    const vidAspect = displayWidth / displayHeight;
+    if (vidAspect > elAspect) {
+      this.renderW = elW;
+      this.renderH = elW / vidAspect;
+      this.renderX = 0;
+      this.renderY = (elH - this.renderH) / 2;
+    } else {
+      this.renderH = elH;
+      this.renderW = elH * vidAspect;
+      this.renderX = (elW - this.renderW) / 2;
+      this.renderY = 0;
+    }
+    this.valid = true;
+    ++layoutVersion;
+  },
+};
+
+// ── RAF render loop — batch all DOM writes ──
+let renderDirty = false;
+
+/// Ensure LayoutCache is up-to-date with current DOM layout.
+/// Call before reading cache after any zoom/pan/keyboard state change.
+function ensureLayoutFresh() {
+  if (layoutVersion !== layoutFlushedVersion) {
+    LayoutCache.update();
+    layoutFlushedVersion = layoutVersion;
+  }
+}
+
+/// @param {string} [smoothClass] — 'smooth' (150ms) or 'follow' (60ms) CSS transition.
+function scheduleRender(smoothClass) {
+  if (!renderDirty) {
+    renderDirty = true;
+    if (smoothClass) {
+      document.getElementById('zoom-layer').classList.add(smoothClass);
+    }
+    requestAnimationFrame(flushRender);
+  }
+}
+
+function flushRender() {
+  renderDirty = false;
+  const layer = document.getElementById('zoom-layer');
+  const kbdHeight = keyboardVisible ? keyboard.offsetHeight : 0;
+  // Clamp pan bounds before applying transform
+  if (zoomLevel > 1) clampPan();
+  if (zoomLevel <= 1.01 && kbdHeight === 0) {
+    layer.style.transform = 'none';
+  } else {
+    let t = '';
+    if (kbdHeight > 0) t += `translateY(-${kbdHeight}px) `;
+    if (zoomLevel > 1.01) t += `translate(${zoomPanX}px, ${zoomPanY}px) scale(${zoomLevel})`;
+    layer.style.transform = t;
+  }
+  // Clear smooth class after each flush (re-added by scheduleRender when needed)
+  layer.classList.remove('smooth', 'follow');
+  // Refresh layout cache after transform change, so cursor is positioned correctly
+  LayoutCache.update();
+  layoutFlushedVersion = layoutVersion;
+  // Render cursor overlay
+  applyCursorPos(localCursorX, localCursorY);
+  cursorOverlay.style.display = 'block';
+}
 
 // ── Browser-side cursor overlay tracking ──
 let localCursorX = 0;
@@ -529,26 +655,52 @@ let animTargetX = 0, animTargetY = 0;
 let animStartTime = 0;
 const ANIM_DURATION = 40; // ms — constant convergence time regardless of distance
 
-/// Render helper: convert display-coordinate (x, y) to a CSS transform and show the overlay.
-/// Pure render function — does NOT mutate localCursorX/Y.
+/// Render helper: convert display-coordinate (x, y) to a CSS transform.
+/// Uses LayoutCache — does NOT touch DOM layout.
 function applyCursorPos(x, y) {
-  if (displayWidth > 0 && displayHeight > 0) {
-    const r = getVideoRenderRect();
-    if (r) {
-      const cssX = r.renderX + (x / displayWidth) * r.renderW;
-      const cssY = r.renderY + (y / displayHeight) * r.renderH;
-      cursorOverlay.style.transform =
-        `translate(${cssX - CURSOR_CENTER}px, ${cssY - CURSOR_CENTER}px)`;
-    }
+  if (displayWidth > 0 && displayHeight > 0 && LayoutCache.valid) {
+    const L = LayoutCache;
+    const vx = L.rect.left + L.renderX + (x / displayWidth) * L.renderW;
+    const vy = L.rect.top + L.renderY + (y / displayHeight) * L.renderH;
+    cursorOverlay.style.transform =
+      `translate(${vx - CURSOR_CENTER}px, ${vy - CURSOR_CENTER}px)`;
   }
-  cursorOverlay.style.display = 'block';
 }
 
 /// Single-frame override refresh: snapshot localCursorX/Y and render immediately.
 /// Used by local input (mouse/touch) for instant response.
-function updateCursorOverlay() {
-  applyCursorPos(localCursorX, localCursorY);
+/// @param {boolean} [skipPan] — skip virtual-cursor panning (used during animation).
+/// When zoomed, also pans the view to keep the remote cursor near center.
+function updateCursorOverlay(skipPan) {
+  ensureLayoutFresh();
+  // Mutate state only — flushRender pushes to DOM in next RAF
+  if (!skipPan && zoomLevel > 1 && displayWidth > 0 && LayoutCache.valid) {
+    const L = LayoutCache;
+    const cvx = L.rect.left + L.renderX + (localCursorX / displayWidth) * L.renderW;
+    const cvy = L.rect.top + L.renderY + (localCursorY / displayHeight) * L.renderH;
+    const dx = cvx - L.viewW / 2;
+    const dy = cvy - L.viewH / 2;
+    // 50px dead zone to avoid micro-adjustments
+    if (Math.abs(dx) > 50 || Math.abs(dy) > 50) {
+      zoomPanX -= dx;
+      zoomPanY -= dy;
+    }
+  }
+  scheduleRender();
 }
+
+/// Clamp zoom pan offset so the visible area never exceeds video boundaries.
+/// At zoom=1 → pan must be (0,0).
+/// At zoom>1 → pan ∈ [viewportW*(1-zoom), 0], [viewportH*(1-zoom), 0].
+function clampPan() {
+  const vw = viewport.clientWidth;
+  const vh = viewport.clientHeight;
+  const minPanX = vw * (1 - zoomLevel);
+  const minPanY = vh * (1 - zoomLevel);
+  zoomPanX = Math.max(minPanX, Math.min(0, zoomPanX));
+  zoomPanY = Math.max(minPanY, Math.min(0, zoomPanY));
+}
+
 
 /// Clamp localCursorX/Y to display bounds (only when dimensions are known)
 /// and refresh the overlay.  Also cancels any running correction animation
@@ -591,7 +743,7 @@ function animStep(now) {
 
   localCursorX = animStartX + (animTargetX - animStartX) * eased;
   localCursorY = animStartY + (animTargetY - animStartY) * eased;
-  updateCursorOverlay();
+  updateCursorOverlay(true);
 
   animFrameId = requestAnimationFrame(animStep);
 }
@@ -624,39 +776,6 @@ function startCursorAnim(targetX, targetY) {
   animFrameId = requestAnimationFrame(animStep);
 }
 
-// Shared: compute video render rect (letterboxed area accounting for aspect ratio)
-function getVideoRenderRect() {
-  if (cachedRenderRect) return cachedRenderRect;
-  const rect = video.getBoundingClientRect();
-  const elW = rect.width, elH = rect.height;
-  if (elW <= 0 || elH <= 0) return null;
-  const vidW = displayWidth, vidH = displayHeight;
-  if (vidW <= 0 || vidH <= 0) return null;
-
-  const elAspect = elW / elH;
-  const vidAspect = vidW / vidH;
-
-  let renderW, renderH, renderX, renderY;
-  if (vidAspect > elAspect) {
-    renderW = elW;
-    renderH = elW / vidAspect;
-    renderX = 0;
-    renderY = (elH - renderH) / 2;
-  } else {
-    renderH = elH;
-    renderW = elH * vidAspect;
-    renderX = (elW - renderW) / 2;
-    renderY = 0;
-  }
-
-  cachedRenderRect = { renderW, renderH, renderX, renderY };
-  return cachedRenderRect;
-}
-
-function invalidateRenderRect() {
-  cachedRenderRect = null;
-  ++cachedRectVersion;
-}
 
 function setStatus(text, connected) {
   statusText.textContent = text;
@@ -709,6 +828,10 @@ function sendInput(csv) {
 function connect() {
   // Release any stuck modifiers before reconnecting
   releaseAllModifiers();
+  // Cancel any pending reconnect
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  // Cancel negotiation timeout
+  if (negotiationTimer) { clearTimeout(negotiationTimer); negotiationTimer = null; }
   // Close existing connection before opening a new one
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.close();
@@ -752,7 +875,11 @@ function connect() {
         break;
       case 'cursor':
         if (typeof msg.x === 'number' && typeof msg.y === 'number') {
-          startCursorAnim(msg.x, msg.y);
+          const dx = msg.x - localCursorX;
+          const dy = msg.y - localCursorY;
+          if (dx * dx + dy * dy > 4) { // >2px threshold to filter echo jitter
+            startCursorAnim(msg.x, msg.y);
+          }
         }
         break;
       case 'error':
@@ -765,8 +892,18 @@ function connect() {
     releaseAllModifiers();
     setStatus('Disconnected, retrying...', false);
     cursorOverlay.style.display = 'none';
+    // Stop media tracks
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach(t => t.stop());
+      video.srcObject = null;
+    }
+    const audioEl = document.getElementById('remote-audio');
+    if (audioEl && audioEl.srcObject) {
+      audioEl.srcObject.getTracks().forEach(t => t.stop());
+      audioEl.srcObject = null;
+    }
     if (pc) { pc.close(); pc = null; }
-    setTimeout(connect, reconnectDelay);
+    reconnectTimer = setTimeout(connect, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 30000);
   };
 
@@ -795,12 +932,22 @@ async function handleOffer(sdp) {
     if (event.track.kind === 'video') {
       video.srcObject = event.streams[0];
       video.onloadedmetadata = () => {
-        displayWidth = video.videoWidth;
-        displayHeight = video.videoHeight;
+        const newW = video.videoWidth;
+        const newH = video.videoHeight;
+        // Reset zoom if remote resolution changed
+        if (newW !== displayWidth || newH !== displayHeight) {
+          zoomLevel = 1.0;
+          zoomPanX = 0;
+          zoomPanY = 0;
+          LayoutCache.update();
+          scheduleRender();
+        }
+        displayWidth = newW;
+        displayHeight = newH;
         console.log(`[video] ${displayWidth}x${displayHeight}`);
-        invalidateRenderRect();
+        LayoutCache.update();
         cursorOverlay.style.display = 'block';
-        updateCursorOverlay();
+        scheduleRender();
       };
       setStatus('●', true);
       document.getElementById('status-text').style.opacity = '0';
@@ -827,6 +974,11 @@ async function handleOffer(sdp) {
     if (!pc) return;
     const st = pc.connectionState;
     const ice = pc.iceConnectionState;
+    // Clear negotiation timer on success
+    if (st === 'connected' && negotiationTimer) {
+      clearTimeout(negotiationTimer);
+      negotiationTimer = null;
+    }
     if (st === 'failed' || st === 'disconnected' ||
         ice === 'failed' || ice === 'disconnected') {
       console.warn(`[pc] connection failed (connectionState=${st}, iceConnectionState=${ice})`);
@@ -853,12 +1005,13 @@ async function handleOffer(sdp) {
       sdp: answer.sdp,
     }));
 
-    setTimeout(() => {
+    negotiationTimer = setTimeout(() => {
       if (pc && pc.connectionState !== 'connected' && pc.connectionState !== 'closed') {
         console.warn('[pc] negotiation timeout (15s), restarting');
         setStatus('Negotiation timeout, retrying...', false);
         ws.close();
       }
+      negotiationTimer = null;
     }, 15000);
 
   } catch (e) {
@@ -869,13 +1022,11 @@ async function handleOffer(sdp) {
 }
 
 function videoPos(clientX, clientY) {
-  invalidateRenderRect(); // ensure rect is fresh for this frame
-  const r = getVideoRenderRect();
-  if (!r) return null;
-  const rect = video.getBoundingClientRect();
-
-  const x = (clientX - rect.left - r.renderX) / r.renderW;
-  const y = (clientY - rect.top - r.renderY) / r.renderH;
+  ensureLayoutFresh();
+  if (!LayoutCache.valid) return null;
+  const L = LayoutCache;
+  const x = (clientX - L.rect.left - L.renderX) / L.renderW;
+  const y = (clientY - L.rect.top - L.renderY) / L.renderH;
 
   if (x < 0 || x > 1 || y < 0 || y > 1) return null;
 
@@ -885,27 +1036,10 @@ function videoPos(clientX, clientY) {
   };
 }
 
-function refreshDisplaySize() {
-  const w = video.videoWidth;
-  const h = video.videoHeight;
-  if (w > 0 && h > 0) {
-    displayWidth = w;
-    displayHeight = h;
-    invalidateRenderRect();
-    updateCursorOverlay();
-  }
-}
-
-function cancelPendingInputs() {
-  relAccDx = 0;
-  relAccDy = 0;
-  relFlushPending = false;
-}
-
 // ── ResizeObserver for real-time container tracking ──
 const resizeObserver = new ResizeObserver(() => {
-  invalidateRenderRect();
-  if (displayWidth > 0) updateCursorOverlay();
+  LayoutCache.update();
+  if (displayWidth > 0) scheduleRender();
 });
 resizeObserver.observe(viewport);
 
@@ -923,6 +1057,7 @@ function isOnUI(el) {
 
 document.addEventListener('mousemove', (e) => {
   if (isSyntheticFromTouch() || isOnUI(e.target)) return;
+
   const pos = videoPos(e.clientX, e.clientY);
   if (pos) {
     localCursorX = pos.x;
@@ -962,7 +1097,25 @@ document.addEventListener('mouseup', (e) => {
 
 document.addEventListener('wheel', (e) => {
   e.preventDefault();
-  sendInput(`ms,${e.deltaY}`);
+  if (zoomActive) {
+    const oldZoom = zoomLevel;
+    zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomLevel - e.deltaY * ZOOM_STEP / 100));
+    if (Math.abs(zoomLevel - oldZoom) > 0.001) {
+      const rect = LayoutCache.viewRect || viewport.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      // Account for keyboard offset: layer Y = cursor Y + kbd
+      const kbdOff = keyboardVisible ? keyboard.offsetHeight : 0;
+      const effectY = cy + kbdOff;
+      // Incremental zoom pivot: keep layer point under cursor fixed
+      const oldPanX = zoomPanX, oldPanY = zoomPanY;
+      zoomPanX = cx - ((cx - oldPanX) / oldZoom) * zoomLevel;
+      zoomPanY = effectY - ((effectY - oldPanY) / oldZoom) * zoomLevel;
+      scheduleRender('smooth');
+    }
+  } else {
+    sendInput(`ms,${-e.deltaY}`);
+  }
 }, { passive: false });
 
 // ── Touch events (trackpad mode) ──
@@ -990,6 +1143,29 @@ const DBL_TAP_MAX = 400;
 video.addEventListener('touchstart', (e) => {
   e.preventDefault();
   lastTouchEndTime = Date.now();
+
+  // ── Two-finger pinch → enter pinch zoom mode ──
+  if (e.touches.length === 2) {
+    const t1 = e.touches[0], t2 = e.touches[1];
+    pinchActive = true;
+    pinchZoom0 = zoomLevel;
+    pinchPanX0 = zoomPanX;
+    pinchPanY0 = zoomPanY;
+    // Initial distance between fingers
+    const dx = t1.clientX - t2.clientX;
+    const dy = t1.clientY - t2.clientY;
+    pinchDist0 = Math.sqrt(dx * dx + dy * dy);
+    // Center point in screen coordinates
+    const cx = (t1.clientX + t2.clientX) / 2;
+    const cy = (t1.clientY + t2.clientY) / 2;
+    // Center point in "world" (unscaled video CSS) coordinates
+    // Account for keyboard offset: layer Y = screen Y + kbdHeight
+    const kbdOff = keyboardVisible ? keyboard.offsetHeight : 0;
+    pinchWorldCX = (cx - zoomPanX) / zoomLevel;
+    pinchWorldCY = (cy + kbdOff - zoomPanY) / zoomLevel;
+    return;
+  }
+
   const t = e.touches[0];
   clearTimeout(longPressTimer);
 
@@ -1026,6 +1202,23 @@ video.addEventListener('touchstart', (e) => {
 
 video.addEventListener('touchmove', (e) => {
   e.preventDefault();
+
+  // ── Pinch zoom ──
+  if (pinchActive && e.touches.length === 2) {
+    const t1 = e.touches[0], t2 = e.touches[1];
+    const dx = t1.clientX - t2.clientX;
+    const dy = t1.clientY - t2.clientY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const scale = dist / pinchDist0;
+    // Apply scale with pivot on world center
+    zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, pinchZoom0 * scale));
+    zoomPanX = pinchPanX0 + pinchWorldCX * (pinchZoom0 - zoomLevel);
+    zoomPanY = pinchPanY0 + pinchWorldCY * (pinchZoom0 - zoomLevel);
+    scheduleRender('smooth');
+    return;
+  }
+  if (pinchActive) return; // was pinch but finger count changed — ignore
+
   if (!touchActive) return;
 
   const t = e.touches[0];
@@ -1048,21 +1241,40 @@ video.addEventListener('touchmove', (e) => {
     lastTouchX = t.clientX;
     lastTouchY = t.clientY;
     if (deltaXDrag !== 0 || deltaYDrag !== 0) {
+      // Always move cursor (updateCursorOverlay handles virtual-cursor panning)
       relAccDx += deltaXDrag;
       relAccDy += deltaYDrag;
       localCursorX += deltaXDrag;
       localCursorY += deltaYDrag;
-      capLocalCursor(); // calls updateCursorOverlay
+      capLocalCursor(); // calls updateCursorOverlay → auto-pans if zoomed
       scheduleRelFlush();
     }
   } else if (isLongPress) {
     longPressMoved = true;
     const scrollDy = t.clientY - lastScrollY;
     if (Math.abs(scrollDy) >= SCROLL_THRESHOLD) {
-      const steps = Math.floor(Math.abs(scrollDy) / SCROLL_THRESHOLD);
-      const dir = scrollDy > 0 ? 1 : -1;
-      for (let i = 0; i < Math.min(steps, 5); i++) {
-        sendInput(`ms,${dir}`);
+      if (zoomActive) {
+        // Zoom mode active → adjust zoom level instead of scrolling
+        const oldZoom = zoomLevel;
+        zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomLevel - scrollDy * ZOOM_STEP / 20));
+        if (Math.abs(zoomLevel - oldZoom) > 0.001) {
+          const rect = LayoutCache.viewRect || viewport.getBoundingClientRect();
+          const cx = t.clientX - rect.left;
+          const cy = t.clientY - rect.top;
+          const kbdOff = keyboardVisible ? keyboard.offsetHeight : 0;
+          const effectY = cy + kbdOff;
+          const oldPanX = zoomPanX, oldPanY = zoomPanY;
+          zoomPanX = cx - ((cx - oldPanX) / oldZoom) * zoomLevel;
+          zoomPanY = effectY - ((effectY - oldPanY) / oldZoom) * zoomLevel;
+          scheduleRender('smooth');
+        }
+      } else {
+        // Normal → send scroll steps to backend
+        const steps = Math.floor(Math.abs(scrollDy) / SCROLL_THRESHOLD);
+        const dir = scrollDy > 0 ? -1 : 1;
+        for (let i = 0; i < Math.min(steps, 5); i++) {
+          sendInput(`ms,${dir}`);
+        }
       }
       lastScrollY = t.clientY;
     }
@@ -1073,11 +1285,12 @@ video.addEventListener('touchmove', (e) => {
     lastTouchX = t.clientX;
     lastTouchY = t.clientY;
     if (deltaX !== 0 || deltaY !== 0) {
+      // Always move cursor
       relAccDx += deltaX;
       relAccDy += deltaY;
       localCursorX += deltaX;
       localCursorY += deltaY;
-      capLocalCursor(); // calls updateCursorOverlay
+      capLocalCursor(); // calls updateCursorOverlay → auto-pans if zoomed
       scheduleRelFlush();
     }
   }
@@ -1085,6 +1298,8 @@ video.addEventListener('touchmove', (e) => {
 
 video.addEventListener('touchend', (e) => {
   e.preventDefault();
+  // Reset pinch state regardless of other touch logic
+  pinchActive = false;
   clearTimeout(longPressTimer);
   cancelPendingInputs();
 
@@ -1139,9 +1354,22 @@ document.addEventListener('keyup', (e) => {
 // ── Page unload: release modifier keys before connection drops ──
 window.addEventListener('beforeunload', () => {
   releaseAllModifiers();
-  // Flush any pending relative input
   flushRelInput();
-  // Attempt synchronous close to ensure WebSocket flush
+  cancelCursorAnim();
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (negotiationTimer) { clearTimeout(negotiationTimer); negotiationTimer = null; }
+  resizeObserver.disconnect();
+  // Stop media tracks
+  if (video.srcObject) {
+    video.srcObject.getTracks().forEach(t => t.stop());
+    video.srcObject = null;
+  }
+  const audioEl = document.getElementById('remote-audio');
+  if (audioEl && audioEl.srcObject) {
+    audioEl.srcObject.getTracks().forEach(t => t.stop());
+    audioEl.srcObject = null;
+  }
+  if (pc) { try { pc.close(); } catch(_) {} pc = null; }
   if (ws && ws.readyState === WebSocket.OPEN) {
     try { ws.close(); } catch (_) {}
   }
@@ -1177,7 +1405,18 @@ fsBtn.addEventListener('click', () => {
   }
 });
 
-document.addEventListener('fullscreenchange', updateFsButton);
+// ── Zoom toggle button ──
+zoomBtn.addEventListener('click', () => {
+  buttonZoom = !buttonZoom;
+  zoomBtn.classList.toggle('active', buttonZoom);
+  syncZoomActive();
+});
+
+document.addEventListener('fullscreenchange', () => {
+  updateFsButton();
+  LayoutCache.update();
+  scheduleRender();
+});
 
 // ── Custom Virtual Keyboard ──
 const keyboard = document.getElementById('custom-keyboard');
@@ -1355,6 +1594,7 @@ keyboard.addEventListener('pointerup', (e) => {
   if (!key) return;
   const code = key.dataset.code;
   if (!code) return;
+  try { key.releasePointerCapture(e.pointerId); } catch(_) {}
   handleKeyUp(code);
 });
 
@@ -1413,20 +1653,39 @@ function hideKeyboard() {
   adjustVideoForKeyboard(false);
 }
 
-// Adjust container translate when keyboard shows/hides
+// ── Alt key: activate frontend zoom mode ──
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'AltLeft' || e.code === 'AltRight') {
+    e.preventDefault();
+    altHeld = true;
+    syncZoomActive();
+  }
+});
+document.addEventListener('keyup', (e) => {
+  if (e.code === 'AltLeft' || e.code === 'AltRight') {
+    altHeld = false;
+    syncZoomActive();
+  }
+});
+// Safety: release all modifier keys (ku) + reset zoom when window loses focus
+window.addEventListener('blur', () => {
+  releaseAllModifiers();
+  if (altHeld) {
+    altHeld = false;
+    syncZoomActive();
+  }
+});
+
+// Adjust container for keyboard visibility
 function adjustVideoForKeyboard(show) {
   const toolbar = document.getElementById('toolbar');
   if (show) {
-    // 只偏移键盘高度，不加工具栏高度 → 消除空隙
-    const kbdHeight = keyboard.offsetHeight;
-    viewport.style.transform = `translateY(-${kbdHeight}px)`;
-    // 隐藏工具栏
     toolbar.style.display = 'none';
   } else {
-    viewport.style.transform = 'translateY(0)';
-    // 恢复工具栏
     toolbar.style.display = 'flex';
   }
+  LayoutCache.update();
+  scheduleRender();
 }
 
 // Recalculate container offset on resize when keyboard is visible
@@ -1449,6 +1708,7 @@ function enableAudio() {
   if (audioEnabled) return;
   audioEnabled = true;
   video.muted = false;
+  document.getElementById('remote-audio').play().catch(() => {});
   audioHint.style.display = 'none';
   document.removeEventListener('click', enableAudio);
   document.removeEventListener('touchstart', enableAudio);
@@ -1467,8 +1727,6 @@ document.addEventListener('touchstart', enableAudio);
 // ── Start ──
 // Defer initial connection to avoid blocking first paint / layout
 requestIdleCallback(connect, { timeout: 2000 });
-
-window.econsole = console;
 </script>
 </body>
 </html>
