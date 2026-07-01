@@ -30,8 +30,8 @@ x11rb-protocol = "0.13"
 
 # WebRTC pure Rust stack
 webrtc = "0.20.0-rc.1"
-rtc = "0.20.0-beta.1"
-rtc-media = "0.20.0-beta.1"
+rtc = "0.20.0-rc.1"
+rtc-media = "0.20.0-rc.1"
 # ICE network types for TCP-only mode
 ice = { package = "rtc-ice", version = "0.20.0-rc.1" }
 
