@@ -1156,6 +1156,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             }
             Some(Ok(Message::Close(_))) | None => {
                 log::debug!("[ws] disconnected before ready");
+                io_handle.abort();
+                let _ = io_handle.await;
                 return;
             }
             _ => {}
@@ -1444,16 +1446,35 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     });
 
     // ── Wait for ICE gathering complete ──
-    tokio::select! {
-        _ = gather_complete_rx.recv() => { log::debug!("[ice] gathering complete"); }
-        _ = done.notified() => { log::debug!("[ice] connection ended during gathering"); return; }
+    if tokio::select! {
+        _ = gather_complete_rx.recv() => { false }
+        _ = done.notified() => { true }
+    } {
+        log::debug!("[ice] connection ended during gathering, cleaning up");
+        // async cleanup: only io_handle, ice_forward, pc exist at this point
+        drop(handler);
+        let _ = ice_forward.await;
+        io_handle.abort();
+        let _ = io_handle.await;
+        let _ = pc.close().await;
+        return;
     }
+    log::debug!("[ice] gathering complete");
 
     // ── Wait for ICE connected state ──
-    tokio::select! {
-        _ = connected_rx.recv() => { log::info!("[pc] connection established!"); }
-        _ = done.notified() => { log::info!("[pc] connection failed before connected"); return; }
+    if tokio::select! {
+        _ = connected_rx.recv() => { false }
+        _ = done.notified() => { true }
+    } {
+        log::info!("[pc] connection failed before connected, cleaning up");
+        drop(handler);
+        let _ = ice_forward.await;
+        io_handle.abort();
+        let _ = io_handle.await;
+        let _ = pc.close().await;
+        return;
     }
+    log::info!("[pc] connection established!");
 
     // ── Create input DataChannel (server-initiated) ──
     match pc.create_data_channel("input", None).await {
@@ -1938,7 +1959,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // Release all pressed keys on the X server to prevent stuck keys
     // (e.g. from virtual keyboard clicks where ku is lost on disconnect)
     {
-        let keys = input_state.pressed_keys.lock().unwrap();
+        let keys = input_state.pressed_keys.lock().unwrap_or_else(|e| e.into_inner());
         for &kc in keys.iter() {
             let _ = xtest::fake_input(&input_state.conn, X11_KEY_RELEASE,
                 kc, 0, input_state.root, 0, 0, 0);
@@ -1968,10 +1989,12 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     drop(handler);
     let _ = ice_forward.await;
 
+    // Close PeerConnection first (sends DTLS close alert), then the WebSocket.
+    let _ = pc.close().await;
+
+    // Finally, abort the WebSocket I/O task (no longer needed).
     io_handle.abort();
     let _ = io_handle.await;
-
-    let _ = pc.close().await;
     log::info!("[ws] cleanup complete");
 }
 
@@ -2059,7 +2082,7 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
             if keysym != 0 {
                 let kc = find_keycode(state, keysym);
                 if kc > 0 {
-                    state.pressed_keys.lock().unwrap().insert(kc);
+                    state.pressed_keys.lock().unwrap_or_else(|e| e.into_inner()).insert(kc);
                     let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
                     let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
                     let _ = xtest::fake_input(&state.conn, X11_KEY_PRESS,
@@ -2076,7 +2099,7 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
             if keysym != 0 {
                 let kc = find_keycode(state, keysym);
                 if kc > 0 {
-                    state.pressed_keys.lock().unwrap().remove(&kc);
+                    state.pressed_keys.lock().unwrap_or_else(|e| e.into_inner()).remove(&kc);
                     let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
                     let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
                     let _ = xtest::fake_input(&state.conn, X11_KEY_RELEASE,
