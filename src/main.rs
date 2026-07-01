@@ -51,8 +51,8 @@ use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYP
 use rtc::statistics::StatsSelector;
 
 // ── openh264 ──
-use openh264::encoder::{Encoder, EncoderConfig, BitRate, FrameRate, UsageType, RateControlMode, IntraFramePeriod, Profile};
-use openh264::formats::YUVBuffer;
+use openh264::encoder::{Encoder, EncoderConfig, BitRate, FrameRate, UsageType, RateControlMode, IntraFramePeriod, Profile, Complexity};
+use openh264::formats::YUVSlices;
 use openh264::OpenH264API;
 use openh264_sys2::ENCODER_OPTION_BITRATE;
 
@@ -618,6 +618,7 @@ impl VideoEncoder {
             .max_frame_rate(FrameRate::from_hz(framerate))
             .usage_type(UsageType::ScreenContentRealTime)
             .rate_control_mode(RateControlMode::Quality)
+            .complexity(Complexity::Low)
             .intra_frame_period(IntraFramePeriod::from_num_frames(intra_period))
             .profile(Profile::Baseline);
 
@@ -667,10 +668,18 @@ impl VideoEncoder {
         true
     }
 
-    fn encode(&mut self, i420: Vec<u8>, out: &mut Vec<u8>) -> Result<()> {
-        let yuv = YUVBuffer::from_vec(i420, self.width as usize, self.height as usize);
+    fn encode(&mut self, i420: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+        let uv_size = (w / 2) * (h / 2);
+        let slices = YUVSlices::new(
+            (&i420[..y_size], &i420[y_size..y_size + uv_size], &i420[y_size + uv_size..]),
+            (w, h),
+            (w, w / 2, w / 2),
+        );
         let bitstream = self.inner
-            .encode(&yuv)
+            .encode(&slices)
             .context("openh264 encode failed")?;
         out.clear();
         bitstream.write_vec(out);
@@ -1241,11 +1250,17 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     log::info!("[ice] binding interfaces: {:?}", all_ips);
     // Bind to ALL non-loopback IPs so each network interface gets its own
     // host candidate. STUN works on the default-route interface.
+    // TCP binds include all IPs (loopback included) so browser-on-device works.
     let tcp_addrs: Vec<String> = all_ips.iter().map(|ip| fmt_bind_addr(ip, 0)).collect();
+    // UDP binds exclude loopback — sending STUN from 127.0.0.1 to an
+    // external server causes EINVAL (Invalid argument) on Linux/Android.
     let udp_addrs = if state.args.tcp_only {
         Vec::<String>::new()
     } else {
-        all_ips.iter().map(|ip| fmt_bind_addr(ip, 0)).collect()
+        all_ips.iter()
+            .filter(|ip| *ip != "127.0.0.1" && *ip != "::1")
+            .map(|ip| fmt_bind_addr(ip, 0))
+            .collect()
     };
     let handler = Arc::new(WebrtcHandler {
         ice_tx,
@@ -1501,9 +1516,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
     // Pipeline channels (capacity 4 for buffering)
     // Standard mpsc sync channels used for blocking pipeline stages (recv_timeout available)
-    let (raw_tx, raw_rx) = block_mpsc::sync_channel::<Bytes>(4);
-    let (yuv_tx, yuv_rx) = block_mpsc::sync_channel::<Vec<u8>>(4);
-    let (enc_tx, mut enc_rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+    let (raw_tx, raw_rx) = block_mpsc::sync_channel::<Bytes>(2);
+    let (yuv_tx, yuv_rx) = block_mpsc::sync_channel::<Bytes>(2);
+    let (enc_tx, mut enc_rx) = tokio::sync::mpsc::channel::<Bytes>(8);
 
     // Shutdown signal — unified CancellationToken for all pipeline tasks
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -1513,22 +1528,25 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let cap_raw_tx = raw_tx.clone();
     let cap_handle = tokio::task::spawn_blocking(move || {
         let mut raw_buf = vec![0u8; cap_w as usize * cap_h as usize * 4];
-        let mut last_raw = Vec::new(); // allocated on first failure
+        let mut last_raw: Option<Vec<u8>> = None; // lazy: alloc on demand
         // Spare buffer for send: avoids taking raw_buf (keeping its allocation alive).
         let mut send_buf = Vec::with_capacity(cap_w as usize * cap_h as usize * 4);
+        let mut drop_count = 0u32; // consecutive frame drops
         loop {
             if cap_stop.is_cancelled() { break; }
 
             let frame_start = std::time::Instant::now();
             if let Err(e) = screen_capture.capture(&mut raw_buf) {
                 log::info!("[capture] error: {:#}, repeating last frame", e);
-                // Repeat last frame: clone only on error, not every frame.
-                if !last_raw.is_empty() {
-                    raw_buf.clone_from(&last_raw);
+                // Restore last known-good frame. If last_raw is None (no prior
+                // success), the stale/uninitialized frame will be shown instead.
+                if let Some(ref last) = last_raw {
+                    raw_buf.clone_from(last);
                 }
-            } else if last_raw.is_empty() {
-                // First success: init last_raw. Subsequent successes skip clone.
-                last_raw.clone_from(&raw_buf);
+            } else if last_raw.is_none() {
+                // First success: lazily clone a reference frame for error
+                // recovery. Subsequent successes skip the clone (~8MB/frame).
+                last_raw = Some(raw_buf.clone());
             }
             // Send via Bytes (zero-copy Vec→Bytes). Swap with send_buf so raw_buf
             // keeps its allocation for the next capture cycle.
@@ -1539,6 +1557,17 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 log::trace!("[capture] dropping frame (channel full)");
                 // restore raw_buf from send_buf (which was emptied by take)
                 std::mem::swap(&mut raw_buf, &mut send_buf);
+                drop_count += 1;
+                // After 10+ consecutive drops the pipeline is persistently
+                // congested — shrink buffers to free memory. They'll grow
+                // back naturally when congestion clears.
+                if drop_count >= 10 {
+                    raw_buf.shrink_to(0);
+                    send_buf.shrink_to(0);
+                    drop_count = 0;
+                }
+            } else {
+                drop_count = 0;
             }
             let elapsed = frame_start.elapsed();
             if elapsed < frame_duration {
@@ -1552,8 +1581,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let conv_stop = cancel.clone();
     let conv_yuv_tx = yuv_tx.clone();
     let conv_handle = tokio::task::spawn_blocking(move || {
-        let mut i420_buf = vec![0u8; (out_w * out_h * 3 / 2) as usize];
-        let mut send_buf = Vec::new();
+        let i420_size = (out_w * out_h * 3 / 2) as usize;
+        let mut i420_buf = vec![0u8; i420_size];
+        let mut send_buf = vec![0u8; i420_size]; // pre-allocated for swap
         let mut tmp_argb = Vec::new();
         loop {
             if conv_stop.is_cancelled() { break; }
@@ -1566,11 +1596,15 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         bgra_to_i420(raw.as_ref(), out_w, out_h, &mut i420_buf);
                     }
                     if conv_stop.is_cancelled() { return; }
-                    // Swap i420_buf (freshly encoded) into send_buf, then take send_buf.
-                    // i420_buf keeps its allocation for the next frame.
+                    // Swap buffers so i420_buf keeps the pre-allocated empty
+                    // buffer while send_buf holds the frame for sending.
                     std::mem::swap(&mut i420_buf, &mut send_buf);
-                    if conv_yuv_tx.send(std::mem::take(&mut send_buf)).is_err() { return; }
-                    // send_buf is now empty; will be swapped with i420_buf next frame
+                    // Copy into Bytes (exact-size allocation). Keep send_buf's
+                    // pre-allocated capacity alive via clear() so both buffers
+                    // stay ready — no alternating reallocation.
+                    let frame = Bytes::copy_from_slice(&send_buf);
+                    send_buf.clear();
+                    if conv_yuv_tx.send(frame).is_err() { return; }
                 }
                 Err(block_mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(block_mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1598,7 +1632,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             match yuv_rx.recv_timeout(std::time::Duration::from_millis(20)) {
                 Ok(yuv) => {
                     enc_buf.clear();
-                    if let Err(e) = encoder.encode(yuv, &mut enc_buf) {
+                    if let Err(e) = encoder.encode(yuv.as_ref(), &mut enc_buf) {
                         enc_failures += 1;
                         log::error!("[encoder] error #{}/{}: {:#}", enc_failures, ENC_MAX_FAILURES, e);
                         if enc_failures >= ENC_MAX_FAILURES {
@@ -1609,11 +1643,11 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         continue;
                     }
                     enc_failures = 0; // reset on success
-                    // Move encoded data into Bytes (zero-copy). Replace enc_buf
-                    // with a pre-sized Vec so the next encode avoids reallocation.
-                    let frame = Bytes::from(std::mem::replace(
-                        &mut enc_buf, Vec::with_capacity(65536),
-                    ));
+                    // Copy encoded data into Bytes (exact size allocation).
+                    // Keep enc_buf's pre-allocated capacity for the next frame
+                    // instead of creating a new Vec with Vec::with_capacity(65536).
+                    let frame = Bytes::copy_from_slice(&enc_buf);
+                    enc_buf.clear();
                     if enc_stop.is_cancelled() { return; }
                     if enc_tx_clone.blocking_send(frame).is_err() { return; }
                     // Force IDR on a wall-clock basis so timing is unaffected
@@ -1712,9 +1746,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 break;
             }
             if audio_cap_stop.is_cancelled() { return; }
-            if audio_pcm_tx.send(std::mem::replace(
-                &mut buf, vec![0u8; PCM_FRAME_BYTES],
-            )).is_err() { return; }
+            // Clone the PCM data (exact-size allocation, no zero-fill waste).
+            // Keep buf's allocation alive for the next pa.read to overwrite.
+            if audio_pcm_tx.send(buf.clone()).is_err() { return; }
         }
         log::debug!("[audio] capture task ended");
     });
@@ -1749,8 +1783,11 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     match encoder.encode(samples, &mut opus_out) {
                         Ok(n) => {
                             opus_out.truncate(n);
-                            // Move into Bytes (zero-copy) instead of copy_from_slice
-                            let frame = Bytes::from(std::mem::take(&mut opus_out));
+                            // Copy into Bytes (exact-size allocation).
+                            // Keep opus_out's pre-allocated capacity alive for the
+                            // next encode instead of creating a new Vec each frame.
+                            let frame = Bytes::copy_from_slice(&opus_out);
+                            opus_out.clear();
                             // try_send — if full, drop packet to avoid blocking spawn_blocking
                             if audio_enc_stop.is_cancelled() { return; }
                             let _ = audio_opus_tx.try_send(frame);
