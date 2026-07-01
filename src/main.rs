@@ -58,6 +58,7 @@ use openh264_sys2::ENCODER_OPTION_BITRATE;
 
 
 use bytes::Bytes;
+use ice::network_type::NetworkType;
 use rand::Rng;
 use async_trait::async_trait;
 use std::os::fd::IntoRawFd;
@@ -687,15 +688,27 @@ struct WebrtcHandler {
     ice_tx: runtime::Sender<String>,
     gather_complete_tx: runtime::Sender<()>,
     connected_tx: runtime::Sender<()>,
-    done_tx: runtime::Sender<()>,
+    done: Arc<tokio::sync::Notify>,
     dc_tx: tokio::sync::watch::Sender<Option<Arc<dyn DataChannel>>>,
+    lan_ip: String,
 }
 
 #[async_trait]
 impl PeerConnectionEventHandler for WebrtcHandler {
     async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
-        log::debug!("[ice] candidate: {} ...", &event.candidate.address[..event.candidate.address.len().min(20)]);
-        if let Ok(init) = event.candidate.to_json() {
+        // The UDP/TCP socket binds to 0.0.0.0:0 (all interfaces), but the host
+        // candidate address becomes "0.0.0.0" which is unreachable. Replace it
+        // with the LAN IP so the browser can reach us.
+        let mut candidate = event.candidate.clone();
+        if candidate.typ == webrtc::peer_connection::RTCIceCandidateType::Host
+            && candidate.address == "0.0.0.0"
+        {
+            candidate.address = self.lan_ip.clone();
+        }
+
+        log::debug!("[ice] candidate: {} {}:{} ...", candidate.typ, candidate.address, candidate.port);
+
+        if let Ok(init) = candidate.to_json() {
             let msg = serde_json::to_string(&SignalingMessage::Ice {
                 candidate: init.candidate,
                 sdp_mline_index: init.sdp_mline_index.unwrap_or(0) as u32,
@@ -724,7 +737,7 @@ impl PeerConnectionEventHandler for WebrtcHandler {
             RTCPeerConnectionState::Failed
             | RTCPeerConnectionState::Disconnected
             | RTCPeerConnectionState::Closed => {
-                let _ = self.done_tx.try_send(());
+                self.done.notify_one();
             }
             _ => {}
         }
@@ -737,6 +750,32 @@ impl PeerConnectionEventHandler for WebrtcHandler {
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
         log::info!("[dc] incoming data channel (id={})", data_channel.id());
         let _ = self.dc_tx.send(Some(data_channel));
+    }
+}
+
+/// Get all non-loopback LAN IPs + loopback fallback for local testing.
+fn get_local_ips() -> Vec<String> {
+    let mut ips: Vec<String> = match if_addrs::get_if_addrs() {
+        Ok(ifaces) => ifaces.into_iter()
+            .filter(|iface| !iface.is_loopback())
+            .map(|iface| iface.ip().to_string())
+            .collect(),
+        Err(_) => vec![],
+    };
+    // Always include loopback so localhost / browser-on-device works.
+    if !ips.contains(&"127.0.0.1".to_string()) {
+        ips.push("127.0.0.1".to_string());
+    }
+    ips
+}
+
+/// Format an IP address and port into a socket bind string.
+/// IPv6 addresses must be wrapped in brackets (e.g. [::1]:0).
+fn fmt_bind_addr(ip: &str, port: u16) -> String {
+    if ip.contains(':') {
+        format!("[{}]:{}", ip, port)
+    } else {
+        format!("{}:{}", ip, port)
     }
 }
 
@@ -775,6 +814,11 @@ async fn main() -> Result<()> {
         println!("  Scale  : {}p", state.args.height);
     } else {
         println!("  Scale  : native (no scaling)");
+    }
+    if state.args.stun.is_empty() {
+        println!("  STUN   : disabled");
+    } else {
+        println!("  STUN   : {}", state.args.stun);
     }
     match &state.token {
         Some(t) => println!("  Auth token: {} (required)", t),
@@ -1175,26 +1219,45 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         Some(std::time::Duration::from_secs(60)),  // failed (default 25s)
         Some(std::time::Duration::from_secs(5)),   // keepalive (default 2s)
     );
+    // In --tcp-only mode, restrict candidate gathering to TCP only.
+    // Default (all four types) is already the webrtc-rs default.
+    if state.args.tcp_only {
+        settings.set_network_types(vec![NetworkType::Tcp4, NetworkType::Tcp6]);
+    }
 
     // ── Create runtime channels for the handler ──
     let (ice_tx, mut ice_rx) = runtime::channel::<String>(256);
     let (gather_complete_tx, mut gather_complete_rx) = runtime::channel::<()>(1);
     let (connected_tx, mut connected_rx) = runtime::channel::<()>(1);
-    let (done_tx, mut done_rx) = runtime::channel::<()>(1);
+    let done = Arc::new(tokio::sync::Notify::new());
     let (dc_tx, mut dc_rx) = tokio::sync::watch::channel::<Option<Arc<dyn DataChannel>>>(None);
 
     // ── Build PeerConnection ──
+    let all_ips = get_local_ips();
+    // get_local_ips always includes 127.0.0.1; non-loopback IPs come first.
+    let lan_ip = all_ips[0].clone();
+    log::info!("[ice] binding interfaces: {:?}", all_ips);
+    // Bind to ALL non-loopback IPs so each network interface gets its own
+    // host candidate. STUN works on the default-route interface.
+    let tcp_addrs: Vec<String> = all_ips.iter().map(|ip| fmt_bind_addr(ip, 0)).collect();
+    let udp_addrs = if state.args.tcp_only {
+        Vec::<String>::new()
+    } else {
+        all_ips.iter().map(|ip| fmt_bind_addr(ip, 0)).collect()
+    };
     let handler = Arc::new(WebrtcHandler {
         ice_tx,
         gather_complete_tx,
         connected_tx,
-        done_tx,
+        done: done.clone(),
         dc_tx: dc_tx.clone(),
+        lan_ip,
     });
 
     let input_dc_tx = dc_tx.clone();
 
     let rt = runtime::default_runtime().expect("no webrtc runtime available");
+
     let pc = match PeerConnectionBuilder::new()
         .with_configuration(config)
         .with_setting_engine(settings)
@@ -1202,12 +1265,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         .with_interceptor_registry(registry)
         .with_handler(handler.clone())
         .with_runtime(rt)
-        .with_udp_addrs(if state.args.tcp_only {
-            Vec::<String>::new()
-        } else {
-            vec![format!("{}:0", get_local_ip())]
-        })
-        .with_tcp_addrs(vec![format!("{}:0", get_local_ip())])
+        .with_udp_addrs(udp_addrs)
+        .with_tcp_addrs(tcp_addrs)
         .build()
         .await
     {
@@ -1387,13 +1446,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // ── Wait for ICE gathering complete ──
     tokio::select! {
         _ = gather_complete_rx.recv() => { log::debug!("[ice] gathering complete"); }
-        _ = done_rx.recv() => { log::debug!("[ice] connection ended during gathering"); return; }
+        _ = done.notified() => { log::debug!("[ice] connection ended during gathering"); return; }
     }
 
     // ── Wait for ICE connected state ──
     tokio::select! {
         _ = connected_rx.recv() => { log::info!("[pc] connection established!"); }
-        _ = done_rx.recv() => { log::info!("[pc] connection failed before connected"); return; }
+        _ = done.notified() => { log::info!("[pc] connection failed before connected"); return; }
     }
 
     // ── Create input DataChannel (server-initiated) ──
@@ -1433,27 +1492,32 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let cap_raw_tx = raw_tx.clone();
     let cap_handle = tokio::task::spawn_blocking(move || {
         let mut raw_buf = vec![0u8; cap_w as usize * cap_h as usize * 4];
-        let mut last_raw = raw_buf.clone(); // repeat frame on capture failure
+        let mut last_raw = Vec::new(); // allocated on first failure
+        // Spare buffer for send: avoids taking raw_buf (keeping its allocation alive).
+        let mut send_buf = Vec::with_capacity(cap_w as usize * cap_h as usize * 4);
         loop {
             if cap_stop.is_cancelled() { break; }
 
             let frame_start = std::time::Instant::now();
             if let Err(e) = screen_capture.capture(&mut raw_buf) {
                 log::info!("[capture] error: {:#}, repeating last frame", e);
-                // Repeat last frame to prevent decoder from losing reference frames
-                raw_buf.clone_from(&last_raw);
-            } else {
+                // Repeat last frame: clone only on error, not every frame.
+                if !last_raw.is_empty() {
+                    raw_buf.clone_from(&last_raw);
+                }
+            } else if last_raw.is_empty() {
+                // First success: init last_raw. Subsequent successes skip clone.
                 last_raw.clone_from(&raw_buf);
             }
-            // Send via Bytes (zero-copy Vec→Bytes transfer), next frame reallocates via mimalloc (fast)
+            // Send via Bytes (zero-copy Vec→Bytes). Swap with send_buf so raw_buf
+            // keeps its allocation for the next capture cycle.
             if cap_stop.is_cancelled() { return; }
-            // Send via Bytes, drop frame if channel is full (backpressure safety)
-            if cap_raw_tx.try_send(Bytes::from(std::mem::take(&mut raw_buf))).is_err() {
+            std::mem::swap(&mut raw_buf, &mut send_buf);
+            if cap_raw_tx.try_send(Bytes::from(std::mem::take(&mut send_buf))).is_err() {
                 // Channel full = downstream is congested; drop frame instead of blocking
                 log::trace!("[capture] dropping frame (channel full)");
-                // Restore raw_buf since try_send didn't consume it... actually take() consumed it.
-                // The take() emptied raw_buf, so the next iteration reallocates.
-                // That's fine — a dropped frame means we skip this capture cycle.
+                // restore raw_buf from send_buf (which was emptied by take)
+                std::mem::swap(&mut raw_buf, &mut send_buf);
             }
             let elapsed = frame_start.elapsed();
             if elapsed < frame_duration {
@@ -1468,10 +1532,11 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let conv_yuv_tx = yuv_tx.clone();
     let conv_handle = tokio::task::spawn_blocking(move || {
         let mut i420_buf = vec![0u8; (out_w * out_h * 3 / 2) as usize];
+        let mut send_buf = Vec::new();
         let mut tmp_argb = Vec::new();
         loop {
             if conv_stop.is_cancelled() { break; }
-            match raw_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+            match raw_rx.recv_timeout(std::time::Duration::from_millis(20)) {
                 Ok(raw) => {
                     if needs_scaling {
                         scale_bgra_direct(raw.as_ref(), cap_w32, cap_h32,
@@ -1479,9 +1544,12 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     } else {
                         bgra_to_i420(raw.as_ref(), out_w, out_h, &mut i420_buf);
                     }
-                    // Use take — mimalloc reuses freed memory instantly
                     if conv_stop.is_cancelled() { return; }
-                    if conv_yuv_tx.send(std::mem::take(&mut i420_buf)).is_err() { return; }
+                    // Swap i420_buf (freshly encoded) into send_buf, then take send_buf.
+                    // i420_buf keeps its allocation for the next frame.
+                    std::mem::swap(&mut i420_buf, &mut send_buf);
+                    if conv_yuv_tx.send(std::mem::take(&mut send_buf)).is_err() { return; }
+                    // send_buf is now empty; will be swapped with i420_buf next frame
                 }
                 Err(block_mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(block_mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1506,7 +1574,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             // Check for adaptive bitrate update
             let desired = enc_bps.load(Ordering::Relaxed);
             encoder.set_bitrate(desired);
-            match yuv_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+            match yuv_rx.recv_timeout(std::time::Duration::from_millis(20)) {
                 Ok(yuv) => {
                     enc_buf.clear();
                     if let Err(e) = encoder.encode(yuv, &mut enc_buf) {
@@ -1520,10 +1588,11 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         continue;
                     }
                     enc_failures = 0; // reset on success
-                    // copy_from_slice preserves enc_buf's capacity for the next
-                    // frame (unlike take() which drops capacity to 0). The memcpy
-                    // of ~30KB (720p H.264 frame) is negligible.
-                    let frame = Bytes::copy_from_slice(&enc_buf);
+                    // Move encoded data into Bytes (zero-copy). Replace enc_buf
+                    // with a pre-sized Vec so the next encode avoids reallocation.
+                    let frame = Bytes::from(std::mem::replace(
+                        &mut enc_buf, Vec::with_capacity(65536),
+                    ));
                     if enc_stop.is_cancelled() { return; }
                     if enc_tx_clone.blocking_send(frame).is_err() { return; }
                     // Force IDR on a wall-clock basis so timing is unaffected
@@ -1622,7 +1691,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 break;
             }
             if audio_cap_stop.is_cancelled() { return; }
-            if audio_pcm_tx.send(buf.clone()).is_err() { return; }
+            if audio_pcm_tx.send(std::mem::replace(
+                &mut buf, vec![0u8; PCM_FRAME_BYTES],
+            )).is_err() { return; }
         }
         log::debug!("[audio] capture task ended");
     });
@@ -1641,7 +1712,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         let mut opus_out = Vec::with_capacity(4096);
         loop {
             if audio_enc_stop.is_cancelled() { break; }
-            match pcm_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+            match pcm_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                 Ok(pcm) => {
                     // Safety: pcm comes from PulseAudio which always returns multiples of frame size
                     // (3840 bytes = 1920 i16 samples @ 20ms stereo 48kHz). Assert to prevent UB.
@@ -1650,12 +1721,15 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         std::slice::from_raw_parts(pcm.as_ptr() as *const i16, pcm.len() / 2)
                     };
                     opus_out.clear();
-                    opus_out.resize(4096, 0);
+                    opus_out.reserve(4096);
+                    // SAFETY: encode will write up to 4096 bytes into the reserved space.
+                    // The returned n tells us how many bytes were actually written.
+                    unsafe { opus_out.set_len(4096); }
                     match encoder.encode(samples, &mut opus_out) {
                         Ok(n) => {
                             opus_out.truncate(n);
-                            // Copy to Bytes — opus_out retains capacity for next frame
-                            let frame = Bytes::copy_from_slice(&opus_out);
+                            // Move into Bytes (zero-copy) instead of copy_from_slice
+                            let frame = Bytes::from(std::mem::take(&mut opus_out));
                             // try_send — if full, drop packet to avoid blocking spawn_blocking
                             if audio_enc_stop.is_cancelled() { return; }
                             let _ = audio_opus_tx.try_send(frame);
@@ -1695,7 +1769,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // ── Periodic cursor position sync ──
     // Push real X11 cursor position to browser every ~50ms so the overlay
     // stays in sync even when an X11 application warps the cursor.
-    let mut cursor_timer = time::interval(Duration::from_millis(50));
+    let mut cursor_timer = time::interval(Duration::from_millis(200));
 
     // ── Input handling runs in main task (non-blocking) ──
     let scale_x = native_w as f64 / out_w as f64;
@@ -1714,7 +1788,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 }
             } => {
                 if let Some(DataChannelEvent::OnMessage(msg)) = dc_event {
-                    if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
+                    if let Ok(text) = std::str::from_utf8(&msg.data) {
                         if text.starts_with("mr,") || text.starts_with("ma,")
                             || text.starts_with("md,") || text.starts_with("mu,")
                             || text.starts_with("ms,") || text.starts_with("kd,")
@@ -1731,8 +1805,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             _ = cursor_timer.tick() => {
                 sync_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
                 stats_tick += 1;
-                // Collect stats every ~2s (50ms × 40)
-                if stats_tick % 40 == 0 {
+                // Collect stats every ~2s (200ms × 10)
+                if stats_tick % 10 == 0 {
                     let now = std::time::Instant::now();
                     let report = pc.get_stats(now, StatsSelector::None).await;
                     let rtt_ms = report.candidate_pairs()
@@ -1825,23 +1899,31 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 }
             }
 
-            // Watch for DataChannel registration from on_data_channel handler
-            _ = dc_rx.changed() => {
-                let borrow = dc_rx.borrow_and_update();
-                if let Some(dc) = &*borrow {
+            // Watch for DataChannel registration from on_data_channel handler.
+            // Once registered, skip this branch to avoid polling dc_rx forever.
+            _ = async {
+                if dc_ref.is_some() {
+                    futures_util::future::pending::<()>().await
+                } else {
+                    dc_rx.changed().await.ok();
+                }
+            } => {
+                if let Some(dc) = &*dc_rx.borrow_and_update() {
                     log::info!("[dc] data channel ready for input");
                     dc_ref = Some(dc.clone());
                 }
             }
 
             // Check peer connection state
-            _ = async {
-                match done_rx.try_recv() {
-                    Ok(()) => {}
-                    Err(_) => futures_util::future::pending::<()>().await,
-                }
-            } => {
+            _ = done.notified() => {
                 log::debug!("[loop] connection closed, exiting");
+                break;
+            }
+
+            // Detect WebSocket disconnect: when the WS send task exits,
+            // out_tx's receiver is dropped, and closed() resolves immediately.
+            _ = out_tx.closed() => {
+                log::debug!("[loop] WebSocket send channel closed, exiting");
                 break;
             }
         }
@@ -1898,15 +1980,18 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 // ═══════════════════════════════════════════════════════════════
 
 fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f64) {
-    let parts: Vec<&str> = raw.split(',').collect();
-    if parts.is_empty() {
-        return;
-    }
+    // Use split() iterator directly — no Vec allocation per input event.
+    let mut fields = raw.split(',');
 
-    match parts[0] {
-        "mr" if parts.len() >= 3 => {
-            let dx: i32 = parts[1].parse().unwrap_or(0);
-            let dy: i32 = parts[2].parse().unwrap_or(0);
+    let cmd = match fields.next() {
+        Some(c) => c,
+        None => return,
+    };
+
+    match cmd {
+        "mr" => {
+            let dx: i32 = match fields.next().and_then(|s| s.parse().ok()) { Some(v) => v, None => return };
+            let dy: i32 = match fields.next().and_then(|s| s.parse().ok()) { Some(v) => v, None => return };
             let max_x = state.screen_w as i32 - 1;
             let max_y = state.screen_h as i32 - 1;
             let new_x = state.cursor_x.load(Ordering::Relaxed).saturating_add(dx).clamp(0, max_x);
@@ -1914,19 +1999,12 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
             state.cursor_x.store(new_x, Ordering::Relaxed);
             state.cursor_y.store(new_y, Ordering::Relaxed);
             let _ = xtest::fake_input(&state.conn, X11_MOTION_NOTIFY,
-                0, 0, state.root,
-                state.cursor_x.load(Ordering::Relaxed) as i16,
-                state.cursor_y.load(Ordering::Relaxed) as i16,
-                0);
+                0, 0, state.root, new_x as i16, new_y as i16, 0);
             let _ = state.conn.flush();
         }
-        "ma" if parts.len() >= 3 => {
-            // Browser sends coordinates in output space (0..out_w, 0..out_h).
-            // Convert to native X11 coordinates (0..screen_w, 0..screen_h)
-            // so that scaling is transparent: browser always works in
-            // displayWidth×displayHeight which equals the encoded video size.
-            let raw_x = parts[1].parse::<i32>().unwrap_or(0);
-            let raw_y = parts[2].parse::<i32>().unwrap_or(0);
+        "ma" => {
+            let raw_x: i32 = match fields.next().and_then(|s| s.parse().ok()) { Some(v) => v, None => return };
+            let raw_y: i32 = match fields.next().and_then(|s| s.parse().ok()) { Some(v) => v, None => return };
             let new_x = ((raw_x as f64 * scale_x) as i32).clamp(0, state.screen_w as i32 - 1);
             let new_y = ((raw_y as f64 * scale_y) as i32).clamp(0, state.screen_h as i32 - 1);
             state.cursor_x.store(new_x, Ordering::Relaxed);
@@ -1935,28 +2013,32 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
                 0, 0, state.root, new_x as i16, new_y as i16, 0);
             let _ = state.conn.flush();
         }
-        "md" if parts.len() >= 2 => {
-            let btn: u8 = match parts[1] {
-                "2" => 2,
-                "3" => 3,
+        "md" => {
+            let btn: u8 = match fields.next() {
+                Some("2") => 2,
+                Some("3") => 3,
                 _ => 1,
             };
+            let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
+            let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
             let _ = xtest::fake_input(&state.conn, X11_BUTTON_PRESS,
-                btn, 0, state.root, state.cursor_x.load(Ordering::Relaxed) as i16, state.cursor_y.load(Ordering::Relaxed) as i16, 0);
+                btn, 0, state.root, cx, cy, 0);
             let _ = state.conn.flush();
         }
-        "mu" if parts.len() >= 2 => {
-            let btn: u8 = match parts[1] {
-                "2" => 2,
-                "3" => 3,
+        "mu" => {
+            let btn: u8 = match fields.next() {
+                Some("2") => 2,
+                Some("3") => 3,
                 _ => 1,
             };
+            let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
+            let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
             let _ = xtest::fake_input(&state.conn, X11_BUTTON_RELEASE,
-                btn, 0, state.root, state.cursor_x.load(Ordering::Relaxed) as i16, state.cursor_y.load(Ordering::Relaxed) as i16, 0);
+                btn, 0, state.root, cx, cy, 0);
             let _ = state.conn.flush();
         }
-        "ms" if parts.len() >= 2 => {
-            let delta: f64 = parts[1].parse().unwrap_or(0.0);
+        "ms" => {
+            let delta: f64 = match fields.next().and_then(|s| s.parse().ok()) { Some(v) => v, None => return };
             let steps = (delta.abs() / 40.0).round().clamp(1.0, 20.0) as u32;
             let btn = if delta > 0.0 { 5_u8 } else { 4_u8 };
             let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
@@ -1969,26 +2051,36 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
             }
             let _ = state.conn.flush();
         }
-        "kd" if parts.len() >= 2 => {
-            let keysym = code_to_keysym(parts[1]);
+        "kd" => {
+            let keysym = match fields.next() {
+                Some(s) => code_to_keysym(s),
+                None => return,
+            };
             if keysym != 0 {
                 let kc = find_keycode(state, keysym);
                 if kc > 0 {
                     state.pressed_keys.lock().unwrap().insert(kc);
+                    let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
+                    let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
                     let _ = xtest::fake_input(&state.conn, X11_KEY_PRESS,
-                        kc, 0, state.root, state.cursor_x.load(Ordering::Relaxed) as i16, state.cursor_y.load(Ordering::Relaxed) as i16, 0);
+                        kc, 0, state.root, cx, cy, 0);
                     let _ = state.conn.flush();
                 }
             }
         }
-        "ku" if parts.len() >= 2 => {
-            let keysym = code_to_keysym(parts[1]);
+        "ku" => {
+            let keysym = match fields.next() {
+                Some(s) => code_to_keysym(s),
+                None => return,
+            };
             if keysym != 0 {
                 let kc = find_keycode(state, keysym);
                 if kc > 0 {
                     state.pressed_keys.lock().unwrap().remove(&kc);
+                    let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
+                    let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
                     let _ = xtest::fake_input(&state.conn, X11_KEY_RELEASE,
-                        kc, 0, state.root, state.cursor_x.load(Ordering::Relaxed) as i16, state.cursor_y.load(Ordering::Relaxed) as i16, 0);
+                        kc, 0, state.root, cx, cy, 0);
                     let _ = state.conn.flush();
                 }
             }
@@ -2123,19 +2215,4 @@ fn code_to_keysym(code: &str) -> u32 {
             0
         }
     }
-}
-
-/// Detect local IP address by creating a UDP socket and querying its local address.
-/// Connects to Google DNS (8.8.8.8:80) to determine the routing interface,
-/// without actually sending any data.
-fn get_local_ip() -> String {
-    let fallback = "127.0.0.1".to_string();
-    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                return addr.ip().to_string();
-            }
-        }
-    }
-    fallback
 }
