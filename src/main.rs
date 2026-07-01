@@ -2129,11 +2129,8 @@ fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &InputState,
     // Scale from native X11 coordinates to encoded video coordinates
     let sx = if native_w > 0 { x as u64 * out_w as u64 / native_w as u64 } else { x as u64 };
     let sy = if native_h > 0 { y as u64 * out_h as u64 / native_h as u64 } else { y as u64 };
-    let Ok(msg) = serde_json::to_string(&serde_json::json!({
-        "type": "cursor",
-        "x": sx,
-        "y": sy
-    })) else { return };
+    // Format cursor JSON directly without serde_json::Value allocation
+    let msg = format!(r#"{{"type":"cursor","x":{},"y":{}}}"#, sx, sy);
     let _ = out_tx.try_send(Message::Text(msg.into()));
 }
 
