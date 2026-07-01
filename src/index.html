@@ -141,6 +141,12 @@
     color: #fff;
     border-color: rgba(255,255,255,0.4);
   }
+  #stats-display {
+    color: rgba(255,255,255,0.7);
+    font-size: 11px;
+    margin-left: 8px;
+    white-space: nowrap;
+  }
   #kbd-btn {
     font-size: 14px;
     line-height: 1;
@@ -349,6 +355,7 @@
     <button id="fullscreen-btn">Fullscreen</button>
     <button id="zoom-btn">+</button>
     <button id="kbd-btn">⌨️</button>
+    <span id="stats-display"></span>
   </div>
   <!-- ── Custom Virtual Keyboard (inside container for fullscreen) ── -->
   <div id="custom-keyboard" style="position:fixed;">
@@ -520,6 +527,7 @@ const video = document.getElementById('remote-video');
 const dot = document.getElementById('dot');
 const statusText = document.getElementById('status-text');
 const pointerHint = document.getElementById('pointer-hint');
+const statsDisplay = document.getElementById('stats-display');
 const fsBtn = document.getElementById('fullscreen-btn');
 const zoomBtn = document.getElementById('zoom-btn');
 const container = document.getElementById('container');
@@ -812,6 +820,8 @@ function cancelPendingInputs() {
   relFlushPending = false;
 }
 
+let inputDC = null; // WebRTC DataChannel for input
+
 function sendInput(csv) {
   if (csv.startsWith('ma,')) {
     const parts = csv.split(',');
@@ -820,7 +830,10 @@ function sendInput(csv) {
     capLocalCursor();
     updateCursorOverlay();
   }
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  // Prefer DataChannel for lower latency; fall back to WebSocket
+  if (inputDC && inputDC.readyState === 'open') {
+    inputDC.send(csv);
+  } else if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(csv);
   }
 }
@@ -884,6 +897,11 @@ function connect() {
         break;
       case 'error':
         setStatus('Error: ' + msg.error, false);
+        break;
+      case 'stats':
+        if (msg.rtt_ms !== undefined) {
+          statsDisplay.textContent = `${msg.rtt_ms}ms`;
+        }
         break;
     }
   };
@@ -1005,6 +1023,13 @@ async function handleOffer(sdp) {
       sdp: answer.sdp,
     }));
 
+    // ── DataChannel for input: listen for server-initiated channel ──
+    pc.ondatachannel = (event) => {
+      inputDC = event.channel;
+      inputDC.onopen = () => console.log('[dc] input channel open');
+      inputDC.onclose = () => console.log('[dc] input channel closed');
+    };
+
     negotiationTimer = setTimeout(() => {
       if (pc && pc.connectionState !== 'connected' && pc.connectionState !== 'closed') {
         console.warn('[pc] negotiation timeout (15s), restarting');
@@ -1051,8 +1076,11 @@ function isSyntheticFromTouch() {
 }
 
 // Skip mouse events that land on UI controls (toolbar / keyboard)
+function closestUI(el, sel) {
+  return el instanceof Element ? el.closest(sel) : null;
+}
 function isOnUI(el) {
-  return el.closest('#toolbar') || el.closest('#custom-keyboard');
+  return closestUI(el, '#toolbar') || closestUI(el, '#custom-keyboard');
 }
 
 document.addEventListener('mousemove', (e) => {
@@ -1563,7 +1591,7 @@ function switchLayer(layer) {
 
 // Pointer events for keyboard keys
 function getCode(el) {
-  const key = el.closest('.kbd-key');
+  const key = closestUI(el, '.kbd-key');
   return key ? key.dataset.code : null;
 }
 
@@ -1574,7 +1602,7 @@ keyboard.addEventListener('click', (e) => {
 
 keyboard.addEventListener('pointerdown', (e) => {
   e.preventDefault();
-  const key = e.target.closest('.kbd-key');
+  const key = closestUI(e.target, '.kbd-key');
   if (!key) return;
   const code = key.dataset.code;
   if (!code) return;
@@ -1590,7 +1618,7 @@ keyboard.addEventListener('pointerdown', (e) => {
 });
 
 keyboard.addEventListener('pointerup', (e) => {
-  const key = e.target.closest('.kbd-key');
+  const key = closestUI(e.target, '.kbd-key');
   if (!key) return;
   const code = key.dataset.code;
   if (!code) return;
@@ -1695,7 +1723,7 @@ window.addEventListener('resize', () => {
 
 // Click on video area → hide keyboard
 container.addEventListener('click', (e) => {
-  if (keyboardVisible && !e.target.closest('#toolbar') && !e.target.closest('#custom-keyboard')) {
+  if (keyboardVisible && !closestUI(e.target, '#toolbar') && !closestUI(e.target, '#custom-keyboard')) {
     hideKeyboard();
   }
 });

@@ -12,6 +12,8 @@ set -euo pipefail
 # Usage:
 #   ./build.sh              # debug build
 #   ./build.sh --release    # release build
+#   ./build.sh --check      # cargo check (debug)
+#   ./build.sh --check --release  # cargo check (release)
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
@@ -29,21 +31,41 @@ echo "==> vnrit build script"
 echo "    cmake: $CMAKE"
 echo "    target: $PROJECT_DIR"
 
+CHECK_MODE=false
 RELEASE_FLAG=""
-if [ "${1:-}" = "--release" ]; then
-    RELEASE_FLAG="--release"
-    echo "    profile: release"
-else
-    echo "    profile: debug"
-fi
 
-cargo build $RELEASE_FLAG
+case "${1:-}" in
+    --check)
+        CHECK_MODE=true
+        shift
+        if [ "${1:-}" = "--release" ]; then
+            RELEASE_FLAG="--release"
+            echo "    check: release"
+        else
+            echo "    check: debug"
+        fi
+        ;;
+    --release)
+        RELEASE_FLAG="--release"
+        echo "    profile: release"
+        ;;
+    *)
+        echo "    profile: debug"
+        ;;
+esac
 
-BIN_PATH="$PROJECT_DIR/target/${RELEASE_FLAG:+release}${RELEASE_FLAG:-debug}/vnrit"
-if [ -f "$BIN_PATH" ]; then
-    echo "==> Build complete: $BIN_PATH"
-    ls -lh "$BIN_PATH"
+if [ "$CHECK_MODE" = true ]; then
+    echo "==> Running cargo check $RELEASE_FLAG ..."
+    cargo check $RELEASE_FLAG
+    echo "==> Check complete (exit code: $?)"
 else
-    echo "==> Build failed"
-    exit 1
+    cargo build $RELEASE_FLAG
+    BIN_PATH="$PROJECT_DIR/target/${RELEASE_FLAG:+release}${RELEASE_FLAG:-debug}/vnrit"
+    if [ -f "$BIN_PATH" ]; then
+        echo "==> Build complete: $BIN_PATH"
+        ls -lh "$BIN_PATH"
+    else
+        echo "==> Build failed"
+        exit 1
+    fi
 fi

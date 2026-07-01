@@ -1,6 +1,6 @@
 [package]
 name = "vnrit"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Lightweight X11 desktop WebRTC streaming server (pure Rust, no GStreamer)"
 license = "Apache-2.0"  
@@ -29,7 +29,7 @@ x11rb = { version = "0.13", features = ["xtest", "allow-unsafe-code", "shm"] }
 x11rb-protocol = "0.13"
 
 # WebRTC pure Rust stack
-webrtc = "0.20.0-beta.1"
+webrtc = "0.20.0-rc.1"
 rtc = "0.20.0-beta.1"
 rtc-media = "0.20.0-beta.1"
 
@@ -38,6 +38,7 @@ async-trait = "0.1"
 
 # Video encoding
 openh264 = { version = "0.9", features = ["source"] }
+openh264-sys2 = "0.9"
 
 # shiguredo_libyuv — Rust bindings for Google's libyuv (SIMD-accelerated conversion + scaling)
 shiguredo_libyuv = { version = "2026.2.0-canary.1", features = ["source-build"] }

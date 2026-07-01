@@ -1,13 +1,21 @@
-# webrtc-rs 0.20.0-beta.1 API 参考
+# webrtc-rs 0.20.0-rc.1 API 参考
 
 ## 项目结构
 
 ```
-webrtc = "0.20.0-beta.1"   # Meta-crate (封装 rtc Sans-I/O 核心)
-rtc                        # Sans-I/O 核心 (自动引入, 不需显式添加)
-├── rtc-media              # Sample 等媒体类型
-├── rtc-shared             # SystemInstant, Error 等共享类型
-└── ...                     # ICE/DTLS/SRTP 等协议实现
+webrtc = "0.20.0-rc.1"      # Meta-crate (Tokio-SansIO 混合层)
+│                             #  PeerConnection trait 提供 async 接口
+│                             #  内部使用 rtc Sans-I/O 核心 + tokio I/O
+├── rtc (0.20.0-rc.1)        # Sans-I/O 核心 (纯协议逻辑, 不绑定 I/O)
+│   ├── peer_connection       #   连接管理 (不含网络 I/O)
+│   ├── statistics            #   统计信息 (RTCStatsReport)
+│   ├── data_channel          #   数据通道
+│   ├── media_stream          #   媒体流
+│   ├── rtp_transceiver       #   RTP 收发器
+│   └── interceptor           #   拦截器 (NACK/TWCC/报告)
+├── rtc-media                 # Sample 等媒体类型
+├── rtc-interceptor           # 拦截器实现 (NACK responder, TWCC sender)
+└── rtc-shared                # SystemInstant, Error 等共享类型
 ```
 
 ## 模块路径速查
@@ -46,7 +54,7 @@ rtc                        # Sans-I/O 核心 (自动引入, 不需显式添加)
 
 ## 1. `PeerConnection` Trait
 
-**文件**: `webrtc-0.20.0-beta.1/src/peer_connection/mod.rs:260`
+**文件**: `webrtc-0.20.0-rc.1/src/peer_connection/mod.rs:260`
 
 ```rust
 pub trait PeerConnection: Send + Sync + 'static {
@@ -109,7 +117,7 @@ let local = pc.local_description().await.unwrap();
 
 ## 2. `PeerConnectionBuilder`
 
-**文件**: `webrtc-0.20.0-beta.1/src/peer_connection/mod.rs:115`
+**文件**: `webrtc-0.20.0-rc.1/src/peer_connection/mod.rs:115`
 
 ```rust
 impl PeerConnectionBuilder {
@@ -126,6 +134,14 @@ impl PeerConnectionBuilder {
     pub async fn build(self) -> Result<impl PeerConnection>;
 }
 ```
+
+### UDP 与 TCP
+
+- **`with_udp_addrs`**: 指定 ICE UDP 候选地址。格式 `"ip:port"`，port=0 表示系统分配。
+  当前项目使用 `vec![format!("{}:0", get_local_ip())]`。
+- **`with_tcp_addrs`**: 指定 ICE TCP 候选地址（可选）。通常用于防火墙限制 UDP 的环境。
+  TCP 候选会增加连接延迟，但能穿透只允许 TCP 出站的网络。
+  不加则只使用 UDP。`"ip:port"` 格式同上。
 
 ### 完整创建示例
 
@@ -166,7 +182,7 @@ let pc = PeerConnectionBuilder::new()
 
 ## 3. `PeerConnectionEventHandler` Trait
 
-**文件**: `webrtc-0.20.0-beta.1/src/peer_connection/mod.rs:86`
+**文件**: `webrtc-0.20.0-rc.1/src/peer_connection/mod.rs:86`
 
 所有方法都有默认空实现, 只需要覆盖需要的。
 
@@ -234,7 +250,7 @@ impl PeerConnectionEventHandler for Handler {
 
 ## 4. `TrackLocalStaticSample`
 
-**文件**: `webrtc-0.20.0-beta.1/src/media_stream/track_local/static_sample.rs:22`
+**文件**: `webrtc-0.20.0-rc.1/src/media_stream/track_local/static_sample.rs:22`
 
 ```rust
 pub struct TrackLocalStaticSample { /* private */ }
@@ -304,7 +320,7 @@ track.sample_writer(ssrc).write_sample(&Sample {
 
 ## 5. `MediaStreamTrack`
 
-**文件**: `rtc-0.20.0-beta.1/src/media_stream/track.rs:209`
+**文件**: `rtc-0.20.0-rc.1/src/media_stream/track.rs:209`
 
 ```rust
 pub type MediaStreamId = String;       // rtc::media_stream::MediaStreamId
@@ -325,7 +341,7 @@ impl MediaStreamTrack {
 
 ## 6. 编解码器配置类型
 
-**文件**: `rtc-0.20.0-beta.1/src/rtp_transceiver/rtp_sender/`
+**文件**: `rtc-0.20.0-rc.1/src/rtp_transceiver/rtp_sender/`
 
 ```rust
 /// 编解码器种类
@@ -376,7 +392,7 @@ pub struct RTCRtpEncodingParameters {
 
 ## 7. `Sample` 结构体
 
-**文件**: `rtc-media-0.20.0-beta.1/src/lib.rs:14`
+**文件**: `rtc-media-0.20.0-rc.1/src/lib.rs:14`
 
 ```rust
 pub struct Sample {
@@ -411,7 +427,7 @@ impl Default for Sample {
 
 ### `RTCSessionDescription`
 
-**文件**: `rtc-0.20.0-beta.1/src/peer_connection/sdp/session_description.rs:158`
+**文件**: `rtc-0.20.0-rc.1/src/peer_connection/sdp/session_description.rs:158`
 
 ```rust
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
@@ -448,7 +464,7 @@ pub enum RTCSdpType {
 
 ### `RTCIceCandidate`
 
-**文件**: `rtc-0.20.0-beta.1/src/peer_connection/transport/ice/candidate.rs:75`
+**文件**: `rtc-0.20.0-rc.1/src/peer_connection/transport/ice/candidate.rs:75`
 
 ```rust
 pub struct RTCIceCandidate {
@@ -489,7 +505,7 @@ pub struct RTCIceCandidateInit {
 
 ### `RTCPeerConnectionIceEvent`
 
-**文件**: `rtc-0.20.0-beta.1/src/peer_connection/event/ice_event.rs:75`
+**文件**: `rtc-0.20.0-rc.1/src/peer_connection/event/ice_event.rs:75`
 
 ```rust
 pub struct RTCPeerConnectionIceEvent {
@@ -531,7 +547,7 @@ pub enum RTCPeerConnectionState {
 
 ## 11. `MediaEngine` 与 Codec 注册
 
-**文件**: `rtc-0.20.0-beta.1/src/peer_connection/configuration/media_engine.rs:286`
+**文件**: `rtc-0.20.0-rc.1/src/peer_connection/configuration/media_engine.rs:286`
 
 ```rust
 pub struct MediaEngine { /* private fields */ }
@@ -572,7 +588,7 @@ media_engine.register_codec(video_codec, RtpCodecKind::Video)?;
 
 ## 12. `RTCConfigurationBuilder`
 
-**文件**: `rtc-0.20.0-beta.1/src/peer_connection/configuration/mod.rs:471`
+**文件**: `rtc-0.20.0-rc.1/src/peer_connection/configuration/mod.rs:471`
 
 ```rust
 pub struct RTCConfigurationBuilder { /* private */ }
@@ -603,7 +619,7 @@ pub struct RTCIceServer {
 
 ## 13. `runtime` 模块
 
-**文件**: `webrtc-0.20.0-beta.1/src/runtime/mod.rs`
+**文件**: `webrtc-0.20.0-rc.1/src/runtime/mod.rs`
 
 ```rust
 // 类型别名 (根据 feature 决定使用 tokio 或 smol)
@@ -635,7 +651,39 @@ pub trait Runtime: Send + Sync + Debug + 'static {
 
 ---
 
-## 14. `Interceptor` 与 Registry
+## 16. Statistics API
+
+```rust
+use rtc::statistics::{StatsSelector, report::RTCStatsReport};
+
+// 获取统计 (需要在事件循环或定时任务中调用)
+let report: RTCStatsReport = pc.get_stats(std::time::Instant::now(), StatsSelector::default()).await;
+```
+
+### 主要统计类型
+
+| 方法 | 返回 | 说明 |
+|------|------|------|
+| `report.peer_connection()` | `Option<&RTCPeerConnectionStats>` | 连接级统计 (连接时长, ICE 重启次数) |
+| `report.transport()` | `Option<&RTCTransportStats>` | 传输层 (RTT, ICE 角色, TLS 指纹, DTLS 版本) |
+| `report.inbound_rtp_streams()` | `impl Iterator<Item = &RTCInboundRtpStreamStats>` | 入站流 (丢包数/率, 抖动, 码率, FIR/SLI/NACK 计数) |
+| `report.outbound_rtp_streams()` | `impl Iterator<Item = &RTCOutboundRtpStreamStats>` | 出站流 (已发送字节/包数, 重传数, 目标码率, NACK/FIR) |
+| `report.data_channels()` | `impl Iterator<Item = &RTCDataChannelStats>` | DataChannel (已收/发消息数, 字节数, 当前缓冲) |
+| `report.candidate_pairs()` | `impl Iterator<Item = &RTCIceCandidatePairStats>` | ICE 候选对 (是否连通, 优先级, RTT, 总收/发字节) |
+
+### 使用示例: 获取出站 RTT
+
+```rust
+if let Some(transport) = report.transport() {
+    if let Some(rtt) = transport.current_round_trip_time {
+        log::info!("[stats] RTT: {}ms", rtt * 1000.0);
+    }
+}
+```
+
+---
+
+## 17. 重要注意事项 (更新)## 14. `Interceptor` 与 Registry
 
 ```rust
 use rtc::interceptor::{Registry, NoopInterceptor};

@@ -2,7 +2,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as block_mpsc;
 use std::sync::Arc;
 
@@ -35,7 +35,9 @@ use webrtc::peer_connection::{
     RTCConfigurationBuilder, RTCIceServer, RTCPeerConnectionIceEvent,
     RTCSessionDescription, RTCIceGatheringState, RTCPeerConnectionState,
     RTCIceCandidateInit, MediaEngine, register_default_interceptors, Registry,
+    SettingEngine,
 };
+use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::{MediaStreamTrack, Track};
@@ -46,11 +48,13 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpEncodingParameters,
 };
 use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS};
+use rtc::statistics::StatsSelector;
 
 // ── openh264 ──
 use openh264::encoder::{Encoder, EncoderConfig, BitRate, FrameRate, UsageType, RateControlMode, IntraFramePeriod, Profile};
 use openh264::formats::YUVBuffer;
 use openh264::OpenH264API;
+use openh264_sys2::ENCODER_OPTION_BITRATE;
 
 
 use bytes::Bytes;
@@ -130,6 +134,18 @@ No GStreamer dependency.
     1000 kbps   High quality, default setting
     2000+ kbps  Near-lossless on static content
 
+─── ADAPTIVE BITRATE ──────────────────────────────────────────
+
+  --adaptive-bitrate enables dynamic bitrate adjustment based on
+  WebRTC bandwidth estimation (TWCC). The encoder lowers bitrate
+  on congested links and raises it when bandwidth improves.
+
+  Rate changes are gated by 5-second minimum intervals and a
+  50kbps deadband. IDR frames are only forced on drops >30%.
+
+    vnrit --adaptive-bitrate              # enable, fixed max only
+    vnrit --bitrate 2000 --adaptive-bitrate  # cap at 2000 kbps
+
 ─── STREAM SCALING ──────────────────────────────────────────────
 
   By default vnrit streams at the desktop's native resolution
@@ -158,13 +174,13 @@ No GStreamer dependency.
 
   vnrit --display :1 -p 8080 --height 720 --bitrate 500
   vnrit --display :0 --stun \"\"    # LAN only, no STUN
+  vnrit --tcp-only --adaptive-bitrate  # NAT traversal + ABR
 
 ─── NOTES ───────────────────────────────────────────────────────
 
   - vnrit requires a running X11 server (Xvnc, Xvfb, or real X).
   - On Termux, it connects via the Unix socket at
     /data/data/com.termux/files/usr/tmp/.X11-unix/X<display>.
-  - No audio supported (video-only).
   - Each browser tab creates a separate WebRTC connection.
 "
 )]
@@ -232,6 +248,20 @@ authentication so subsequent requests (including the WebSocket upgrade) can reus
         help = "Log level (off, error, warn, info, debug, trace)",
     )]
     log_level: String,
+
+    #[arg(
+        long,
+        default_value = "false",
+        help = "Use TCP-only ICE (disable UDP, useful when UDP is blocked)",
+    )]
+    tcp_only: bool,
+
+    #[arg(
+        long,
+        default_value = "false",
+        help = "Enable adaptive bitrate based on WebRTC bandwidth estimation",
+    )]
+    adaptive_bitrate: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -259,11 +289,9 @@ struct InputState {
     screen_h: u16,
     cursor_x: AtomicI32,
     cursor_y: AtomicI32,
-    /// Cache of the last cursor position sent to the browser, so we can skip
-    /// redundant sends when the cursor hasn't moved. Initialized to -1 to
-    /// guarantee the first send always goes through.
-    last_sent_x: AtomicI32,
-    last_sent_y: AtomicI32,
+    /// Packed (y << 16) | x of last sent cursor position for atomic compare-swap.
+    /// Initialized to !0 (= no sent yet) so first send always goes through.
+    last_sent_packed: AtomicU64,
     keycode_cache: HashMap<u32, u8>,
     /// Track currently pressed keycodes so we can release them on disconnect,
     /// preventing "stuck key" on the X server (especially from virtual keyboard).
@@ -568,6 +596,8 @@ struct VideoEncoder {
     inner: Encoder,
     width: u32,
     height: u32,
+    last_bitrate_bps: u32,
+    last_adjust: std::time::Instant,
 }
 
 impl VideoEncoder {
@@ -577,12 +607,9 @@ impl VideoEncoder {
 
         let intra_period = (args.framerate as u32) * 10; // GOP = 10× framerate
 
-        // Detect available parallelism, cap at 2 threads for encoder
-        // (pipeline already parallelizes at a higher level; encoder multi-threading
-        //  helps but too many threads on mobile cause cache contention)
         let enc_threads = std::thread::available_parallelism()
             .map(|n| (n.get() / 2).min(4).max(1) as u16)
-            .unwrap_or(0); // 0 = auto mode if detection fails
+            .unwrap_or(0);
 
         let config = EncoderConfig::new()
             .num_threads(enc_threads)
@@ -596,13 +623,47 @@ impl VideoEncoder {
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
             .context("failed to create openh264 encoder")?;
 
-        log::info!("[encoder] {} threads configured", enc_threads);
+        log::info!("[encoder] {} threads configured, {}kbps", enc_threads, bitrate_bps / 1000);
 
         Ok(VideoEncoder {
             inner: encoder,
             width,
             height,
+            last_bitrate_bps: bitrate_bps,
+            last_adjust: std::time::Instant::now(),
         })
+    }
+
+    /// Adjust encoder bitrate at runtime via openh264 SetOption (no recreate).
+    /// Returns true if bitrate was actually changed.
+    fn set_bitrate(&mut self, new_bps: u32) -> bool {
+        const MIN_GAP: std::time::Duration = std::time::Duration::from_secs(5);
+        if self.last_adjust.elapsed() < MIN_GAP { return false; }
+        if (new_bps as i32 - self.last_bitrate_bps as i32).abs() < 50000 { return false; }
+        let clamped = new_bps.clamp(100_000, 10_000_000);
+        let mut val: i32 = clamped as i32;
+        // SAFETY: set_option with ENCODER_OPTION_BITRATE is a well-defined
+        // operation in openh264's public C API — the encoder handles mid-stream
+        // bitrate changes safely without requiring re-initialization.
+        unsafe {
+            self.inner.raw_api().set_option(
+                ENCODER_OPTION_BITRATE,
+                std::ptr::addr_of_mut!(val).cast(),
+            );
+        }
+        let old_bps = self.last_bitrate_bps;
+        self.last_bitrate_bps = clamped;
+        self.last_adjust = std::time::Instant::now();
+        // Only force IDR on significant drops (>30%) to avoid bloating an
+        // already-congested link. Small adjustments transition smoothly via
+        // the encoder's internal rate control.
+        if clamped < old_bps && (old_bps - clamped) > old_bps * 30 / 100 {
+            self.inner.force_intra_frame();
+            log::info!("[encoder] {}→{}kbps (IDR forced)", old_bps / 1000, clamped / 1000);
+        } else {
+            log::info!("[encoder] {}→{}kbps", old_bps / 1000, clamped / 1000);
+        }
+        true
     }
 
     fn encode(&mut self, i420: Vec<u8>, out: &mut Vec<u8>) -> Result<()> {
@@ -627,6 +688,7 @@ struct WebrtcHandler {
     gather_complete_tx: runtime::Sender<()>,
     connected_tx: runtime::Sender<()>,
     done_tx: runtime::Sender<()>,
+    dc_tx: tokio::sync::watch::Sender<Option<Arc<dyn DataChannel>>>,
 }
 
 #[async_trait]
@@ -639,7 +701,9 @@ impl PeerConnectionEventHandler for WebrtcHandler {
                 sdp_mline_index: init.sdp_mline_index.unwrap_or(0) as u32,
             }).ok();
             if let Some(msg) = msg {
-                let _ = self.ice_tx.try_send(msg);
+                if let Err(e) = self.ice_tx.try_send(msg) {
+                    log::warn!("[ice] candidate send failed: {:?}", e);
+                }
             }
         }
     }
@@ -668,6 +732,11 @@ impl PeerConnectionEventHandler for WebrtcHandler {
 
     async fn on_signaling_state_change(&self, state: webrtc::peer_connection::RTCSignalingState) {
         log::info!("[pc] signaling state: {:?}", state);
+    }
+
+    async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
+        log::info!("[dc] incoming data channel (id={})", data_channel.id());
+        let _ = self.dc_tx.send(Some(data_channel));
     }
 }
 
@@ -898,8 +967,7 @@ fn setup_x11_connections(display: &str) -> Result<(Arc<CaptureState>, Arc<InputS
         screen_h: screen_height,
         cursor_x: AtomicI32::new(ptr.root_x as i32),
         cursor_y: AtomicI32::new(ptr.root_y as i32),
-        last_sent_x: AtomicI32::new(-1),
-        last_sent_y: AtomicI32::new(-1),
+        last_sent_packed: AtomicU64::new(u64::MAX),
         keycode_cache,
         pressed_keys: std::sync::Mutex::new(std::collections::HashSet::new()),
     });
@@ -1100,11 +1168,20 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         .with_ice_servers(ice_servers)
         .build();
 
+    // ── SettingEngine: relax ICE timeouts for mobile/unstable networks ──
+    let mut settings = SettingEngine::default();
+    settings.set_ice_timeouts(
+        Some(std::time::Duration::from_secs(15)),  // disconnected (default 5s)
+        Some(std::time::Duration::from_secs(60)),  // failed (default 25s)
+        Some(std::time::Duration::from_secs(5)),   // keepalive (default 2s)
+    );
+
     // ── Create runtime channels for the handler ──
     let (ice_tx, mut ice_rx) = runtime::channel::<String>(256);
     let (gather_complete_tx, mut gather_complete_rx) = runtime::channel::<()>(1);
     let (connected_tx, mut connected_rx) = runtime::channel::<()>(1);
     let (done_tx, mut done_rx) = runtime::channel::<()>(1);
+    let (dc_tx, mut dc_rx) = tokio::sync::watch::channel::<Option<Arc<dyn DataChannel>>>(None);
 
     // ── Build PeerConnection ──
     let handler = Arc::new(WebrtcHandler {
@@ -1112,16 +1189,25 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         gather_complete_tx,
         connected_tx,
         done_tx,
+        dc_tx: dc_tx.clone(),
     });
+
+    let input_dc_tx = dc_tx.clone();
 
     let rt = runtime::default_runtime().expect("no webrtc runtime available");
     let pc = match PeerConnectionBuilder::new()
         .with_configuration(config)
+        .with_setting_engine(settings)
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
         .with_handler(handler.clone())
         .with_runtime(rt)
-        .with_udp_addrs(vec![format!("{}:0", get_local_ip())])
+        .with_udp_addrs(if state.args.tcp_only {
+            Vec::<String>::new()
+        } else {
+            vec![format!("{}:0", get_local_ip())]
+        })
+        .with_tcp_addrs(vec![format!("{}:0", get_local_ip())])
         .build()
         .await
     {
@@ -1310,6 +1396,15 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         _ = done_rx.recv() => { log::info!("[pc] connection failed before connected"); return; }
     }
 
+    // ── Create input DataChannel (server-initiated) ──
+    match pc.create_data_channel("input", None).await {
+        Ok(dc) => {
+            log::info!("[dc] input channel created (id={})", dc.id());
+            let _ = input_dc_tx.send(Some(dc));
+        }
+        Err(e) => log::warn!("[dc] create_data_channel failed: {}", e),
+    }
+
     // ── Pipeline: 4-stage capture → convert → encode → send ──
     let frame_duration = std::time::Duration::from_millis(1000 / state.args.framerate as u64);
     let track_ssrc = *track.ssrcs().await.first().unwrap_or(&0);
@@ -1319,6 +1414,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     }
 
     log::info!("[pipeline] starting 4-stage pipeline (cap→conv→enc→send), {} fps", state.args.framerate);
+
+    // Capture flag before it's moved into the encoder task
+    let adaptive_bitrate = state.args.adaptive_bitrate;
+    let initial_bitrate_bps = (state.args.bitrate as u32) * 1000;
 
     // Pipeline channels (capacity 4 for buffering)
     // Standard mpsc sync channels used for blocking pipeline stages (recv_timeout available)
@@ -1348,7 +1447,14 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             }
             // Send via Bytes (zero-copy Vec→Bytes transfer), next frame reallocates via mimalloc (fast)
             if cap_stop.is_cancelled() { return; }
-            if cap_raw_tx.send(Bytes::from(std::mem::take(&mut raw_buf))).is_err() { break; }
+            // Send via Bytes, drop frame if channel is full (backpressure safety)
+            if cap_raw_tx.try_send(Bytes::from(std::mem::take(&mut raw_buf))).is_err() {
+                // Channel full = downstream is congested; drop frame instead of blocking
+                log::trace!("[capture] dropping frame (channel full)");
+                // Restore raw_buf since try_send didn't consume it... actually take() consumed it.
+                // The take() emptied raw_buf, so the next iteration reallocates.
+                // That's fine — a dropped frame means we skip this capture cycle.
+            }
             let elapsed = frame_start.elapsed();
             if elapsed < frame_duration {
                 std::thread::sleep(frame_duration - elapsed);
@@ -1387,29 +1493,44 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // ── Stage 3: Encode (spawn_blocking, single-threaded) ──
     let enc_stop = cancel.clone();
     let enc_tx_clone = enc_tx.clone();
+    let target_bps = Arc::new(AtomicU32::new(initial_bitrate_bps));
+    let enc_bps = target_bps.clone();
     let enc_handle = tokio::task::spawn_blocking(move || {
         let mut enc_buf = Vec::with_capacity(65536);
-        let mut frame_count: u64 = 0;
+        let mut last_idr = std::time::Instant::now();
+        let mut enc_failures = 0u32;
+        const ENC_MAX_FAILURES: u32 = 10;
+        const IDR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
         loop {
             if enc_stop.is_cancelled() { break; }
+            // Check for adaptive bitrate update
+            let desired = enc_bps.load(Ordering::Relaxed);
+            encoder.set_bitrate(desired);
             match yuv_rx.recv_timeout(std::time::Duration::from_millis(5)) {
                 Ok(yuv) => {
                     enc_buf.clear();
                     if let Err(e) = encoder.encode(yuv, &mut enc_buf) {
-                        log::error!("[encoder] error: {:#}, forcing keyframe", e);
+                        enc_failures += 1;
+                        log::error!("[encoder] error #{}/{}: {:#}", enc_failures, ENC_MAX_FAILURES, e);
+                        if enc_failures >= ENC_MAX_FAILURES {
+                            log::error!("[encoder] too many failures, aborting encoder task");
+                            break;
+                        }
                         encoder.force_keyframe();
                         continue;
                     }
-                    let frame = Bytes::from(std::mem::take(&mut enc_buf));
-                    // blocking_send provides backpressure: encoder backs off when channel is full.
-                    // The send task runs in the tokio async runtime, so it will eventually drain
-                    // the channel, waking this blocking_send. Channel capacity 32 = ~1.3s @ 24fps.
+                    enc_failures = 0; // reset on success
+                    // copy_from_slice preserves enc_buf's capacity for the next
+                    // frame (unlike take() which drops capacity to 0). The memcpy
+                    // of ~30KB (720p H.264 frame) is negligible.
+                    let frame = Bytes::copy_from_slice(&enc_buf);
                     if enc_stop.is_cancelled() { return; }
                     if enc_tx_clone.blocking_send(frame).is_err() { return; }
-                    frame_count += 1;
-                    let period = state.args.framerate as u64 * 10;
-                    if frame_count % period == 0 {
+                    // Force IDR on a wall-clock basis so timing is unaffected
+                    // by encoder stalls or frame drops.
+                    if last_idr.elapsed() >= IDR_INTERVAL {
                         encoder.force_keyframe();
+                        last_idr = std::time::Instant::now();
                     }
                 }
                 Err(block_mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1489,15 +1610,17 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         };
         log::info!("[audio] PulseAudio capture started");
 
-        const PCM_FRAME_BYTES: usize = 3840;
+        const PCM_FRAME_BYTES: usize = 3840; // 20ms stereo 48kHz S16LE
         let mut buf = vec![0u8; PCM_FRAME_BYTES];
         loop {
             if audio_cap_stop.is_cancelled() { break; }
+            // PulseAudio Simple::read blocks up to 20ms (one frame).
+            // If PA hangs (rare), the cancel token can't interrupt it, but
+            // this only delays shutdown by at most one audio frame.
             if let Err(e) = pa.read(&mut buf) {
                 log::info!("[audio] read error: {}", e);
                 break;
             }
-            // Clone PCM data — buf retains capacity for next frame (3840 bytes, cheap clone)
             if audio_cap_stop.is_cancelled() { return; }
             if audio_pcm_tx.send(buf.clone()).is_err() { return; }
         }
@@ -1575,11 +1698,85 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let mut cursor_timer = time::interval(Duration::from_millis(50));
 
     // ── Input handling runs in main task (non-blocking) ──
+    let scale_x = native_w as f64 / out_w as f64;
+    let scale_y = native_h as f64 / out_h as f64;
+    let mut dc_ref: Option<Arc<dyn DataChannel>> = None;
+    let mut stats_tick = 0u32;
+
     loop {
         tokio::select! {
+            // DataChannel input (non-blocking — only fires when a message arrives)
+            dc_event = async {
+                if let Some(ref dc) = dc_ref {
+                    dc.poll().await
+                } else {
+                    futures_util::future::pending::<Option<DataChannelEvent>>().await
+                }
+            } => {
+                if let Some(DataChannelEvent::OnMessage(msg)) = dc_event {
+                    if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
+                        if text.starts_with("mr,") || text.starts_with("ma,")
+                            || text.starts_with("md,") || text.starts_with("mu,")
+                            || text.starts_with("ms,") || text.starts_with("kd,")
+                            || text.starts_with("ku,")
+                        {
+                            handle_input_message(&text, &input_state, scale_x, scale_y);
+                            send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
+                        }
+                    }
+                }
+            }
+
             // Periodic cursor sync: query X11 and push position to browser
             _ = cursor_timer.tick() => {
                 sync_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
+                stats_tick += 1;
+                // Collect stats every ~2s (50ms × 40)
+                if stats_tick % 40 == 0 {
+                    let now = std::time::Instant::now();
+                    let report = pc.get_stats(now, StatsSelector::None).await;
+                    let rtt_ms = report.candidate_pairs()
+                        .find_map(|p| if p.current_round_trip_time > 0.0 { Some(p.current_round_trip_time * 1000.0) } else { None });
+                    if let Some(rtt) = rtt_ms {
+                        if out_tx.try_send(Message::Text(
+                            serde_json::json!({"type":"stats","rtt_ms": rtt as u32}).to_string().into()
+                        )).is_err() {
+                            log::warn!("[stats] failed to send stats");
+                        }
+                    }
+                    // Adaptive bitrate: TWCC estimation + packet loss back-off
+                    if adaptive_bitrate {
+                        let mut desired_bps = 0u32;
+                        // Check TWCC target bitrate from outbound stats
+                        for outbound in report.outbound_rtp_streams() {
+                            let twcc_bps = outbound.target_bitrate as u32;
+                            if twcc_bps > 0 { desired_bps = twcc_bps; break; }
+                        }
+                        // Check packet loss from inbound stats — reduce aggressively
+                        for inbound in report.inbound_rtp_streams() {
+                            let total = inbound.received_rtp_stream_stats.packets_received
+                                + inbound.received_rtp_stream_stats.packets_lost.max(0) as u64;
+                            if total > 100 {
+                                let ratio = inbound.received_rtp_stream_stats.packets_lost as f64 / total as f64;
+                                if ratio > 0.05 {
+                                    // >5% loss → cut to 80% of current
+                                    let cur = target_bps.load(Ordering::Relaxed);
+                                    desired_bps = (cur as f64 * 0.8) as u32;
+                                    log::info!("[abr] loss={:.1}%, cutting to {}kbps", ratio * 100.0, desired_bps / 1000);
+                                }
+                            }
+                            break;
+                        }
+                        if desired_bps > 0 {
+                            let current_bps = target_bps.load(Ordering::Relaxed);
+                            let new_bps = desired_bps.max(200_000).min(initial_bitrate_bps);
+                            if (new_bps as i32 - current_bps as i32).abs() >= 50000 {
+                                target_bps.store(new_bps, Ordering::Relaxed);
+                                log::info!("[abr] bitrate={}kbps (twcc={}kbps)", new_bps / 1000, desired_bps / 1000);
+                            }
+                        }
+                    }
+                }
             }
 
             // Handle incoming WebSocket messages (input + signaling)
@@ -1606,8 +1803,6 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                             || t.starts_with("ms,") || t.starts_with("kd,")
                             || t.starts_with("ku,")
                         {
-                            let scale_x = native_w as f64 / out_w as f64;
-                            let scale_y = native_h as f64 / out_h as f64;
                             handle_input_message(&t, &input_state, scale_x, scale_y);
                             send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
                         } else {
@@ -1627,6 +1822,15 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         break;
                     }
                     _ => {}
+                }
+            }
+
+            // Watch for DataChannel registration from on_data_channel handler
+            _ = dc_rx.changed() => {
+                let borrow = dc_rx.borrow_and_update();
+                if let Some(dc) = &*borrow {
+                    log::info!("[dc] data channel ready for input");
+                    dc_ref = Some(dc.clone());
                 }
             }
 
@@ -1669,14 +1873,14 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     drop(pcm_tx);
     drop(opus_tx);
 
-    // Wait for pipeline tasks to finish
-    let _ = cap_handle.await;
-    let _ = conv_handle.await;
-    let _ = enc_handle.await;
-    let _ = send_handle.await;
-    let _ = audio_cap_handle.await;
-    let _ = audio_enc_handle.await;
-    let _ = audio_send_handle.await;
+    // Wait for pipeline tasks to finish (log any panics)
+    if let Err(e) = cap_handle.await { log::error!("[pipeline] capture task panicked: {:?}", e); }
+    if let Err(e) = conv_handle.await { log::error!("[pipeline] convert task panicked: {:?}", e); }
+    if let Err(e) = enc_handle.await { log::error!("[pipeline] encode task panicked: {:?}", e); }
+    if let Err(e) = send_handle.await { log::error!("[pipeline] send task panicked: {:?}", e); }
+    if let Err(e) = audio_cap_handle.await { log::error!("[pipeline] audio capture panicked: {:?}", e); }
+    if let Err(e) = audio_enc_handle.await { log::error!("[pipeline] audio encode panicked: {:?}", e); }
+    if let Err(e) = audio_send_handle.await { log::error!("[pipeline] audio send panicked: {:?}", e); }
 
     // ICE forward: drop handler to close ice channel, then await task completion
     drop(handler);
@@ -1801,14 +2005,12 @@ fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &InputState,
 {
     let x = state.cursor_x.load(Ordering::Relaxed);
     let y = state.cursor_y.load(Ordering::Relaxed);
-    // Skip redundant sends — only push to browser when coordinates actually changed
-    if x == state.last_sent_x.load(Ordering::Relaxed)
-        && y == state.last_sent_y.load(Ordering::Relaxed)
-    {
+    let packed = (x as u64) | ((y as u64) << 32);
+    // Atomic swap: skip if the same position was already sent
+    let prev = state.last_sent_packed.swap(packed, Ordering::Relaxed);
+    if prev == packed {
         return;
     }
-    state.last_sent_x.store(x, Ordering::Relaxed);
-    state.last_sent_y.store(y, Ordering::Relaxed);
     // Scale from native X11 coordinates to encoded video coordinates
     let sx = if native_w > 0 { x as u64 * out_w as u64 / native_w as u64 } else { x as u64 };
     let sy = if native_h > 0 { y as u64 * out_h as u64 / native_h as u64 } else { y as u64 };
