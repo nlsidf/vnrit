@@ -413,8 +413,10 @@ impl ShmScreenCapture {
         }))
     }
 
-    /// Capture the root window and write raw BGRA pixel data to `out`.
-    fn capture(&self, out: &mut Vec<u8>) -> Result<()> {
+    /// Capture the root window and convert directly to I420, bypassing BGRA Vec.
+    fn capture_to_i420(&self, i420_out: &mut Vec<u8>, out_w: u32, out_h: u32,
+        needs_scaling: bool, tmp_argb: &mut Vec<u8>) -> Result<()>
+    {
         let cookie = shm::get_image(
             &self.conn.conn,
             self.conn.root, // drawable
@@ -429,22 +431,18 @@ impl ShmScreenCapture {
         ).context("SHM get_image failed")?;
         let _reply = cookie.reply().context("SHM get_image reply failed")?;
 
-        // Copy pixel data from shared memory into pre-allocated buffer
+        // Read BGRA directly from shared memory and convert to I420 in one step.
         let size = (self.width as usize) * (self.height as usize) * (self.bpp as usize);
-        out.clear();
-        out.reserve(size);
-        // SAFETY: shm_ptr points to X server's shared memory (written by get_image reply).
-        // out has reserved capacity >= size. copy_nonoverlapping writes all `size` bytes.
-        unsafe {
-            out.set_len(size);
-            std::ptr::copy_nonoverlapping(self.shm_ptr, out.as_mut_ptr(), size);
+        // SAFETY: shm_ptr points to X server's shared memory, written by get_image.
+        let bgra_slice = unsafe { std::slice::from_raw_parts(self.shm_ptr, size) };
+
+        if needs_scaling {
+            scale_bgra_direct(bgra_slice, self.width as u32, self.height as u32,
+                out_w, out_h, i420_out, tmp_argb);
+        } else {
+            bgra_to_i420(bgra_slice, self.width as u32, self.height as u32, i420_out);
         }
         Ok(())
-    }
-
-    /// Return the capture dimensions (width, height).
-    fn dimensions(&self) -> (u16, u16) {
-        (self.width, self.height)
     }
 }
 
@@ -467,7 +465,9 @@ struct FallbackCapture {
 }
 
 impl FallbackCapture {
-    fn capture(&self, out: &mut Vec<u8>) -> Result<()> {
+    fn capture_to_i420(&self, i420_out: &mut Vec<u8>, out_w: u32, out_h: u32,
+        needs_scaling: bool, tmp_argb: &mut Vec<u8>) -> Result<()>
+    {
         let cookie = xproto::get_image(
             &self.conn.conn,
             xproto::ImageFormat::Z_PIXMAP,
@@ -477,13 +477,14 @@ impl FallbackCapture {
             !0, // plane_mask = all planes
         ).context("get_image failed")?;
         let reply = cookie.reply().context("get_image reply failed")?;
-        *out = reply.data;
-        Ok(())
-    }
 
-    /// Return the capture dimensions (width, height).
-    fn dimensions(&self) -> (u16, u16) {
-        (self.width, self.height)
+        if needs_scaling {
+            scale_bgra_direct(&reply.data, self.width as u32, self.height as u32,
+                out_w, out_h, i420_out, tmp_argb);
+        } else {
+            bgra_to_i420(&reply.data, self.width as u32, self.height as u32, i420_out);
+        }
+        Ok(())
     }
 }
 
@@ -494,18 +495,12 @@ enum ScreenCapture {
 }
 
 impl ScreenCapture {
-    fn capture(&self, out: &mut Vec<u8>) -> Result<()> {
+    fn capture_to_i420(&self, i420_out: &mut Vec<u8>, out_w: u32, out_h: u32,
+        needs_scaling: bool, tmp_argb: &mut Vec<u8>) -> Result<()>
+    {
         match self {
-            ScreenCapture::Shm(s) => s.capture(out),
-            ScreenCapture::Fallback(f) => f.capture(out),
-        }
-    }
-
-    /// Return the capture dimensions (width, height).
-    fn dimensions(&self) -> (u16, u16) {
-        match self {
-            ScreenCapture::Shm(s) => s.dimensions(),
-            ScreenCapture::Fallback(f) => f.dimensions(),
+            ScreenCapture::Shm(s) => s.capture_to_i420(i420_out, out_w, out_h, needs_scaling, tmp_argb),
+            ScreenCapture::Fallback(f) => f.capture_to_i420(i420_out, out_w, out_h, needs_scaling, tmp_argb),
         }
     }
 }
@@ -611,12 +606,8 @@ impl VideoEncoder {
 
         let intra_period = (args.framerate as u32) * 10; // GOP = 10× framerate
 
-        let enc_threads = std::thread::available_parallelism()
-            .map(|n| (n.get() / 2).min(4).max(1) as u16)
-            .unwrap_or(0);
-
         let config = EncoderConfig::new()
-            .num_threads(enc_threads)
+            .num_threads(1)
             .bitrate(BitRate::from_bps(bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(framerate))
             .usage_type(UsageType::ScreenContentRealTime)
@@ -628,7 +619,7 @@ impl VideoEncoder {
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
             .context("failed to create openh264 encoder")?;
 
-        log::info!("[encoder] {} threads configured, {}kbps", enc_threads, bitrate_bps / 1000);
+        log::info!("[encoder] 1 thread configured, {}kbps", bitrate_bps / 1000);
 
         Ok(VideoEncoder {
             inner: encoder,
@@ -1396,11 +1387,6 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         }
     };
 
-    // Use dimensions from the actual screen_capture (may differ from native_w/native_h in theory)
-    let (cap_w, cap_h) = screen_capture.dimensions();
-    let cap_w32 = cap_w as u32;
-    let cap_h32 = cap_h as u32;
-
     // ── Create VideoEncoder ──
     let mut encoder = match VideoEncoder::new(&state.args, out_w, out_h) {
         Ok(e) => e,
@@ -1463,8 +1449,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     };
 
     // ── Set remote description from answer ──
-    let answer = RTCSessionDescription::answer(answer_sdp)
-        .expect("invalid answer SDP");
+    let answer = match RTCSessionDescription::answer(answer_sdp) {
+        Ok(a) => a,
+        Err(e) => {
+            log::info!("[sdp] invalid answer SDP: {}", e);
+            return;
+        }
+    };
     if let Err(e) = pc.set_remote_description(answer).await {
         log::info!("[pc] set_remote_description failed: {}", e);
         return;
@@ -1475,7 +1466,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let ice_out_tx = out_tx.clone();
     let ice_forward = tokio::spawn(async move {
         while let Some(candidate_msg) = ice_rx.recv().await {
-            if ice_out_tx.try_send(Message::Text(candidate_msg.into())).is_err() {
+            if ice_out_tx.send(Message::Text(candidate_msg.into())).await.is_err() {
                 break;
             }
         }
@@ -1521,75 +1512,94 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         Err(e) => log::warn!("[dc] create_data_channel failed: {}", e),
     }
 
-    // ── Pipeline: 4-stage capture → convert → encode → send ──
-    let frame_duration = std::time::Duration::from_millis(1000 / state.args.framerate as u64);
+    // ── Pipeline: 3-stage capture → encode → send ──
+    let frame_duration = std::time::Duration::from_nanos(1_000_000_000 / state.args.framerate as u64);
     let track_ssrc = *track.ssrcs().await.first().unwrap_or(&0);
     if track_ssrc == 0 {
         log::info!("[pc] ERROR: no SSRC available for video track");
         return;
     }
 
-    log::info!("[pipeline] starting 4-stage pipeline (cap→conv→enc→send), {} fps", state.args.framerate);
+    log::info!("[pipeline] starting 3-stage pipeline (cap→enc→send), {} fps", state.args.framerate);
 
     // Capture flag before it's moved into the encoder task
     let adaptive_bitrate = state.args.adaptive_bitrate;
     let initial_bitrate_bps = (state.args.bitrate as u32) * 1000;
 
-    // Pipeline channels (capacity 4 for buffering)
-    // Standard mpsc sync channels used for blocking pipeline stages (recv_timeout available)
-    let (raw_tx, raw_rx) = block_mpsc::sync_channel::<Bytes>(2);
-    let (yuv_tx, yuv_rx) = block_mpsc::sync_channel::<Bytes>(2);
+    // Pipeline channels
+    let (yuv_tx, yuv_rx) = block_mpsc::sync_channel::<Vec<u8>>(2);
     let (enc_tx, mut enc_rx) = tokio::sync::mpsc::channel::<Bytes>(2);
 
     // Shutdown signal — unified CancellationToken for all pipeline tasks
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    // ── Stage 1: Capture (spawn_blocking) ──
+    // I420 memory pool (1 write + 1 in transit + 1 spare)
+    use crossbeam_queue::ArrayQueue;
+    let i420_pool = {
+        let pool = ArrayQueue::new(3);
+        let i420_size = (out_w * out_h * 3 / 2) as usize;
+        for _ in 0..3 {
+            let _ = pool.push(vec![0u8; i420_size]);
+        }
+        Arc::new(pool)
+    };
+
+    // ── Stage 1: Capture + Convert (spawn_blocking) ──
     let cap_stop = cancel.clone();
-    let cap_raw_tx = raw_tx.clone();
+    let yuv_tx_cap = yuv_tx.clone();
+    let i420_pool_cap = i420_pool.clone();
     let cap_handle = tokio::task::spawn_blocking(move || {
-        let mut raw_buf = vec![0u8; cap_w as usize * cap_h as usize * 4];
-        let mut last_raw: Option<Vec<u8>> = None; // lazy: alloc on demand
-        // Spare buffer for send: avoids taking raw_buf (keeping its allocation alive).
-        let mut send_buf = Vec::with_capacity(cap_w as usize * cap_h as usize * 4);
-        let mut drop_count = 0u32; // consecutive frame drops
+        let mut last_raw: Option<Vec<u8>> = None;
+        let mut tmp_argb = Vec::new();
         loop {
             if cap_stop.is_cancelled() { break; }
 
             let frame_start = std::time::Instant::now();
-            if let Err(e) = screen_capture.capture(&mut raw_buf) {
-                log::info!("[capture] error: {:#}, repeating last frame", e);
-                // Restore last known-good frame. If last_raw is None (no prior
-                // success), the stale/uninitialized frame will be shown instead.
-                if let Some(ref last) = last_raw {
-                    raw_buf.clone_from(last);
+
+            // Pop I420 buffer from pool
+            let mut i420 = match i420_pool_cap.pop() {
+                Some(buf) => buf,
+                None => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
                 }
-            } else if last_raw.is_none() {
-                // First success: lazily clone a reference frame for error
-                // recovery. Subsequent successes skip the clone (~8MB/frame).
-                last_raw = Some(raw_buf.clone());
-            }
-            // Send via Bytes (zero-copy Vec→Bytes). Swap with send_buf so raw_buf
-            // keeps its allocation for the next capture cycle.
-            if cap_stop.is_cancelled() { return; }
-            std::mem::swap(&mut raw_buf, &mut send_buf);
-            if cap_raw_tx.try_send(Bytes::from(std::mem::take(&mut send_buf))).is_err() {
-                // Channel full = downstream is congested; drop frame instead of blocking
-                log::trace!("[capture] dropping frame (channel full)");
-                // restore raw_buf from send_buf (which was emptied by take)
-                std::mem::swap(&mut raw_buf, &mut send_buf);
-                drop_count += 1;
-                // After 10+ consecutive drops the pipeline is persistently
-                // congested — shrink buffers to free memory. They'll grow
-                // back naturally when congestion clears.
-                if drop_count >= 10 {
-                    raw_buf.shrink_to(0);
-                    send_buf.shrink_to(0);
-                    drop_count = 0;
+            };
+
+            if let Err(e) = screen_capture.capture_to_i420(&mut i420, out_w, out_h,
+                needs_scaling, &mut tmp_argb)
+            {
+                log::info!("[capture] error: {:#}, repeating last frame", e);
+                // O(1) pointer swap instead of ~3MB copy_from_slice
+                if let Some(ref mut last) = last_raw {
+                    std::mem::swap(&mut i420, last);
+                } else {
+                    let _ = i420_pool_cap.push(i420);
+                    let elapsed = frame_start.elapsed();
+                    if elapsed < frame_duration {
+                        std::thread::sleep(frame_duration - elapsed);
+                    }
+                    continue;
                 }
             } else {
-                drop_count = 0;
+                // Capture succeeded
+                if let Some(ref mut last) = last_raw {
+                    let stale = std::mem::replace(last, i420.clone());
+                    let _ = i420_pool_cap.push(stale);
+                } else {
+                    last_raw = Some(i420.clone());
+                }
             }
+            if cap_stop.is_cancelled() { return; }
+
+            // Send I420 downstream (try_send — drop on congestion)
+            if let Err(e) = yuv_tx_cap.try_send(i420) {
+                log::trace!("[capture] dropping frame (channel full)");
+                if let block_mpsc::TrySendError::Full(v) = e {
+                    let _ = i420_pool_cap.push(v);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+
             let elapsed = frame_start.elapsed();
             if elapsed < frame_duration {
                 std::thread::sleep(frame_duration - elapsed);
@@ -1598,47 +1608,12 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         log::debug!("[capture] task ended");
     });
 
-    // ── Stage 2: Convert (spawn_blocking) ──
-    let conv_stop = cancel.clone();
-    let conv_yuv_tx = yuv_tx.clone();
-    let conv_handle = tokio::task::spawn_blocking(move || {
-        let i420_size = (out_w * out_h * 3 / 2) as usize;
-        let mut i420_buf = vec![0u8; i420_size];
-        let mut send_buf = vec![0u8; i420_size]; // pre-allocated for swap
-        let mut tmp_argb = Vec::new();
-        loop {
-            if conv_stop.is_cancelled() { break; }
-            match raw_rx.recv_timeout(std::time::Duration::from_millis(20)) {
-                Ok(raw) => {
-                    if needs_scaling {
-                        scale_bgra_direct(raw.as_ref(), cap_w32, cap_h32,
-                            out_w, out_h, &mut i420_buf, &mut tmp_argb);
-                    } else {
-                        bgra_to_i420(raw.as_ref(), out_w, out_h, &mut i420_buf);
-                    }
-                    if conv_stop.is_cancelled() { return; }
-                    // Swap buffers so i420_buf keeps the pre-allocated empty
-                    // buffer while send_buf holds the frame for sending.
-                    std::mem::swap(&mut i420_buf, &mut send_buf);
-                    // Copy into Bytes (exact-size allocation). Keep send_buf's
-                    // pre-allocated capacity alive via clear() so both buffers
-                    // stay ready — no alternating reallocation.
-                    let frame = Bytes::copy_from_slice(&send_buf);
-                    send_buf.clear();
-                    if conv_yuv_tx.send(frame).is_err() { return; }
-                }
-                Err(block_mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(block_mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        log::debug!("[convert] task ended");
-    });
-
     // ── Stage 3: Encode (spawn_blocking, single-threaded) ──
     let enc_stop = cancel.clone();
     let enc_tx_clone = enc_tx.clone();
     let target_bps = Arc::new(AtomicU32::new(initial_bitrate_bps));
     let enc_bps = target_bps.clone();
+    let i420_pool_enc = i420_pool.clone();
     let enc_handle = tokio::task::spawn_blocking(move || {
         let mut enc_buf = Vec::with_capacity(65536);
         let mut last_idr = std::time::Instant::now();
@@ -1658,15 +1633,17 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         log::error!("[encoder] error #{}/{}: {:#}", enc_failures, ENC_MAX_FAILURES, e);
                         if enc_failures >= ENC_MAX_FAILURES {
                             log::error!("[encoder] too many failures, aborting encoder task");
+                            let _ = i420_pool_enc.push(yuv);
                             break;
                         }
                         encoder.force_keyframe();
+                        let _ = i420_pool_enc.push(yuv);
                         continue;
                     }
                     enc_failures = 0; // reset on success
+                    // Return I420 buffer to pool for reuse
+                    let _ = i420_pool_enc.push(yuv);
                     // Copy encoded data into Bytes (exact size allocation).
-                    // Keep enc_buf's pre-allocated capacity for the next frame
-                    // instead of creating a new Vec with Vec::with_capacity(65536).
                     let frame = Bytes::copy_from_slice(&enc_buf);
                     enc_buf.clear();
                     if enc_stop.is_cancelled() { return; }
@@ -1723,7 +1700,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     use libpulse_simple_binding as psimple;
 
     // Auto-detect default sink monitor source for system audio capture
-    let audio_source = find_default_monitor();
+    let audio_source = tokio::task::spawn_blocking(find_default_monitor).await.unwrap_or(None);
     if let Some(ref src) = audio_source {
         log::info!("[audio] using monitor source: {}", src);
     } else {
@@ -1808,7 +1785,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     opus_out.reserve(4096);
                     // SAFETY: encode will write up to 4096 bytes into the reserved space.
                     // The returned n tells us how many bytes were actually written.
-                    unsafe { opus_out.set_len(4096); }
+                    opus_out.resize(4096, 0);
                     match encoder.encode(samples, &mut opus_out) {
                         Ok(n) => {
                             opus_out.truncate(n);
@@ -1864,12 +1841,40 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let dup_fd = unsafe { libc::dup(fd) };
     if dup_fd < 0 {
         log::error!("[x11] failed to dup event connection fd");
+        // Clean up pipeline tasks and connections before returning
+        cancel.cancel();
+        drop(yuv_tx); drop(enc_tx); drop(pcm_tx); drop(opus_tx);
+        if let Err(e) = cap_handle.await { log::error!("[pipeline] capture task panicked: {:?}", e); }
+        if let Err(e) = enc_handle.await { log::error!("[pipeline] encode task panicked: {:?}", e); }
+        if let Err(e) = send_handle.await { log::error!("[pipeline] send task panicked: {:?}", e); }
+        if let Err(e) = audio_cap_handle.await { log::error!("[pipeline] audio capture panicked: {:?}", e); }
+        if let Err(e) = audio_enc_handle.await { log::error!("[pipeline] audio encode panicked: {:?}", e); }
+        if let Err(e) = audio_send_handle.await { log::error!("[pipeline] audio send panicked: {:?}", e); }
+        drop(handler);
+        let _ = ice_forward.await;
+        let _ = pc.close().await;
+        io_handle.abort();
+        let _ = io_handle.await;
         return;
     }
     let evt_fd = match unsafe { AsyncFd::new(std::os::unix::io::OwnedFd::from_raw_fd(dup_fd)) } {
         Ok(fd) => fd,
         Err(e) => {
             log::error!("[x11] failed to create AsyncFd for event connection: {}", e);
+            // Clean up pipeline tasks and connections before returning
+            cancel.cancel();
+            drop(yuv_tx); drop(enc_tx); drop(pcm_tx); drop(opus_tx);
+            if let Err(e) = cap_handle.await { log::error!("[pipeline] capture task panicked: {:?}", e); }
+            if let Err(e) = enc_handle.await { log::error!("[pipeline] encode task panicked: {:?}", e); }
+            if let Err(e) = send_handle.await { log::error!("[pipeline] send task panicked: {:?}", e); }
+            if let Err(e) = audio_cap_handle.await { log::error!("[pipeline] audio capture panicked: {:?}", e); }
+            if let Err(e) = audio_enc_handle.await { log::error!("[pipeline] audio encode panicked: {:?}", e); }
+            if let Err(e) = audio_send_handle.await { log::error!("[pipeline] audio send panicked: {:?}", e); }
+            drop(handler);
+            let _ = ice_forward.await;
+            let _ = pc.close().await;
+            io_handle.abort();
+            let _ = io_handle.await;
             return;
         }
     };
@@ -2071,7 +2076,6 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     }
 
     // Drop channel senders so receivers stop blocking
-    drop(raw_tx);
     drop(yuv_tx);
     drop(enc_tx);
     drop(pcm_tx);
@@ -2079,7 +2083,6 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
     // Wait for pipeline tasks to finish (log any panics)
     if let Err(e) = cap_handle.await { log::error!("[pipeline] capture task panicked: {:?}", e); }
-    if let Err(e) = conv_handle.await { log::error!("[pipeline] convert task panicked: {:?}", e); }
     if let Err(e) = enc_handle.await { log::error!("[pipeline] encode task panicked: {:?}", e); }
     if let Err(e) = send_handle.await { log::error!("[pipeline] send task panicked: {:?}", e); }
     if let Err(e) = audio_cap_handle.await { log::error!("[pipeline] audio capture panicked: {:?}", e); }

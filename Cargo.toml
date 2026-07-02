@@ -59,6 +59,9 @@ rand = "0.9"
 # mmap for SHM shared memory
 libc = "0.2"
 
+# Lock-free memory pool for pipeline buffers
+crossbeam-queue = "0.3"
+
 # Memory allocator
 mimalloc = "0.1.52"
 
