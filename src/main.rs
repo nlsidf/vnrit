@@ -26,8 +26,11 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, Window};
 use x11rb::protocol::shm::{self, Seg};
 use x11rb::protocol::xtest;
+use x11rb::protocol::xinput::{self, XIEventMask, EventMask};
+use x11rb::protocol::Event;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 use x11rb_protocol::xauth::get_auth;
+use std::os::unix::io::AsRawFd;
 
 // ── webrtc-rs types ──
 use webrtc::peer_connection::{
@@ -953,7 +956,7 @@ fn connect_to_display(display: &str) -> Result<(RustConnection, usize)> {
     }
 }
 
-fn setup_x11_connections(display: &str) -> Result<(Arc<CaptureState>, Arc<InputState>, u16, u16, u8)> {
+fn setup_x11_connections(display: &str) -> Result<(Arc<CaptureState>, Arc<InputState>, u16, u16, u8, RustConnection)> {
     log::info!("[x11] connecting to display {} (capture connection)", display);
 
     let (cap_conn, screen_num) = connect_to_display(display)?;
@@ -1008,6 +1011,24 @@ fn setup_x11_connections(display: &str) -> Result<(Arc<CaptureState>, Arc<InputS
         m
     };
 
+    // Third connection for event-driven cursor tracking via XI2
+    log::info!("[x11] connecting to display {} (xi2 event connection)", display);
+    let (evt_conn, _) = connect_to_display(display)?;
+
+    // Query XI2 version
+    let xi_ver = xinput::xi_query_version(&evt_conn, 2, 0)
+        .context("XI2 query_version failed")?
+        .reply()
+        .context("XI2 query_version reply failed")?;
+    log::info!("[x11] XI2 version: {}.{}", xi_ver.major_version, xi_ver.minor_version);
+
+    // Select XI_Motion events on root window for all master devices
+    xinput::xi_select_events(&evt_conn, root, &[EventMask {
+        deviceid: 1, // XIAllMasterDevices
+        mask: vec![XIEventMask::MOTION],
+    }]).context("XI2 select_events failed")?;
+    evt_conn.flush()?;
+
     let capture_state = Arc::new(CaptureState {
         conn: cap_conn,
         root,
@@ -1025,7 +1046,7 @@ fn setup_x11_connections(display: &str) -> Result<(Arc<CaptureState>, Arc<InputS
         pressed_keys: std::sync::Mutex::new(std::collections::HashSet::new()),
     });
 
-    Ok((capture_state, input_state, screen_width, screen_height, screen_depth))
+    Ok((capture_state, input_state, screen_width, screen_height, screen_depth, evt_conn))
 }
 
 /// Try to auto-detect the default PulseAudio sink's monitor source for system audio capture.
@@ -1093,8 +1114,8 @@ fn find_default_monitor() -> Option<String> {
 async fn handle_ws(ws: WebSocket, state: ServerState) {
     log::info!("[ws] client connected");
 
-    // ── X11 connection setup (dual connections: capture + input) ──
-    let (capture_state, input_state, native_w, native_h, depth) = match setup_x11_connections(&state.args.display) {
+    // ── X11 connection setup (triple connections: capture + input + event) ──
+    let (capture_state, input_state, native_w, native_h, depth, evt_conn) = match setup_x11_connections(&state.args.display) {
         Ok(v) => v,
         Err(e) => {
             log::error!("[x11] FATAL: failed to connect: {:#}", e);
@@ -1824,10 +1845,30 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         log::debug!("[audio] send task ended");
     });
 
-    // ── Periodic cursor position sync ──
-    // Push real X11 cursor position to browser every ~50ms so the overlay
-    // stays in sync even when an X11 application warps the cursor.
-    let mut cursor_timer = time::interval(Duration::from_millis(60));
+    // ── XI2 event-driven cursor tracking ──
+    // AsyncFd wraps the X11 connection fd for tokio select readiness.
+    // When the fd becomes readable we poll for XI2 Motion events and
+    // update the cursor position without any X11 RPC overhead.
+    use tokio::io::unix::AsyncFd;
+    use std::os::unix::io::FromRawFd;
+    // Dup the fd so AsyncFd can own it independently of evt_conn
+    let fd = evt_conn.stream().as_raw_fd();
+    let dup_fd = unsafe { libc::dup(fd) };
+    if dup_fd < 0 {
+        log::error!("[x11] failed to dup event connection fd");
+        return;
+    }
+    let evt_fd = match unsafe { AsyncFd::new(std::os::unix::io::OwnedFd::from_raw_fd(dup_fd)) } {
+        Ok(fd) => fd,
+        Err(e) => {
+            log::error!("[x11] failed to create AsyncFd for event connection: {}", e);
+            return;
+        }
+    };
+
+    // ── Periodic stats timer (separate from cursor sync) ──
+    // Runs at 200ms; every 3 ticks (~600ms) we collect RTT + adaptive bitrate.
+    let mut stats_timer = time::interval(Duration::from_millis(200));
 
     // ── Input handling runs in main task (non-blocking) ──
     let scale_x = native_w as f64 / out_w as f64;
@@ -1859,12 +1900,27 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 }
             }
 
-            // Periodic cursor sync: query X11 and push position to browser
-            _ = cursor_timer.tick() => {
-                sync_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
+            // Event-driven cursor sync via XI2 (no polling)
+            _ = evt_fd.readable() => {
+                let mut guard = evt_fd.readable().await.expect("XI2 event fd error");
+                guard.clear_ready();
+                while let Ok(Some(event)) = evt_conn.poll_for_event() {
+                    if let Event::XinputMotion(ev) = event {
+                        // Fp1616 is 16.16 fixed-point → shift right 16 for integer pixel coords
+                        let rx = (ev.root_x >> 16) as i32;
+                        let ry = (ev.root_y >> 16) as i32;
+                        input_state.cursor_x.store(rx, Ordering::Relaxed);
+                        input_state.cursor_y.store(ry, Ordering::Relaxed);
+                        send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
+                    }
+                }
+            }
+
+            // Periodic stats collection (RTT + adaptive bitrate)
+            _ = stats_timer.tick() => {
                 stats_tick += 1;
-                // Collect stats every ~2s (200ms × 10)
-                if stats_tick % 10 == 0 {
+                // Collect stats every ~600ms (200ms × 3)
+                if stats_tick % 3 == 0 {
                     let now = std::time::Instant::now();
                     let report = pc.get_stats(now, StatsSelector::None).await;
                     let rtt_ms = report.candidate_pairs()
@@ -2169,21 +2225,6 @@ fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &InputState,
     // Format cursor JSON directly without serde_json::Value allocation
     let msg = format!(r#"{{"type":"cursor","x":{},"y":{}}}"#, sx, sy);
     let _ = out_tx.try_send(Message::Text(msg.into()));
-}
-
-/// Query X11 for the actual cursor position, update the in-memory state,
-/// and send the updated position to the browser.  Used for periodic sync
-/// so the overlay follows cursor movements initiated by X11 applications.
-fn sync_cursor_position(out_tx: &mpsc::Sender<Message>, state: &InputState,
-    native_w: u16, native_h: u16, out_w: u32, out_h: u32)
-{
-    if let Ok(q) = xproto::query_pointer(&state.conn, state.root) {
-        if let Ok(r) = q.reply() {
-            state.cursor_x.store(r.root_x as i32, Ordering::Relaxed);
-            state.cursor_y.store(r.root_y as i32, Ordering::Relaxed);
-        }
-    }
-    send_cursor_position(out_tx, state, native_w, native_h, out_w, out_h);
 }
 
 fn find_keycode(s: &InputState, keysym: u32) -> u8 {
