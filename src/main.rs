@@ -1827,7 +1827,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // ── Periodic cursor position sync ──
     // Push real X11 cursor position to browser every ~50ms so the overlay
     // stays in sync even when an X11 application warps the cursor.
-    let mut cursor_timer = time::interval(Duration::from_millis(200));
+    let mut cursor_timer = time::interval(Duration::from_millis(60));
 
     // ── Input handling runs in main task (non-blocking) ──
     let scale_x = native_w as f64 / out_w as f64;
