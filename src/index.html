@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
 <title>vnrit</title>
+<script>{{PAKO_JS}}</script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -858,12 +859,54 @@ function connect() {
     ws.send(JSON.stringify({ type: 'ready' }));
   };
 
+  // Set binary type for receiving compressed messages
+  ws.binaryType = 'arraybuffer';
+
+  // ── WebSocket decompression (native DecompressionStream with pako fallback) ──
+  async function decompressDeflate(data) {
+    if (typeof DecompressionStream !== 'undefined') {
+      const ds = new DecompressionStream('deflate-raw');
+      const writer = ds.writable.getWriter();
+      writer.write(data);
+      writer.close();
+      return await new Response(ds.readable).text();
+    }
+    if (typeof window.pako !== 'undefined') {
+      return new TextDecoder().decode(window.pako.inflateRaw(data));
+    }
+    throw new Error('No decompression support');
+  }
+
   ws.onmessage = async (event) => {
+    let text;
+    if (event.data instanceof ArrayBuffer) {
+      // Binary message with compression prefix byte
+      const view = new Uint8Array(event.data);
+      if (view[0] === 1) {
+        // Decompress deflate payload with native API or pako fallback
+        try {
+          const compressed = view.slice(1);
+          text = await decompressDeflate(compressed);
+        } catch (e) {
+          console.warn('[ws] decompression failed:', e);
+          return;
+        }
+      } else {
+        // Uncompressed text
+        text = new TextDecoder().decode(view.slice(1));
+      }
+    } else if (typeof event.data === 'string') {
+      text = event.data;
+    } else {
+      console.warn('[ws] unknown message type:', typeof event.data);
+      return;
+    }
+
     let msg;
     try {
-      msg = JSON.parse(event.data);
+      msg = JSON.parse(text);
     } catch {
-      console.warn('[ws] non-JSON message:', event.data);
+      console.warn('[ws] non-JSON message:', text);
       return;
     }
 

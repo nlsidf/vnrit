@@ -843,7 +843,8 @@ async fn main() -> Result<()> {
 
 async fn root_handler(State(state): State<ServerState>) -> Html<String> {
     let html = include_str!("index.html")
-        .replace("{{STUN_SERVER}}", &state.args.stun);
+        .replace("{{STUN_SERVER}}", &state.args.stun)
+        .replace("{{PAKO_JS}}", include_str!("pako_inflate.min.js"));
     Html(html)
 }
 
@@ -1144,6 +1145,19 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 outgoing = out_rx.recv() => {
                     match outgoing {
                         Some(msg) => {
+                            // Application-level deflate compression for text messages
+                            let msg = match msg {
+                                Message::Text(t) if t.len() > 512 => {
+                                    compress_text(&t)
+                                }
+                                Message::Text(t) => {
+                                    let mut buf = Vec::with_capacity(1 + t.len());
+                                    buf.push(0);
+                                    buf.extend_from_slice(t.as_bytes());
+                                    Message::Binary(buf.into())
+                                }
+                                other => other,
+                            };
                             if let Err(e) = ws_sink.send(msg).await {
                                 log::debug!("[wsio] send error: {}", e);
                                 break;
@@ -1155,6 +1169,12 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 incoming = ws_stream.next() => {
                     match incoming {
                         Some(Ok(msg)) => {
+                            let msg = match msg {
+                                Message::Binary(data) if data.len() > 1 && data[0] == 1 => {
+                                    decompress_binary(data)
+                                }
+                                _ => msg,
+                            };
                             if in_tx_task.send(Ok(msg)).await.is_err() {
                                 break;
                             }
@@ -2373,5 +2393,47 @@ fn code_to_keysym(code: &str) -> u32 {
             }
             0
         }
+    }
+}
+
+// ── WebSocket compression helpers ──
+//
+// Application-level deflate compression for text messages > 512 bytes.
+// Protocol: first byte = 0 (uncompressed) or 1 (deflate-compressed), followed by payload.
+
+/// Compress a text string with deflate and wrap as Binary with prefix byte 0x01.
+fn compress_text(text: &str) -> Message {
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+    if encoder.write_all(text.as_bytes()).is_ok() {
+        if let Ok(compressed) = encoder.finish() {
+            if compressed.len() < text.len() {
+                let mut buf = Vec::with_capacity(1 + compressed.len());
+                buf.push(1);
+                buf.extend_from_slice(&compressed);
+                return Message::Binary(Bytes::from(buf));
+            }
+        }
+    }
+    // Compression didn't help — send uncompressed
+    let mut buf = Vec::with_capacity(1 + text.len());
+    buf.push(0);
+    buf.extend_from_slice(text.as_bytes());
+    Message::Binary(Bytes::from(buf))
+}
+
+/// Decompress a Binary message with prefix byte 0x01 back to Text.
+fn decompress_binary(data: Bytes) -> Message {
+    use flate2::read::DeflateDecoder;
+    use std::io::Read;
+    let mut decoder = DeflateDecoder::new(&data[1..]);
+    let mut s = String::new();
+    if decoder.read_to_string(&mut s).is_ok() {
+        Message::Text(s.into())
+    } else {
+        // Decompression failed — try to interpret raw bytes as text
+        Message::Text(String::from_utf8_lossy(&data[1..]).to_string().into())
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "vnrit"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 description = "Lightweight X11 desktop WebRTC streaming server (pure Rust, no GStreamer)"
 license = "Apache-2.0"  
@@ -19,7 +19,7 @@ opt-level = 1
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8.9", features = ["ws"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -61,6 +61,9 @@ libc = "0.2"
 
 # Lock-free memory pool for pipeline buffers
 crossbeam-queue = "0.3"
+
+# WebSocket compression (deflate, application-level)
+flate2 = "1.0"
 
 # Memory allocator
 mimalloc = "0.1.52"
