@@ -1,7 +1,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as block_mpsc;
 use std::sync::Arc;
@@ -84,6 +83,8 @@ fn with_resize_uninit(buf: &mut Vec<u8>, size: usize, write: impl FnOnce(&mut [u
 struct ServerState {
     args: Arc<Args>,
     token: Option<String>,
+    /// Shared keycode cache (keysym→keycode), built once on first connection.
+    keycode_cache: std::sync::OnceLock<std::sync::Arc<std::collections::HashMap<u32, u8>>>,
 }
 
 // X11 event opcodes used by XTest fake_input (standard X11 protocol values)
@@ -296,7 +297,7 @@ struct InputState {
     /// Packed (y << 16) | x of last sent cursor position for atomic compare-swap.
     /// Initialized to !0 (= no sent yet) so first send always goes through.
     last_sent_packed: AtomicU64,
-    keycode_cache: HashMap<u32, u8>,
+    keycode_cache: std::sync::Arc<std::collections::HashMap<u32, u8>>,
     /// Track currently pressed keycodes so we can release them on disconnect,
     /// preventing "stuck key" on the X server (especially from virtual keyboard).
     pressed_keys: std::sync::Mutex<std::collections::HashSet<u8>>,
@@ -806,6 +807,7 @@ async fn main() -> Result<()> {
     let state = ServerState {
         args: Arc::new(args),
         token,
+        keycode_cache: std::sync::OnceLock::new(),
     };
 
     let addr = format!("0.0.0.0:{}", state.args.port);
@@ -947,7 +949,7 @@ fn connect_to_display(display: &str) -> Result<(RustConnection, usize)> {
     }
 }
 
-fn setup_x11_connections(display: &str) -> Result<(Arc<CaptureState>, Arc<InputState>, u16, u16, u8, RustConnection)> {
+fn setup_x11_connections(display: &str, keycode_cache: std::sync::Arc<std::collections::HashMap<u32, u8>>) -> Result<(Arc<CaptureState>, Arc<InputState>, u16, u16, u8, RustConnection)> {
     log::info!("[x11] connecting to display {} (capture connection)", display);
 
     let (cap_conn, screen_num) = connect_to_display(display)?;
@@ -972,35 +974,14 @@ fn setup_x11_connections(display: &str) -> Result<(Arc<CaptureState>, Arc<InputS
         .reply()
         .context("query_pointer reply failed")?;
 
-    // Cache keyboard mapping on input connection
     let setup = inp_conn.setup();
-    let first_keycode = setup.min_keycode;
-    let keycode_count = setup.max_keycode - setup.min_keycode + 1;
-    let kbd = xproto::get_keyboard_mapping(&inp_conn, first_keycode, keycode_count)
-        .context("get_keyboard_mapping failed")?
-        .reply()
-        .context("get_keyboard_mapping reply failed")?;
 
     log::info!(
         "[x11] connected, root=0x{:x}, pointer=({},{}), dims={}x{}, keycodes={}-{}",
         root, ptr.root_x, ptr.root_y,
         screen_width, screen_height,
-        first_keycode, setup.max_keycode
+        setup.min_keycode, setup.max_keycode
     );
-
-    let keycode_cache = {
-        let kpk = kbd.keysyms_per_keycode as usize;
-        let mut m = HashMap::new();
-        for (i, chunk) in kbd.keysyms.chunks(kpk).enumerate() {
-            let kc = first_keycode + i as u8;
-            for &ks in chunk {
-                if ks != 0 {
-                    m.entry(ks).or_insert(kc);
-                }
-            }
-        }
-        m
-    };
 
     // Third connection for event-driven cursor tracking via XI2
     log::info!("[x11] connecting to display {} (xi2 event connection)", display);
@@ -1106,7 +1087,30 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     log::info!("[ws] client connected");
 
     // ── X11 connection setup (triple connections: capture + input + event) ──
-    let (capture_state, input_state, native_w, native_h, depth, evt_conn) = match setup_x11_connections(&state.args.display) {
+    // Build or reuse the shared keycode cache (keysym→keycode mapping)
+    let keycode_cache = state.keycode_cache.get_or_init(|| {
+        let (conn, _screen_num) = connect_to_display(&state.args.display)
+            .expect("failed to connect to X11 for keycode cache");
+        let setup = conn.setup();
+        let first_kc = setup.min_keycode;
+        let keycode_count = setup.max_keycode - setup.min_keycode + 1;
+        let kbd = xproto::get_keyboard_mapping(&conn, first_kc, keycode_count)
+            .expect("get_keyboard_mapping failed")
+            .reply()
+            .expect("get_keyboard_mapping reply failed");
+        let kpk = kbd.keysyms_per_keycode as usize;
+        let mut m = std::collections::HashMap::new();
+        for (i, chunk) in kbd.keysyms.chunks(kpk).enumerate() {
+            let kc = first_kc + i as u8;
+            for &ks in chunk {
+                if ks != 0 {
+                    m.entry(ks).or_insert(kc);
+                }
+            }
+        }
+        std::sync::Arc::new(m)
+    }).clone();
+    let (capture_state, input_state, native_w, native_h, depth, evt_conn) = match setup_x11_connections(&state.args.display, keycode_cache) {
         Ok(v) => v,
         Err(e) => {
             log::error!("[x11] FATAL: failed to connect: {:#}", e);
@@ -1200,9 +1204,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         payload_type: 102,
         ..Default::default()
     };
-    media_engine
-        .register_codec(video_codec.clone(), RtpCodecKind::Video)
-        .expect("failed to register H264 codec");
+    if let Err(e) = media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video) {
+        log::info!("[pc] failed to register H264 codec: {}", e);
+        return;
+    }
 
     // ── Register Opus audio codec ──
     let audio_codec = RTCRtpCodecParameters {
@@ -1216,11 +1221,17 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         payload_type: 111,
         ..Default::default()
     };
-    media_engine
-        .register_codec(audio_codec.clone(), RtpCodecKind::Audio)
-        .expect("failed to register Opus codec");
-    let registry = register_default_interceptors(Registry::new(), &mut media_engine)
-        .expect("failed to register default interceptors");
+    if let Err(e) = media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio) {
+        log::info!("[pc] failed to register Opus codec: {}", e);
+        return;
+    }
+    let registry = match register_default_interceptors(Registry::new(), &mut media_engine) {
+        Ok(r) => r,
+        Err(e) => {
+            log::info!("[pc] failed to register default interceptors: {}", e);
+            return;
+        }
+    };
 
     // ── RTCConfiguration ──
     let ice_servers = if state.args.stun.is_empty() {
@@ -1285,7 +1296,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
     let input_dc_tx = dc_tx.clone();
 
-    let rt = runtime::default_runtime().expect("no webrtc runtime available");
+    let rt = match runtime::default_runtime() {
+        Some(r) => r,
+        None => {
+            log::info!("[pc] no webrtc runtime available");
+            return;
+        }
+    };
 
     let pc = match PeerConnectionBuilder::new()
         .with_configuration(config)
@@ -1711,12 +1728,23 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
     // Audio channels — std sync_channel for blocking pipeline (recv_timeout available)
     let (pcm_tx, pcm_rx) = block_mpsc::sync_channel::<Vec<u8>>(8);
-    let (opus_tx, mut opus_rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+    let (opus_tx, mut opus_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+    // PCM memory pool for zero-alloc audio capture
+    const PCM_FRAME_BYTES: usize = 3840; // 20ms stereo 48kHz S16LE
+    let pcm_pool = {
+        let pool = ArrayQueue::new(8);
+        for _ in 0..8 {
+            let _ = pool.push(vec![0u8; PCM_FRAME_BYTES]);
+        }
+        Arc::new(pool)
+    };
 
     // ── Audio Stage 1: PulseAudio capture (spawn_blocking) ──
     let audio_cap_stop = cancel.clone();
     let audio_pcm_tx = pcm_tx.clone();
     let audio_source = audio_source.clone();
+    let pcm_pool_cap = pcm_pool.clone();
     let audio_cap_handle = tokio::task::spawn_blocking(move || {
         let spec = pulse::sample::Spec {
             format: pulse::sample::Format::S16NE,
@@ -1740,21 +1768,33 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         };
         log::info!("[audio] PulseAudio capture started");
 
-        const PCM_FRAME_BYTES: usize = 3840; // 20ms stereo 48kHz S16LE
-        let mut buf = vec![0u8; PCM_FRAME_BYTES];
         loop {
             if audio_cap_stop.is_cancelled() { break; }
+            // Pop PCM buffer from pool (no per-frame allocation)
+            let mut buf = match pcm_pool_cap.pop() {
+                Some(b) => b,
+                None => {
+                    log::trace!("[audio] PCM pool empty, dropping frame");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+            };
             // PulseAudio Simple::read blocks up to 20ms (one frame).
             // If PA hangs (rare), the cancel token can't interrupt it, but
             // this only delays shutdown by at most one audio frame.
             if let Err(e) = pa.read(&mut buf) {
                 log::info!("[audio] read error: {}", e);
+                let _ = pcm_pool_cap.push(buf);
                 break;
             }
-            if audio_cap_stop.is_cancelled() { return; }
-            // Clone the PCM data (exact-size allocation, no zero-fill waste).
-            // Keep buf's allocation alive for the next pa.read to overwrite.
-            if audio_pcm_tx.send(buf.clone()).is_err() { return; }
+            if audio_cap_stop.is_cancelled() {
+                let _ = pcm_pool_cap.push(buf);
+                return;
+            }
+            // Send PCM buffer downstream — no clone needed
+            if audio_pcm_tx.send(buf).is_err() {
+                return;
+            }
         }
         log::debug!("[audio] capture task ended");
     });
@@ -1762,6 +1802,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // ── Audio Stage 2: Opus encode (spawn_blocking) ──
     let audio_enc_stop = cancel.clone();
     let audio_opus_tx = opus_tx.clone();
+    let pcm_pool_enc = pcm_pool.clone();
     let audio_enc_handle = tokio::task::spawn_blocking(move || {
         let mut encoder = match opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::Audio) {
             Ok(e) => e,
@@ -1783,22 +1824,22 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     };
                     opus_out.clear();
                     opus_out.reserve(4096);
-                    // SAFETY: encode will write up to 4096 bytes into the reserved space.
-                    // The returned n tells us how many bytes were actually written.
                     opus_out.resize(4096, 0);
                     match encoder.encode(samples, &mut opus_out) {
                         Ok(n) => {
                             opus_out.truncate(n);
-                            // Copy into Bytes (exact-size allocation).
-                            // Keep opus_out's pre-allocated capacity alive for the
-                            // next encode instead of creating a new Vec each frame.
-                            let frame = Bytes::copy_from_slice(&opus_out);
-                            opus_out.clear();
-                            // try_send — if full, drop packet to avoid blocking spawn_blocking
+                            // Return PCM buffer to pool for reuse
+                            let _ = pcm_pool_enc.push(pcm);
+                            // Zero-copy: send Opus Vec directly
                             if audio_enc_stop.is_cancelled() { return; }
-                            let _ = audio_opus_tx.try_send(frame);
+                            if audio_opus_tx.try_send(std::mem::take(&mut opus_out)).is_err() {
+                                log::trace!("[audio] dropping Opus packet (channel full)");
+                            }
                         }
-                        Err(e) => log::info!("[audio] encode error: {}", e),
+                        Err(e) => {
+                            log::info!("[audio] encode error: {}", e);
+                            let _ = pcm_pool_enc.push(pcm);
+                        }
                     }
                 }
                 Err(block_mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1815,8 +1856,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             tokio::select! {
                 Some(opus_packet) = opus_rx.recv() => {
                     if opus_packet.is_empty() { continue; }
+                    // Zero-copy Vec→Bytes (moves heap allocation, no copy)
+                    let data = Bytes::from(opus_packet);
                     if let Err(e) = audio_track.sample_writer(audio_ssrc).write_sample(&Sample {
-                        data: opus_packet,
+                        data,
                         duration: audio_frame_duration,
                         ..Default::default()
                     }).await {
@@ -1915,7 +1958,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
             // Event-driven cursor sync via XI2 (no polling)
             _ = evt_fd.readable() => {
-                let mut guard = evt_fd.readable().await.expect("XI2 event fd error");
+                let mut guard = match evt_fd.readable().await {
+                    Ok(g) => g,
+                    Err(e) => {
+                        log::error!("[x11] XI2 event fd error: {}", e);
+                        break;
+                    }
+                };
                 guard.clear_ready();
                 while let Ok(Some(event)) = evt_conn.poll_for_event() {
                     if let Event::XinputMotion(ev) = event {
@@ -1984,7 +2033,15 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             msg = in_rx.recv() => {
                 match msg {
                     Some(Ok(Message::Text(t))) => {
-                        if let Ok(sig) = serde_json::from_str::<SignalingMessage>(&t) {
+                        // Fast path: check for input events first (most frequent)
+                        if t.starts_with("mr,") || t.starts_with("ma,")
+                            || t.starts_with("md,") || t.starts_with("mu,")
+                            || t.starts_with("ms,") || t.starts_with("kd,")
+                            || t.starts_with("ku,")
+                        {
+                            handle_input_message(&t, &input_state, scale_x, scale_y);
+                            send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
+                        } else if let Ok(sig) = serde_json::from_str::<SignalingMessage>(&t) {
                             match sig {
                                 SignalingMessage::Ice { candidate, sdp_mline_index } => {
                                     let init = RTCIceCandidateInit {
@@ -1999,13 +2056,6 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                                 }
                                 _ => {}
                             }
-                        } else if t.starts_with("mr,") || t.starts_with("ma,")
-                            || t.starts_with("md,") || t.starts_with("mu,")
-                            || t.starts_with("ms,") || t.starts_with("kd,")
-                            || t.starts_with("ku,")
-                        {
-                            handle_input_message(&t, &input_state, scale_x, scale_y);
-                            send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
                         } else {
                             let preview: String = t.chars().take(100).collect();
                             log::debug!("[ws] unrecognized message: '{}'", preview);
