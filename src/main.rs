@@ -1539,7 +1539,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // Standard mpsc sync channels used for blocking pipeline stages (recv_timeout available)
     let (raw_tx, raw_rx) = block_mpsc::sync_channel::<Bytes>(2);
     let (yuv_tx, yuv_rx) = block_mpsc::sync_channel::<Bytes>(2);
-    let (enc_tx, mut enc_rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+    let (enc_tx, mut enc_rx) = tokio::sync::mpsc::channel::<Bytes>(2);
 
     // Shutdown signal — unified CancellationToken for all pipeline tasks
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -1670,7 +1670,15 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     let frame = Bytes::copy_from_slice(&enc_buf);
                     enc_buf.clear();
                     if enc_stop.is_cancelled() { return; }
-                    if enc_tx_clone.blocking_send(frame).is_err() { return; }
+                    match enc_tx_clone.try_send(frame) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            // 通道满，丢弃当前帧，强制 IDR
+                            encoder.force_keyframe();
+                            log::trace!("[encoder] dropping frame: channel full");
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                    }
                     // Force IDR on a wall-clock basis so timing is unaffected
                     // by encoder stalls or frame drops.
                     if last_idr.elapsed() >= IDR_INTERVAL {
