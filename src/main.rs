@@ -86,6 +86,8 @@ fn with_resize_uninit(buf: &mut Vec<u8>, size: usize, write: impl FnOnce(&mut [u
 struct ServerState {
     args: Arc<Args>,
     token: Option<String>,
+    /// Pre-rendered HTML page (template substitution done once at startup).
+    index_html: String,
     /// Shared keycode cache (keysym→keycode), built once on first connection.
     keycode_cache: std::sync::OnceLock<std::sync::Arc<std::collections::HashMap<u32, u8>>>,
 }
@@ -987,9 +989,14 @@ fn main() -> Result<()> {
     .init();
 
     let token = args.token.clone();
+    // Pre-render HTML once at startup (avoids template substitution on every request).
+    let index_html = include_str!("index.html")
+        .replace("{{STUN_SERVER}}", &args.stun)
+        .replace("{{PAKO_JS}}", include_str!("pako_inflate.min.js"));
     let state = ServerState {
         args: Arc::new(args),
         token,
+        index_html,
         keycode_cache: std::sync::OnceLock::new(),
     };
 
@@ -1026,10 +1033,7 @@ fn main() -> Result<()> {
 }
 
 async fn root_handler(State(state): State<ServerState>) -> Html<String> {
-    let html = include_str!("index.html")
-        .replace("{{STUN_SERVER}}", &state.args.stun)
-        .replace("{{PAKO_JS}}", include_str!("pako_inflate.min.js"));
-    Html(html)
+    Html(state.index_html.clone())
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<ServerState>) -> impl IntoResponse {
@@ -2564,7 +2568,9 @@ fn find_keycode(s: &InputState, keysym: u32) -> u8 {
 }
 
 fn code_to_keysym(code: &str) -> u32 {
-    match code {
+    // Perfect-hash static lookup map — compile-time generated, O(1), no hashing overhead.
+    use phf::phf_map;
+    static KEYMAP: phf::Map<&'static str, u32> = phf_map! {
         "Enter" => 0xff0d,
         "Backspace" => 0xff08,
         "Space" => 0x0020,
@@ -2574,10 +2580,14 @@ fn code_to_keysym(code: &str) -> u32 {
         "ArrowDown" => 0xff54,
         "ArrowLeft" => 0xff51,
         "ArrowRight" => 0xff53,
-        "ShiftLeft" | "ShiftRight" => 0xffe1,
-        "ControlLeft" | "ControlRight" => 0xffe3,
-        "AltLeft" | "AltRight" => 0xffe9,
-        "MetaLeft" | "MetaRight" => 0xffeb,
+        "ShiftLeft" => 0xffe1,
+        "ShiftRight" => 0xffe1,
+        "ControlLeft" => 0xffe3,
+        "ControlRight" => 0xffe3,
+        "AltLeft" => 0xffe9,
+        "AltRight" => 0xffe9,
+        "MetaLeft" => 0xffeb,
+        "MetaRight" => 0xffeb,
         "CapsLock" => 0xffe5,
         "Delete" => 0xffff,
         "Insert" => 0xff63,
@@ -2601,50 +2611,55 @@ fn code_to_keysym(code: &str) -> u32 {
         "Comma" => 0x002c,
         "Period" => 0x002e,
         "Slash" => 0x002f,
-        "Backslash" | "IntlBackslash" => 0x005c,
-        k if k.starts_with("Numpad") => match k {
-            "Numpad0" => 0xffb0,
-            "Numpad1" => 0xffb1,
-            "Numpad2" => 0xffb2,
-            "Numpad3" => 0xffb3,
-            "Numpad4" => 0xffb4,
-            "Numpad5" => 0xffb5,
-            "Numpad6" => 0xffb6,
-            "Numpad7" => 0xffb7,
-            "Numpad8" => 0xffb8,
-            "Numpad9" => 0xffb9,
-            "NumpadEnter" => 0xff8d,
-            "NumpadAdd" => 0xffab,
-            "NumpadSubtract" => 0xffad,
-            "NumpadMultiply" => 0xffaa,
-            "NumpadDivide" => 0xffaf,
-            "NumpadDecimal" => 0xffae,
-            _ => return 0,
-        },
-        k if k.starts_with('F') && k.len() <= 4 => {
-            let n: u32 = k[1..].parse().unwrap_or(0);
-            if (1..=24).contains(&n) {
-                0xffbe + n - 1
-            } else {
-                0
-            }
-        }
-        "Digit0" | "Digit1" | "Digit2" | "Digit3" | "Digit4"
-        | "Digit5" | "Digit6" | "Digit7" | "Digit8" | "Digit9" => {
-            code.as_bytes()[5] as u32
-        }
-        _ => {
-            if let Some(c) = code.strip_prefix("Key") {
-                if c.len() == 1 {
-                    let b = c.as_bytes()[0];
-                    if b.is_ascii_alphabetic() {
-                        return b as u32;
-                    }
-                }
-            }
-            0
+        "Backslash" => 0x005c,
+        "IntlBackslash" => 0x005c,
+        "Numpad0" => 0xffb0,
+        "Numpad1" => 0xffb1,
+        "Numpad2" => 0xffb2,
+        "Numpad3" => 0xffb3,
+        "Numpad4" => 0xffb4,
+        "Numpad5" => 0xffb5,
+        "Numpad6" => 0xffb6,
+        "Numpad7" => 0xffb7,
+        "Numpad8" => 0xffb8,
+        "Numpad9" => 0xffb9,
+        "NumpadEnter" => 0xff8d,
+        "NumpadAdd" => 0xffab,
+        "NumpadSubtract" => 0xffad,
+        "NumpadMultiply" => 0xffaa,
+        "NumpadDivide" => 0xffaf,
+        "NumpadDecimal" => 0xffae,
+    };
+
+    if let Some(&keysym) = KEYMAP.get(code) {
+        return keysym;
+    }
+    // Function keys: F1..F24
+    if code.starts_with('F') && code.len() <= 4 {
+        let n: u32 = code[1..].parse().unwrap_or(0);
+        if (1..=24).contains(&n) {
+            return 0xffbe + n - 1;
         }
     }
+    // Digit keys: Digit0..Digit9
+    if let Some(d) = code.strip_prefix("Digit") {
+        if d.len() == 1 {
+            let b = d.as_bytes()[0];
+            if b.is_ascii_digit() {
+                return b as u32;
+            }
+        }
+    }
+    // Letter keys: KeyA..KeyZ
+    if let Some(c) = code.strip_prefix("Key") {
+        if c.len() == 1 {
+            let b = c.as_bytes()[0];
+            if b.is_ascii_alphabetic() {
+                return b as u32;
+            }
+        }
+    }
+    0
 }
 
 // ── WebSocket compression helpers ──
