@@ -67,6 +67,9 @@ use std::os::fd::IntoRawFd;
 
 use shiguredo_libyuv::{self, FilterMode, ImageSize, ArgbImage, I420Image, I420ImageMut};
 
+// ── libblur: SIMD-accelerated fast blur (used for Y-plane unsharp mask) ──
+use libblur::{self, BlurImageMut, FastBlurChannels, AnisotropicRadius, ThreadingPolicy};
+
 /// Resize `buf` to `size` without zero-initialization, then call `write` with the mutable slice.
 /// The write closure must write all `size` bytes before returning — reading uninit bytes is UB.
 /// After `write` returns, the Vec is guaranteed to contain `size` initialized bytes.
@@ -267,6 +270,18 @@ authentication so subsequent requests (including the WebSocket upgrade) can reus
         help = "Enable adaptive bitrate based on WebRTC bandwidth estimation",
     )]
     adaptive_bitrate: bool,
+
+    #[arg(
+        long,
+        help = "Y-plane unsharp mask strength (0.0=off, 0.5=light, 1.0=medium, 2.0=strong) \
+[default: auto=0.8 when --height is active, else 0.0]",
+        long_help = "After scaling, applies unsharp masking to the Y (luminance) plane. \
+Uses libblur stack_blur (SIMD O(1) blur) with integer USM. \
+Only touches luma — chroma is preserved. \
+Values above 1.5 may introduce visible halos. \
+When omitted and --height is active, defaults to 0.8 automatically."
+    )]
+    enhance: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -571,6 +586,167 @@ fn scale_bgra_direct(bgra: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
         let dst_size = ImageSize::new(dst_w as usize, dst_h as usize);
         let _ = shiguredo_libyuv::i420_scale(&src_img, src_size, &mut dst_img, dst_size, FilterMode::Bilinear);
     });
+}
+
+/// Build motion-adaptation look-up table at compile time.
+///
+/// `table[mad] = 255 × exp(-mad/5)` approximated via recurrence
+/// `v_{n+1} = v_n × 209 / 256` where 209 = floor(256 × e^{-1/5}).
+const fn build_motion_table() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut v: u32 = 255;
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = v as u8;
+        v = v * 209 / 256;
+        i += 1;
+    }
+    t
+}
+
+/// Motion-adaptation table: MAD → sharpening multiplier [0, 255].
+/// MAD = 0 (still) → 255 (full); MAD = 25+ (fast motion) → ≈ 0.
+const MOTION_TABLE: [u8; 256] = build_motion_table();
+
+/// Apply unsharp mask to the Y (luminance) plane of an I420 frame.
+///
+/// Features:
+///   - **Motion adaptation** — MAD-based look-up table reduces strength
+///     during motion (eliminates temporal flicker).
+///   - **Local adaptation** — per-pixel edge strength (`|Y - blur(Y)|`)
+///     boosts the amount on strong edges, leaves flat areas untouched.
+///   - **Integer only** — no float division, no `exp`, no `sin`/`cos`.
+///
+/// # Memory layout: `blur_buf` is dual-purpose
+///
+/// ```text
+/// blur_buf  [0 .. y_size)   = copy of current Y (for stack_blur)
+///           [y_size .. 2×y_size) = previous frame Y (for MAD)
+/// ```
+///
+/// This avoids a separate `prev` allocation.  `blur_buf` is `tmp_argb`
+/// from the capture pipeline (already ≈3 MB), so the 2× expansion from
+/// `y_size` to `2×y_size` never reallocates after the first frame.
+fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32, blur_buf: &mut Vec<u8>) {
+    if strength <= 0.0 || w < 3 || h < 3 {
+        return;
+    }
+    let y_size = w * h;
+    let total_req = 2 * y_size;
+
+    // Compute UV sizes now (needed for chroma activity and later for flattening)
+    let uv_size = (w / 2) * (h / 2);
+
+    // (Re)size blur_buf to [blur_copy | prev]; on first call or resolution
+    // change the new prev is seeded with current frame so MAD = 0.
+    if blur_buf.len() != total_req {
+        blur_buf.clear();
+        blur_buf.reserve(total_req);
+        // SAFETY: reserve guarantees capacity. Writes below fill all bytes.
+        unsafe { blur_buf.set_len(total_req); }
+        // First frame or resolution change: no valid prev → current = prev
+        let y_plane = &i420[..y_size];
+        blur_buf[y_size..total_req].copy_from_slice(y_plane);
+    }
+
+    // ── 0.  Chroma activity ─────────────────────────────────────
+    // Compute mean absolute chroma deviation from 128 (neutral).
+    // Do this BEFORE splitting y_plane from i420 to satisfy the borrow checker.
+    let chroma_boost_q8 = if uv_size > 0 && i420.len() >= y_size + 2 * uv_size {
+        let mut chroma_sum: u64 = 0;
+        for &p in &i420[y_size..y_size + 2 * uv_size] {
+            chroma_sum += (p as i32 - 128).unsigned_abs() as u64;
+        }
+        let avg_chroma = (chroma_sum / (2 * uv_size as u64)) as u32; // [0, 127]
+        //  avg_chroma → chroma_boost_q8 (Q8):
+        //    0 (grayscale) → 256 (1.0×,  no boost)
+        //   40 (colorful)  → 376 (1.47×, near max)
+        //   85+            → 384 (1.5×,  saturate)
+        256u32 + (avg_chroma * 3).min(128)
+    } else {
+        256u32
+    };
+
+    let (blur_copy, prev) = blur_buf.split_at_mut(y_size);
+    let y_plane = &mut i420[..y_size];
+
+    // ── 1.  MAD × TV × Copy ─────────────────────────────────────
+    // Merge MAD (motion) and TV (contrast) accumulation with the
+    // mandatory Y → blur_copy copy.  No extra passes.
+    //   MAD = Σ|y[i] - prev[i]|       → motion adaptation
+    //   TV  = Σ|y[i] - y[i-1]|        → contrast adaptation
+    let mut mad_sum: u64 = 0;
+    let mut tv_sum: u64 = 0;
+    let mut prev_y = y_plane[0];
+    for i in 0..y_size {
+        let diff = y_plane[i] as i32 - prev[i] as i32;
+        mad_sum += diff.unsigned_abs() as u64;
+        if i > 0 {
+            tv_sum += (y_plane[i] as i32 - prev_y as i32).unsigned_abs() as u64;
+        }
+        prev_y = y_plane[i];
+        blur_copy[i] = y_plane[i];
+    }
+    let mad = (mad_sum / y_size as u64) as usize;           // [0, 255]
+    let avg_tv = (tv_sum / (y_size.saturating_sub(1)) as u64) as u32; // [0, 255]
+    let motion_factor = MOTION_TABLE[mad.min(255)] as u32;  // [0, 255]
+
+    // ── 2.  Stack blur (SIMD, O(1)) ────────────────────────────
+    {
+        let mut img = BlurImageMut::borrow(
+            blur_copy,
+            w as u32, h as u32,
+            FastBlurChannels::Plane,
+        );
+        let radius = AnisotropicRadius::new(2);
+        let _ = libblur::stack_blur(&mut img, radius, ThreadingPolicy::Single);
+    }
+
+    // ── 3.  USM with motion + contrast + local adaptation ──────
+    //  base_amount = Q8  (256 = 1.0x)
+    let base_amount = (strength * 256.0).clamp(0.0, 1023.0) as u32;
+
+    //  Contrast boost  (Total Variation per pixel → Q8 multiplier)
+    //    avg_tv ≈  2 (blurry/smooth) → boost = 384 (1.5x)
+    //    avg_tv ≈ 43 (typical)       → boost = 256 (1.0x)
+    //    avg_tv ≈ 85 (already sharp) → boost = 128 (0.5x)
+    let contrast_boost_q8 = (384u32).saturating_sub(avg_tv * 3).max(128).min(512);
+    let effective_base = ((base_amount * contrast_boost_q8 + 128) >> 8).min(1023);
+
+    //  Chroma boost (mean |C - 128| → Q8 multiplier)
+    //    avg_chroma ≈  0 (grayscale) → 256  (1.0×,  no boost)
+    //    avg_chroma ≈ 40 (colorful)  → 376  (1.47×, near max)
+    //    avg_chroma ≈ 85+            → 384  (1.5×,  saturate)
+    let effective_base = ((effective_base * chroma_boost_q8 + 128) >> 8).min(1023);
+
+    for (yp, &blur) in y_plane.iter_mut().zip(blur_copy.iter()) {
+        let diff = *yp as i32 - blur as i32;
+        let abs_diff = diff.unsigned_abs();
+
+        // Local factor Q8: piecewise linear in |diff|
+        //   [0,  8) → 256 (1.0)           dead zone — no boost
+        //   [8, 40) → 256..384 (1..1.5)   linear ramp
+        //   [40, ∞) → 384 (1.5)           saturate
+        let local_q8 = if abs_diff < 8 {
+            256u32
+        } else if abs_diff < 40 {
+            // 256 + (abs_diff - 8) × 4 = 256 + ((abs_diff - 8) << 2)
+            256 + (((abs_diff - 8) as u32) << 2)
+        } else {
+            384u32
+        };
+
+        // Combined multiplier: motion × local  (Q8)
+        let combined_q8 = (motion_factor * local_q8 + 128) >> 8;
+        // Final Q8 amount, clamped to safe range
+        let amount = ((effective_base * combined_q8 + 128) >> 8).min(1023);
+
+        let adj = (diff as i32 * amount as i32 + 128) >> 8;
+        *yp = ((*yp as i32 + adj).clamp(0, 255)) as u8;
+    }
+
+    // ── 4.  Save current Y as prev for next frame ──────────────
+    prev.copy_from_slice(y_plane);
 }
 
 /// BGRA → I420, writing into a pre-sized buffer (no resize).
@@ -1557,7 +1733,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         return;
     }
 
-    log::info!("[pipeline] starting 3-stage pipeline (cap→enc→send), {} fps", state.args.framerate);
+    // When --height is active, auto-enable enhancement at 0.8 unless user explicitly set --enhance.
+    let enhance = state.args.enhance
+        .unwrap_or_else(|| if needs_scaling { 0.8 } else { 0.0 });
+    log::info!("[pipeline] starting 3-stage pipeline (cap→enc→send), {} fps, enhance={}", state.args.framerate, enhance);
 
     // Capture flag before it's moved into the encoder task
     let adaptive_bitrate = state.args.adaptive_bitrate;
@@ -1618,7 +1797,17 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     continue;
                 }
             } else {
-                // Capture succeeded
+                // Capture succeeded — apply Y-plane unsharp mask enhancement
+                if enhance > 0.0 {
+                    let y_size = out_w as usize * out_h as usize;
+                    let uv_size = (out_w as usize / 2) * (out_h as usize / 2);
+                    apply_enhancement(
+                        &mut i420[..y_size + 2 * uv_size],
+                        out_w as usize, out_h as usize,
+                        enhance, &mut tmp_argb,
+                    );
+                }
+                // Update last_raw with the (now enhanced) frame
                 if let Some(ref mut last) = last_raw {
                     let stale = std::mem::replace(last, i420.clone());
                     let _ = i420_pool_cap.push(stale);
