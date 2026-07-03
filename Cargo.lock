@@ -2700,27 +2700,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shiguredo_cmake"
-version = "4.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8135cbeeadd45e9325685cd4a7a3d035013cac359189da48c37a221f90d86f46"
-dependencies = [
- "cmake",
- "shiguredo_toml",
-]
-
-[[package]]
-name = "shiguredo_libyuv"
-version = "2026.2.0-canary.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0db8f8d8b39db8731a182cc4c9a265de1d46fac2773b35b68454b49e3e4ec2be"
-dependencies = [
- "bindgen",
- "shiguredo_cmake",
- "shiguredo_toml",
-]
-
-[[package]]
 name = "shiguredo_toml"
 version = "2026.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3156,7 +3135,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vnrit"
-version = "0.2.11"
+version = "0.2.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3182,9 +3161,9 @@ dependencies = [
  "rtc-media",
  "serde",
  "serde_json",
- "shiguredo_libyuv",
  "tokio",
  "tokio-util",
+ "vnrit-libyuv",
  "vnrit-opus",
  "webrtc",
  "x11rb",
@@ -3200,6 +3179,17 @@ dependencies = [
  "cmake",
  "log",
  "pkg-config",
+]
+
+[[package]]
+name = "vnrit-libyuv"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79472281e13b6c60cfa9078f6925a344ca7d6fac3b085ee02e186842374fd1f1"
+dependencies = [
+ "bindgen",
+ "cmake",
+ "shiguredo_toml",
 ]
 
 [[package]]

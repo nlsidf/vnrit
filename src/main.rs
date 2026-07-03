@@ -65,7 +65,7 @@ use rand::Rng;
 use async_trait::async_trait;
 use std::os::fd::IntoRawFd;
 
-use shiguredo_libyuv::{self, FilterMode, ImageSize, ArgbImage, I420Image, I420ImageMut};
+use vnrit_libyuv::{self, FilterMode, ImageSize, ArgbImage, I420Image, I420ImageMut};
 
 // ── libblur: SIMD-accelerated fast blur (used for Y-plane unsharp mask) ──
 use libblur::{self, BlurImageMut, FastBlurChannels, AnisotropicRadius, ThreadingPolicy};
@@ -521,7 +521,7 @@ impl ScreenCapture {
     }
 }
 
-// ── Color conversion (libyuv SIMD-accelerated via shiguredo_libyuv) ──
+// ── Color conversion (libyuv SIMD-accelerated via vnrit_libyuv) ──
 //
 // X11 ZPixmap returns BGRA bytes: [B,G,R,A]. libyuv calls this "ARGB".
 // No-scaling path:  BGRA → ARGBToI420 → I420 (SIMD, 1 pass)
@@ -545,7 +545,7 @@ fn bgra_to_i420(bgra: &[u8], width: u32, height: u32, out: &mut Vec<u8>) {
             v: v_plane, v_stride: (width / 2) as usize,
         };
         let size = ImageSize::new(width as usize, height as usize);
-        let _ = shiguredo_libyuv::argb_to_i420(&src, &mut dst, size);
+        let _ = vnrit_libyuv::argb_to_i420(&src, &mut dst, size);
     });
 }
 
@@ -584,7 +584,7 @@ fn scale_bgra_direct(bgra: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
         };
         let src_size = ImageSize::new(src_w as usize, src_h as usize);
         let dst_size = ImageSize::new(dst_w as usize, dst_h as usize);
-        let _ = shiguredo_libyuv::i420_scale(&src_img, src_size, &mut dst_img, dst_size, FilterMode::Bilinear);
+        let _ = vnrit_libyuv::i420_scale(&src_img, src_size, &mut dst_img, dst_size, FilterMode::Bilinear);
     });
 }
 
@@ -763,7 +763,7 @@ fn bgra_to_i420_into(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
         v: v_plane, v_stride: (width / 2) as usize,
     };
     let size = ImageSize::new(width as usize, height as usize);
-    let _ = shiguredo_libyuv::argb_to_i420(&src, &mut dst, size);
+    let _ = vnrit_libyuv::argb_to_i420(&src, &mut dst, size);
 }
 
 // ── VideoEncoder: wraps openh264 ──
@@ -963,8 +963,15 @@ fn fmt_bind_addr(ip: &str, port: u16) -> String {
 //  main() — server entry point
 // ═══════════════════════════════════════════════════════════════
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Build a multi-threaded Tokio runtime with a limited blocking thread pool.
+    // Without this cap, each stuck spawn_blocking task (e.g. PulseAudio read,
+    // X11 reply) consumes a blocking thread forever, causing unbounded growth.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(32)
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
     let args = Args::parse();
 
     // Init logging from --log-level arg (falls back to RUST_LOG env var).
@@ -1015,6 +1022,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+    })
 }
 
 async fn root_handler(State(state): State<ServerState>) -> Html<String> {
@@ -1260,33 +1268,285 @@ fn find_default_monitor() -> Option<String> {
 //  handle_ws() — per‑client WebSocket + WebRTC handler
 // ═══════════════════════════════════════════════════════════════
 
+/// Resources created during the signaling phase that survive into the pipeline.
+struct SignalingOutput {
+    pc: Box<dyn PeerConnection>,
+    handler: Arc<WebrtcHandler>,
+    ice_rx: runtime::Receiver<String>,
+    gather_complete_rx: runtime::Receiver<()>,
+    connected_rx: runtime::Receiver<()>,
+    dc_tx: tokio::sync::watch::Sender<Option<Arc<dyn DataChannel>>>,
+    dc_rx: tokio::sync::watch::Receiver<Option<Arc<dyn DataChannel>>>,
+    done: Arc<tokio::sync::Notify>,
+    track: Arc<TrackLocalStaticSample>,
+    audio_track: Arc<TrackLocalStaticSample>,
+    audio_ssrc: u32,
+}
+
+/// Run the WebRTC signaling phase inside a Result so that all early exits
+/// use `?` and the outer function performs cleanup once on error.
+async fn run_signaling(
+    in_rx: &mut mpsc::Receiver<Result<Message, axum::Error>>,
+    out_tx: &mpsc::Sender<Message>,
+    state: &ServerState,
+    all_ips: &[String],
+    tcp_addrs: Vec<String>,
+    udp_addrs: Vec<String>,
+) -> Result<SignalingOutput> {
+    // ── Build MediaEngine (H.264 only) ──
+    let mut media_engine = MediaEngine::default();
+    let video_codec = RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                .into(),
+            rtcp_feedback: vec![],
+        },
+        payload_type: 102,
+        ..Default::default()
+    };
+    media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)
+        .context("register H264 codec")?;
+
+    // ── Register Opus audio codec ──
+    let audio_codec = RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: 48000,
+            channels: 2,
+            sdp_fmtp_line: "minptime=10;useinbandfec=1".into(),
+            rtcp_feedback: vec![],
+        },
+        payload_type: 111,
+        ..Default::default()
+    };
+    media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)
+        .context("register Opus codec")?;
+
+    let registry = register_default_interceptors(Registry::new(), &mut media_engine)
+        .context("register default interceptors")?;
+
+    // ── RTCConfiguration ──
+    let ice_servers = if state.args.stun.is_empty() {
+        vec![]
+    } else {
+        vec![RTCIceServer {
+            urls: vec![state.args.stun.clone()],
+            ..Default::default()
+        }]
+    };
+    let config = RTCConfigurationBuilder::new()
+        .with_ice_servers(ice_servers)
+        .build();
+
+    // ── SettingEngine: relax ICE timeouts for mobile/unstable networks ──
+    let mut settings = SettingEngine::default();
+    settings.set_ice_timeouts(
+        Some(std::time::Duration::from_secs(15)),  // disconnected (default 5s)
+        Some(std::time::Duration::from_secs(60)),  // failed (default 25s)
+        Some(std::time::Duration::from_secs(5)),   // keepalive (default 2s)
+    );
+    if state.args.tcp_only {
+        settings.set_network_types(vec![NetworkType::Tcp4, NetworkType::Tcp6]);
+    }
+
+    // ── Create runtime channels for the handler ──
+    let (ice_tx, ice_rx) = runtime::channel::<String>(256);
+    let (gather_complete_tx, gather_complete_rx) = runtime::channel::<()>(1);
+    let (connected_tx, connected_rx) = runtime::channel::<()>(1);
+    let done = Arc::new(tokio::sync::Notify::new());
+    let (dc_tx, dc_rx) = tokio::sync::watch::channel::<Option<Arc<dyn DataChannel>>>(None);
+
+    // ── Build PeerConnection ──
+    let lan_ip = all_ips[0].clone();
+    log::info!("[ice] binding interfaces: {:?}", all_ips);
+    let handler = Arc::new(WebrtcHandler {
+        ice_tx,
+        gather_complete_tx,
+        connected_tx,
+        done: done.clone(),
+        dc_tx: dc_tx.clone(),
+        lan_ip,
+    });
+
+    let rt = runtime::default_runtime()
+        .context("no webrtc runtime available")?;
+
+    let pc = Box::new(PeerConnectionBuilder::new()
+        .with_configuration(config)
+        .with_setting_engine(settings)
+        .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
+        .with_handler(handler.clone())
+        .with_runtime(rt)
+        .with_udp_addrs(udp_addrs)
+        .with_tcp_addrs(tcp_addrs)
+        .build()
+        .await
+        .context("build PeerConnection")?);
+    log::info!("[pc] PeerConnection created");
+
+    // ── Post-pc operations (tracks, offer/answer) — close pc on error ──
+    let (track, audio_track, audio_ssrc) = match async {
+        // ── Create video track ──
+        let ssrc = rand::rng().random::<u32>();
+        let rtp_codec = video_codec.rtp_codec.clone();
+
+        let track = TrackLocalStaticSample::new(MediaStreamTrack::new(
+            "video-stream".to_owned(),
+            "video-track".to_owned(),
+            "desktop".to_owned(),
+            RtpCodecKind::Video,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters {
+                    ssrc: Some(ssrc),
+                    ..Default::default()
+                },
+                codec: rtp_codec.clone(),
+                ..Default::default()
+            }],
+        )).context("create video track")?;
+        let track = Arc::new(track);
+        let track_local: Arc<dyn TrackLocal> = track.clone();
+        pc.add_track(track_local).await
+            .context("add video track")?;
+        log::info!("[pc] video track added");
+
+        // ── Create audio track ──
+        let audio_ssrc = rand::rng().random::<u32>();
+        let audio_rtp_codec = audio_codec.rtp_codec.clone();
+        let audio_track = TrackLocalStaticSample::new(MediaStreamTrack::new(
+            "audio-stream".to_owned(),
+            "audio-track".to_owned(),
+            "microphone".to_owned(),
+            RtpCodecKind::Audio,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters {
+                    ssrc: Some(audio_ssrc),
+                    ..Default::default()
+                },
+                codec: audio_rtp_codec,
+                ..Default::default()
+            }],
+        )).context("create audio track")?;
+        let audio_track = Arc::new(audio_track);
+        let audio_track_local: Arc<dyn TrackLocal> = audio_track.clone();
+        pc.add_track(audio_track_local).await
+            .context("add audio track")?;
+        log::info!("[pc] audio track added, creating offer...");
+
+        // ── Create offer and send to browser ──
+        let offer = pc.create_offer(None).await
+            .context("create_offer")?;
+        pc.set_local_description(offer).await
+            .context("set_local_description")?;
+
+        let local = pc.local_description().await
+            .context("local_description returned None")?;
+        let offer_msg = serde_json::to_string(&SignalingMessage::Offer {
+            sdp: local.sdp.clone(),
+        }).context("serialize offer")?;
+        log::info!("[sdp] sending offer ({} bytes)", local.sdp.len());
+        out_tx.try_send(Message::Text(offer_msg.into()))
+            .context("send offer to WebSocket")?;
+
+        // ── Receive browser's answer ──
+        let answer_sdp = loop {
+            match in_rx.recv().await {
+                Some(Ok(Message::Text(t))) => {
+                    if let Ok(SignalingMessage::Answer { sdp }) = serde_json::from_str(&t) {
+                        log::info!("[sdp] received answer ({} bytes)", sdp.len());
+                        break sdp;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    anyhow::bail!("disconnected while waiting for answer");
+                }
+                _ => {}
+            }
+        };
+
+        // ── Set remote description from answer ──
+        let answer = RTCSessionDescription::answer(answer_sdp)
+            .context("invalid answer SDP")?;
+        pc.set_remote_description(answer).await
+            .context("set_remote_description")?;
+        log::info!("[sdp] remote description set");
+
+        anyhow::Ok((track, audio_track, audio_ssrc))
+    }.await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = pc.close().await;
+            return Err(e);
+        }
+    };
+
+    Ok(SignalingOutput {
+        pc,
+        handler,
+        ice_rx,
+        gather_complete_rx,
+        connected_rx,
+        dc_tx,
+        dc_rx,
+        done,
+        track,
+        audio_track,
+        audio_ssrc,
+    })
+}
+
 async fn handle_ws(ws: WebSocket, state: ServerState) {
     log::info!("[ws] client connected");
 
     // ── X11 connection setup (triple connections: capture + input + event) ──
     // Build or reuse the shared keycode cache (keysym→keycode mapping)
-    let keycode_cache = state.keycode_cache.get_or_init(|| {
-        let (conn, _screen_num) = connect_to_display(&state.args.display)
-            .expect("failed to connect to X11 for keycode cache");
-        let setup = conn.setup();
-        let first_kc = setup.min_keycode;
-        let keycode_count = setup.max_keycode - setup.min_keycode + 1;
-        let kbd = xproto::get_keyboard_mapping(&conn, first_kc, keycode_count)
-            .expect("get_keyboard_mapping failed")
-            .reply()
-            .expect("get_keyboard_mapping reply failed");
-        let kpk = kbd.keysyms_per_keycode as usize;
-        let mut m = std::collections::HashMap::new();
-        for (i, chunk) in kbd.keysyms.chunks(kpk).enumerate() {
-            let kc = first_kc + i as u8;
-            for &ks in chunk {
-                if ks != 0 {
-                    m.entry(ks).or_insert(kc);
+    let keycode_cache = match state.keycode_cache.get() {
+        Some(cache) => cache.clone(),
+        None => {
+            // First-time initialization with proper error handling
+            let (conn, _screen_num) = match connect_to_display(&state.args.display) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("[x11] failed to connect for keycode cache: {:#}", e);
+                    return;
+                }
+            };
+            let setup = conn.setup();
+            let first_kc = setup.min_keycode;
+            let keycode_count = setup.max_keycode - setup.min_keycode + 1;
+            let kbd = match xproto::get_keyboard_mapping(&conn, first_kc, keycode_count) {
+                Ok(cookie) => match cookie.reply() {
+                    Ok(reply) => reply,
+                    Err(e) => {
+                        log::error!("[x11] get_keyboard_mapping reply failed: {:#}", e);
+                        return;
+                    }
+                },
+                Err(e) => {
+                    log::error!("[x11] get_keyboard_mapping request failed: {:#}", e);
+                    return;
+                }
+            };
+            let kpk = kbd.keysyms_per_keycode as usize;
+            let mut m = std::collections::HashMap::new();
+            for (i, chunk) in kbd.keysyms.chunks(kpk).enumerate() {
+                let kc = first_kc + i as u8;
+                for &ks in chunk {
+                    if ks != 0 {
+                        m.entry(ks).or_insert(kc);
+                    }
                 }
             }
+            let cache = std::sync::Arc::new(m);
+            // Ignore race: another task may have set it first
+            let _ = state.keycode_cache.set(cache.clone());
+            cache
         }
-        std::sync::Arc::new(m)
-    }).clone();
+    };
     let (capture_state, input_state, native_w, native_h, depth, evt_conn) = match setup_x11_connections(&state.args.display, keycode_cache) {
         Ok(v) => v,
         Err(e) => {
@@ -1313,7 +1573,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Message, axum::Error>>(256);
     let in_tx_task = in_tx.clone();
 
-    let io_handle = tokio::spawn(async move {
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
         use futures_util::SinkExt;
         let (mut ws_sink, mut ws_stream) = ws.split();
         loop {
@@ -1374,8 +1635,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             }
             Some(Ok(Message::Close(_))) | None => {
                 log::debug!("[ws] disconnected before ready");
-                io_handle.abort();
-                let _ = io_handle.await;
+                tasks.shutdown().await;
                 return;
             }
             _ => {}
@@ -1383,93 +1643,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     }
     log::info!("[ws] ready received, creating WebRTC peer connection...");
 
-    // ── Build MediaEngine (H.264 only) ──
-    let mut media_engine = MediaEngine::default();
-    let video_codec = RTCRtpCodecParameters {
-        rtp_codec: RTCRtpCodec {
-            mime_type: MIME_TYPE_H264.to_owned(),
-            clock_rate: 90000,
-            channels: 0,
-            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                .into(),
-            rtcp_feedback: vec![],
-        },
-        payload_type: 102,
-        ..Default::default()
-    };
-    if let Err(e) = media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video) {
-        log::info!("[pc] failed to register H264 codec: {}", e);
-        return;
-    }
-
-    // ── Register Opus audio codec ──
-    let audio_codec = RTCRtpCodecParameters {
-        rtp_codec: RTCRtpCodec {
-            mime_type: MIME_TYPE_OPUS.to_owned(),
-            clock_rate: 48000,
-            channels: 2,
-            sdp_fmtp_line: "minptime=10;useinbandfec=1".into(),
-            rtcp_feedback: vec![],
-        },
-        payload_type: 111,
-        ..Default::default()
-    };
-    if let Err(e) = media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio) {
-        log::info!("[pc] failed to register Opus codec: {}", e);
-        return;
-    }
-    let registry = match register_default_interceptors(Registry::new(), &mut media_engine) {
-        Ok(r) => r,
-        Err(e) => {
-            log::info!("[pc] failed to register default interceptors: {}", e);
-            return;
-        }
-    };
-
-    // ── RTCConfiguration ──
-    let ice_servers = if state.args.stun.is_empty() {
-        vec![]
-    } else {
-        vec![RTCIceServer {
-            urls: vec![state.args.stun.clone()],
-            ..Default::default()
-        }]
-    };
-    let config = RTCConfigurationBuilder::new()
-        .with_ice_servers(ice_servers)
-        .build();
-
-    // ── SettingEngine: relax ICE timeouts for mobile/unstable networks ──
-    let mut settings = SettingEngine::default();
-    settings.set_ice_timeouts(
-        Some(std::time::Duration::from_secs(15)),  // disconnected (default 5s)
-        Some(std::time::Duration::from_secs(60)),  // failed (default 25s)
-        Some(std::time::Duration::from_secs(5)),   // keepalive (default 2s)
-    );
-    // In --tcp-only mode, restrict candidate gathering to TCP only.
-    // Default (all four types) is already the webrtc-rs default.
-    if state.args.tcp_only {
-        settings.set_network_types(vec![NetworkType::Tcp4, NetworkType::Tcp6]);
-    }
-
-    // ── Create runtime channels for the handler ──
-    let (ice_tx, mut ice_rx) = runtime::channel::<String>(256);
-    let (gather_complete_tx, mut gather_complete_rx) = runtime::channel::<()>(1);
-    let (connected_tx, mut connected_rx) = runtime::channel::<()>(1);
-    let done = Arc::new(tokio::sync::Notify::new());
-    let (dc_tx, mut dc_rx) = tokio::sync::watch::channel::<Option<Arc<dyn DataChannel>>>(None);
-
-    // ── Build PeerConnection ──
+    // ── Run signaling phase (wrapped in Result for unified cleanup) ──
     let all_ips = get_local_ips();
-    // get_local_ips always includes 127.0.0.1; non-loopback IPs come first.
-    let lan_ip = all_ips[0].clone();
-    log::info!("[ice] binding interfaces: {:?}", all_ips);
-    // Bind to ALL non-loopback IPs so each network interface gets its own
-    // host candidate. STUN works on the default-route interface.
-    // TCP binds include all IPs (loopback included) so browser-on-device works.
     let tcp_addrs: Vec<String> = all_ips.iter().map(|ip| fmt_bind_addr(ip, 0)).collect();
-    // UDP binds exclude loopback — sending STUN from 127.0.0.1 to an
-    // external server causes EINVAL (Invalid argument) on Linux/Android.
     let udp_addrs = if state.args.tcp_only {
         Vec::<String>::new()
     } else {
@@ -1478,105 +1654,31 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             .map(|ip| fmt_bind_addr(ip, 0))
             .collect()
     };
-    let handler = Arc::new(WebrtcHandler {
-        ice_tx,
-        gather_complete_tx,
-        connected_tx,
-        done: done.clone(),
-        dc_tx: dc_tx.clone(),
-        lan_ip,
-    });
 
+    let sig = match run_signaling(
+        &mut in_rx, &out_tx, &state, &all_ips, tcp_addrs, udp_addrs,
+    ).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::info!("[ws] signaling failed: {:#}", e);
+            tasks.shutdown().await;
+            return;
+        }
+    };
+
+    // Destructure signaling output
+    let pc = sig.pc;
+    let handler = sig.handler;
+    let mut ice_rx = sig.ice_rx;
+    let mut gather_complete_rx = sig.gather_complete_rx;
+    let mut connected_rx = sig.connected_rx;
+    let dc_tx = sig.dc_tx;
+    let mut dc_rx = sig.dc_rx;
+    let done = sig.done;
+    let track = sig.track;
+    let audio_track = sig.audio_track;
+    let audio_ssrc = sig.audio_ssrc;
     let input_dc_tx = dc_tx.clone();
-
-    let rt = match runtime::default_runtime() {
-        Some(r) => r,
-        None => {
-            log::info!("[pc] no webrtc runtime available");
-            return;
-        }
-    };
-
-    let pc = match PeerConnectionBuilder::new()
-        .with_configuration(config)
-        .with_setting_engine(settings)
-        .with_media_engine(media_engine)
-        .with_interceptor_registry(registry)
-        .with_handler(handler.clone())
-        .with_runtime(rt)
-        .with_udp_addrs(udp_addrs)
-        .with_tcp_addrs(tcp_addrs)
-        .build()
-        .await
-    {
-        Ok(pc) => pc,
-        Err(e) => {
-            log::info!("[pc] build failed: {:#}", e);
-            return;
-        }
-    };
-    log::info!("[pc] PeerConnection created");
-
-    // ── Create video track ──
-    let ssrc = rand::rng().random::<u32>();
-    let rtp_codec = video_codec.rtp_codec.clone();
-
-    let track = match TrackLocalStaticSample::new(MediaStreamTrack::new(
-        "video-stream".to_owned(),
-        "video-track".to_owned(),
-        "desktop".to_owned(),
-        RtpCodecKind::Video,
-        vec![RTCRtpEncodingParameters {
-            rtp_coding_parameters: RTCRtpCodingParameters {
-                ssrc: Some(ssrc),
-                ..Default::default()
-            },
-            codec: rtp_codec.clone(),
-            ..Default::default()
-        }],
-    )) {
-        Ok(t) => Arc::new(t),
-        Err(e) => {
-            log::info!("[pc] failed to create track: {}", e);
-            return;
-        }
-    };
-    let track_local: Arc<dyn TrackLocal> = track.clone();
-    if let Err(e) = pc.add_track(track_local).await {
-        log::info!("[pc] add_track (video) failed: {}", e);
-        return;
-    }
-    log::info!("[pc] video track added");
-
-    // ── Create audio track ──
-    let audio_ssrc = rand::rng().random::<u32>();
-    let audio_rtp_codec = audio_codec.rtp_codec.clone();
-    let audio_track = match TrackLocalStaticSample::new(MediaStreamTrack::new(
-        "audio-stream".to_owned(),
-        "audio-track".to_owned(),
-        "microphone".to_owned(),
-        RtpCodecKind::Audio,
-        vec![RTCRtpEncodingParameters {
-            rtp_coding_parameters: RTCRtpCodingParameters {
-                ssrc: Some(audio_ssrc),
-                ..Default::default()
-            },
-            codec: audio_rtp_codec,
-            ..Default::default()
-        }],
-    )) {
-        Ok(t) => Arc::new(t),
-        Err(e) => {
-            log::info!("[pc] failed to create audio track: {}", e);
-            return;
-        }
-    };
-    let audio_track_local: Arc<dyn TrackLocal> = audio_track.clone();
-    if let Err(e) = pc.add_track(audio_track_local).await {
-        log::info!("[pc] add_track (audio) failed: {}", e);
-        return;
-    }
-    log::info!("[pc] audio track added, creating offer...");
 
     // ── Send initial cursor position ──
     send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
@@ -1602,79 +1704,17 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         Ok(e) => e,
         Err(err) => {
             log::info!("[encoder] failed to create: {:#}", err);
+            tasks.shutdown().await;
+            let _ = pc.close().await;
             return;
         }
     };
     log::info!("[encoder] created ({}x{}, {}kbps, {}fps)",
         out_w, out_h, state.args.bitrate, state.args.framerate);
 
-    // ── Create offer and send to browser ──
-    let offer = match pc.create_offer(None).await {
-        Ok(o) => o,
-        Err(e) => {
-            log::info!("[pc] create_offer failed: {}", e);
-            return;
-        }
-    };
-    if let Err(e) = pc.set_local_description(offer).await {
-        log::info!("[pc] set_local_description failed: {}", e);
-        return;
-    }
-
-    if let Some(local) = pc.local_description().await {
-        let offer_msg = match serde_json::to_string(&SignalingMessage::Offer {
-            sdp: local.sdp.clone(),
-        }) {
-            Ok(m) => m,
-            Err(e) => {
-                log::error!("[sdp] failed to serialize offer: {}", e);
-                return;
-            }
-        };
-        log::info!("[sdp] sending offer ({} bytes)", local.sdp.len());
-        if out_tx.try_send(Message::Text(offer_msg.into())).is_err() {
-            log::info!("[ws] failed to send offer");
-            return;
-        }
-    } else {
-        log::info!("[pc] ERROR: no local description after create_offer");
-        return;
-    }
-
-    // ── Receive browser's answer ──
-    let answer_sdp = loop {
-        match in_rx.recv().await {
-            Some(Ok(Message::Text(t))) => {
-                if let Ok(SignalingMessage::Answer { sdp }) = serde_json::from_str(&t) {
-                    log::info!("[sdp] received answer ({} bytes)", sdp.len());
-                    break sdp;
-                }
-            }
-            Some(Ok(Message::Close(_))) | None => {
-                log::info!("[ws] disconnected waiting for answer");
-                return;
-            }
-            _ => {}
-        }
-    };
-
-    // ── Set remote description from answer ──
-    let answer = match RTCSessionDescription::answer(answer_sdp) {
-        Ok(a) => a,
-        Err(e) => {
-            log::info!("[sdp] invalid answer SDP: {}", e);
-            return;
-        }
-    };
-    if let Err(e) = pc.set_remote_description(answer).await {
-        log::info!("[pc] set_remote_description failed: {}", e);
-        return;
-    }
-    log::info!("[sdp] remote description set");
-
     // ── Forward ICE candidates ──
     let ice_out_tx = out_tx.clone();
-    let ice_forward = tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Some(candidate_msg) = ice_rx.recv().await {
             if ice_out_tx.send(Message::Text(candidate_msg.into())).await.is_err() {
                 break;
@@ -1689,11 +1729,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     } {
         log::debug!("[ice] connection ended during gathering, cleaning up");
         // async cleanup: only io_handle, ice_forward, pc exist at this point
-        drop(handler);
-        let _ = ice_forward.await;
-        io_handle.abort();
-        let _ = io_handle.await;
         let _ = pc.close().await;
+        drop(pc);
+        drop(handler);
+        tasks.shutdown().await;
         return;
     }
     log::debug!("[ice] gathering complete");
@@ -1704,11 +1743,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         _ = done.notified() => { true }
     } {
         log::info!("[pc] connection failed before connected, cleaning up");
-        drop(handler);
-        let _ = ice_forward.await;
-        io_handle.abort();
-        let _ = io_handle.await;
         let _ = pc.close().await;
+        drop(pc);
+        drop(handler);
+        tasks.shutdown().await;
         return;
     }
     log::info!("[pc] connection established!");
@@ -1727,6 +1765,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let track_ssrc = *track.ssrcs().await.first().unwrap_or(&0);
     if track_ssrc == 0 {
         log::info!("[pc] ERROR: no SSRC available for video track");
+        let _ = pc.close().await;
+        drop(pc);
+        drop(handler);
+        tasks.shutdown().await;
         return;
     }
 
@@ -1740,53 +1782,37 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let initial_bitrate_bps = (state.args.bitrate as u32) * 1000;
 
     // Pipeline channels
-    let (yuv_tx, yuv_rx) = block_mpsc::sync_channel::<Vec<u8>>(2);
+    let (yuv_tx, yuv_rx) = block_mpsc::sync_channel::<Bytes>(2);
     let (enc_tx, mut enc_rx) = tokio::sync::mpsc::channel::<Bytes>(2);
 
     // Shutdown signal — unified CancellationToken for all pipeline tasks
     let cancel = tokio_util::sync::CancellationToken::new();
-
-    // I420 memory pool (1 write + 1 in transit + 1 spare)
-    use crossbeam_queue::ArrayQueue;
-    let i420_pool = {
-        let pool = ArrayQueue::new(3);
-        let i420_size = (out_w * out_h * 3 / 2) as usize;
-        for _ in 0..3 {
-            let _ = pool.push(vec![0u8; i420_size]);
-        }
-        Arc::new(pool)
-    };
-
-    // ── Stage 1: Capture + Convert (spawn_blocking) ──
     let cap_stop = cancel.clone();
     let yuv_tx_cap = yuv_tx.clone();
-    let i420_pool_cap = i420_pool.clone();
-    let cap_handle = tokio::task::spawn_blocking(move || {
-        let mut last_raw: Option<Vec<u8>> = None;
+    let frame_size = (out_w * out_h * 3 / 2) as usize;
+
+    // ── Stage 1: Capture + Convert (spawn_blocking) ──
+    tasks.spawn_blocking(move || {
+        let mut last_raw: Option<Bytes> = None;
         let mut tmp_argb = Vec::new();
         loop {
             if cap_stop.is_cancelled() { break; }
 
             let frame_start = std::time::Instant::now();
 
-            // Pop I420 buffer from pool
-            let mut i420 = match i420_pool_cap.pop() {
-                Some(buf) => buf,
-                None => {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    continue;
-                }
-            };
+            // Allocate I420 buffer (fresh allocation per frame; Bytes shares ownership downstream)
+            let mut i420 = vec![0u8; frame_size];
 
             if let Err(e) = screen_capture.capture_to_i420(&mut i420, out_w, out_h,
                 needs_scaling, &mut tmp_argb)
             {
                 log::info!("[capture] error: {:#}, repeating last frame", e);
-                // O(1) pointer swap instead of ~3MB copy_from_slice
                 if let Some(ref mut last) = last_raw {
-                    std::mem::swap(&mut i420, last);
+                    // O(1) pointer swap — swap Arc<[u8]> refs instead of 3MB memcpy
+                    let mut old_frame = Bytes::from(i420);
+                    std::mem::swap(&mut old_frame, last);
+                    // old_frame holds last frame's data, dropped at end of scope
                 } else {
-                    let _ = i420_pool_cap.push(i420);
                     let elapsed = frame_start.elapsed();
                     if elapsed < frame_duration {
                         std::thread::sleep(frame_duration - elapsed);
@@ -1804,24 +1830,24 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         enhance, &mut tmp_argb,
                     );
                 }
-                // Update last_raw with the (now enhanced) frame
-                if let Some(ref mut last) = last_raw {
-                    let stale = std::mem::replace(last, i420.clone());
-                    let _ = i420_pool_cap.push(stale);
-                } else {
-                    last_raw = Some(i420.clone());
+                // Zero-copy: Vec -> Bytes (takes ownership of Vec allocation)
+                let frame = Bytes::from(i420);
+                // Share via Arc: last_raw holds a clone (refcount++), send the original
+                last_raw = Some(frame.clone());
+                if let Err(e) = yuv_tx_cap.try_send(frame) {
+                    match e {
+                        block_mpsc::TrySendError::Full(_) => {
+                            log::trace!("[capture] dropping frame (channel full)");
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        block_mpsc::TrySendError::Disconnected(_) => {
+                            log::debug!("[capture] output channel closed, exiting");
+                            return;
+                        }
+                    }
                 }
             }
             if cap_stop.is_cancelled() { return; }
-
-            // Send I420 downstream (try_send — drop on congestion)
-            if let Err(e) = yuv_tx_cap.try_send(i420) {
-                log::trace!("[capture] dropping frame (channel full)");
-                if let block_mpsc::TrySendError::Full(v) = e {
-                    let _ = i420_pool_cap.push(v);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
 
             let elapsed = frame_start.elapsed();
             if elapsed < frame_duration {
@@ -1836,8 +1862,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let enc_tx_clone = enc_tx.clone();
     let target_bps = Arc::new(AtomicU32::new(initial_bitrate_bps));
     let enc_bps = target_bps.clone();
-    let i420_pool_enc = i420_pool.clone();
-    let enc_handle = tokio::task::spawn_blocking(move || {
+    let enc_done = done.clone();
+    tasks.spawn_blocking(move || {
         let mut enc_buf = Vec::with_capacity(65536);
         let mut last_idr = std::time::Instant::now();
         let mut enc_failures = 0u32;
@@ -1856,16 +1882,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         log::error!("[encoder] error #{}/{}: {:#}", enc_failures, ENC_MAX_FAILURES, e);
                         if enc_failures >= ENC_MAX_FAILURES {
                             log::error!("[encoder] too many failures, aborting encoder task");
-                            let _ = i420_pool_enc.push(yuv);
+                            enc_done.notify_one();
                             break;
                         }
                         encoder.force_keyframe();
-                        let _ = i420_pool_enc.push(yuv);
                         continue;
                     }
                     enc_failures = 0; // reset on success
-                    // Return I420 buffer to pool for reuse
-                    let _ = i420_pool_enc.push(yuv);
                     // Copy encoded data into Bytes (exact size allocation).
                     let frame = Bytes::copy_from_slice(&enc_buf);
                     enc_buf.clear();
@@ -1895,7 +1918,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
     // ── Stage 4: Send (async) ──
     let send_stop = cancel.clone();
-    let send_handle = tokio::spawn(async move {
+    let send_done = done.clone();
+    tasks.spawn(async move {
         loop {
             tokio::select! {
                 Some(h264) = enc_rx.recv() => {
@@ -1906,6 +1930,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         ..Default::default()
                     }).await {
                         log::info!("[send] write_sample error: {}", e);
+                        send_done.notify_one();
                         break;
                     }
                 }
@@ -1920,7 +1945,6 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // ═══════════════════════════════════════════════════════════
 
     use libpulse_binding as pulse;
-    use libpulse_simple_binding as psimple;
 
     // Auto-detect default sink monitor source for system audio capture
     let audio_source = tokio::task::spawn_blocking(find_default_monitor).await.unwrap_or(None);
@@ -1937,6 +1961,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let (opus_tx, mut opus_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
 
     // PCM memory pool for zero-alloc audio capture
+    use crossbeam_queue::ArrayQueue;
     const PCM_FRAME_BYTES: usize = 3840; // 20ms stereo 48kHz S16LE
     let pcm_pool = {
         let pool = ArrayQueue::new(8);
@@ -1946,12 +1971,22 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         Arc::new(pool)
     };
 
-    // ── Audio Stage 1: PulseAudio capture (spawn_blocking) ──
-    let audio_cap_stop = cancel.clone();
-    let audio_pcm_tx = pcm_tx.clone();
-    let audio_source = audio_source.clone();
+    // ── Audio Stage 1: PulseAudio capture (event-driven, with wakeup) ──
+    let audio_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let audio_cancelled_clone = audio_cancelled.clone();
+    let audio_pcm_tx_thread = pcm_tx.clone();
     let pcm_pool_cap = pcm_pool.clone();
-    let audio_cap_handle = tokio::task::spawn_blocking(move || {
+    let audio_source_thread = audio_source.clone();
+    // Atomic pointer for PA mainloop wakeup from the async context.
+    // pa_mainloop_wakeup() is documented as thread-safe; we only call wakeup(), not quit().
+    use std::sync::atomic::AtomicPtr;
+    let pa_mainloop_ptr: Arc<AtomicPtr<pulse::mainloop::standard::Mainloop>> =
+        Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+    let pa_mainloop_ptr_clone = pa_mainloop_ptr.clone();
+
+    tasks.spawn_blocking(move || {
+        use pulse::mainloop::standard::IterateResult;
+
         let spec = pulse::sample::Spec {
             format: pulse::sample::Format::S16NE,
             channels: 2,
@@ -1961,47 +1996,80 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             log::info!("[audio] invalid PulseAudio sample spec");
             return;
         }
-        let dev = audio_source.as_deref();
-        let pa = match psimple::Simple::new(
-            None, "vnrit", pulse::stream::Direction::Record,
-            dev, "audio-capture", &spec, None, None,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("[audio] PulseAudio init failed: {} — audio disabled", e);
-                return;
-            }
-        };
-        log::info!("[audio] PulseAudio capture started");
 
-        loop {
-            if audio_cap_stop.is_cancelled() { break; }
-            // Pop PCM buffer from pool (no per-frame allocation)
-            let mut buf = match pcm_pool_cap.pop() {
-                Some(b) => b,
-                None => {
-                    log::trace!("[audio] PCM pool empty, dropping frame");
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    continue;
+        let mut mainloop = match pulse::mainloop::standard::Mainloop::new() {
+            Some(m) => m,
+            None => { log::error!("[audio] PA mainloop init failed"); return; }
+        };
+
+        // Store pointer for external wakeup (called from cleanup on any thread).
+        pa_mainloop_ptr_clone.store(&mut mainloop as *mut _, std::sync::atomic::Ordering::Release);
+
+        let mut ctx = match pulse::context::Context::new(&mainloop, "vnrit") {
+            Some(c) => c,
+            None => { log::error!("[audio] PA context init failed"); return; }
+        };
+
+        // Connect and wait for context to be ready
+        if ctx.connect(None, pulse::context::FlagSet::NOFLAGS, None).is_err() {
+            log::error!("[audio] PA connect failed");
+            return;
+        }
+        for _ in 0..200 {
+            if audio_cancelled_clone.load(std::sync::atomic::Ordering::Relaxed) { return; }
+            let _ = mainloop.iterate(false);
+            if ctx.get_state() == pulse::context::State::Ready { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if ctx.get_state() != pulse::context::State::Ready {
+            log::error!("[audio] PA context not ready");
+            return;
+        }
+
+        // Create recording stream
+        let dev = audio_source_thread.as_deref();
+        let mut stream = match pulse::stream::Stream::new(&mut ctx, "audio-capture", &spec, None) {
+            Some(s) => s,
+            None => { log::error!("[audio] PA Stream::new failed"); return; }
+        };
+
+        // Connect for recording
+        if stream.connect_record(dev, None, pulse::stream::FlagSet::NOFLAGS).is_err() {
+            log::error!("[audio] PA connect_record failed");
+            return;
+        }
+
+        log::info!("[audio] PulseAudio capture started (event-driven)");
+
+        // Event-driven mainloop: iterate(true) blocks until PA events arrive.
+        // After each event, drain available audio data with non-blocking peek().
+        while !audio_cancelled_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            match mainloop.iterate(true) {
+                IterateResult::Quit(_) => break,
+                _ => {}
+            }
+            // Drain all available data
+            loop {
+                match stream.peek() {
+                    Ok(pulse::stream::PeekResult::Data(data)) => {
+                        // Pop a buffer from pool, or allocate fresh if pool empty
+                        let mut buf = match pcm_pool_cap.pop() {
+                            Some(b) => b,
+                            None => vec![0u8; PCM_FRAME_BYTES],
+                        };
+                        let n = data.len().min(buf.len());
+                        buf[..n].copy_from_slice(&data[..n]);
+                        if audio_pcm_tx_thread.send(buf).is_err() {
+                            log::debug!("[audio] PCM channel closed, exiting");
+                            return;
+                        }
+                        let _ = stream.discard();
+                    }
+                    _ => break, // Empty or Hole → no more data
                 }
-            };
-            // PulseAudio Simple::read blocks up to 20ms (one frame).
-            // If PA hangs (rare), the cancel token can't interrupt it, but
-            // this only delays shutdown by at most one audio frame.
-            if let Err(e) = pa.read(&mut buf) {
-                log::info!("[audio] read error: {}", e);
-                let _ = pcm_pool_cap.push(buf);
-                break;
-            }
-            if audio_cap_stop.is_cancelled() {
-                let _ = pcm_pool_cap.push(buf);
-                return;
-            }
-            // Send PCM buffer downstream — no clone needed
-            if audio_pcm_tx.send(buf).is_err() {
-                return;
             }
         }
+
         log::debug!("[audio] capture task ended");
     });
 
@@ -2009,7 +2077,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let audio_enc_stop = cancel.clone();
     let audio_opus_tx = opus_tx.clone();
     let pcm_pool_enc = pcm_pool.clone();
-    let audio_enc_handle = tokio::task::spawn_blocking(move || {
+    tasks.spawn_blocking(move || {
         let mut encoder = match opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::Audio) {
             Ok(e) => e,
             Err(e) => {
@@ -2057,7 +2125,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
     // ── Audio Stage 3: Send Opus packets via WebRTC (async) ──
     let audio_send_stop = cancel.clone();
-    let audio_send_handle = tokio::spawn(async move {
+    let audio_send_done = done.clone();
+    tasks.spawn(async move {
         loop {
             tokio::select! {
                 Some(opus_packet) = opus_rx.recv() => {
@@ -2070,6 +2139,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         ..Default::default()
                     }).await {
                         log::info!("[audio] write_sample error: {}", e);
+                        audio_send_done.notify_one();
                         break;
                     }
                 }
@@ -2091,19 +2161,19 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     if dup_fd < 0 {
         log::error!("[x11] failed to dup event connection fd");
         // Clean up pipeline tasks and connections before returning
+        // Signal PA mainloop and all async tasks to stop
+        audio_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Wake up PA mainloop (thread-safe) so iterate(true) returns immediately.
+        {
+            let ptr = pa_mainloop_ptr.load(std::sync::atomic::Ordering::Acquire);
+            if !ptr.is_null() { unsafe { (&mut *ptr).wakeup(); } }
+        }
         cancel.cancel();
         drop(yuv_tx); drop(enc_tx); drop(pcm_tx); drop(opus_tx);
-        if let Err(e) = cap_handle.await { log::error!("[pipeline] capture task panicked: {:?}", e); }
-        if let Err(e) = enc_handle.await { log::error!("[pipeline] encode task panicked: {:?}", e); }
-        if let Err(e) = send_handle.await { log::error!("[pipeline] send task panicked: {:?}", e); }
-        if let Err(e) = audio_cap_handle.await { log::error!("[pipeline] audio capture panicked: {:?}", e); }
-        if let Err(e) = audio_enc_handle.await { log::error!("[pipeline] audio encode panicked: {:?}", e); }
-        if let Err(e) = audio_send_handle.await { log::error!("[pipeline] audio send panicked: {:?}", e); }
-        drop(handler);
-        let _ = ice_forward.await;
+        tasks.shutdown().await;
         let _ = pc.close().await;
-        io_handle.abort();
-        let _ = io_handle.await;
+        drop(pc);
+        drop(handler);
         return;
     }
     let evt_fd = match unsafe { AsyncFd::new(std::os::unix::io::OwnedFd::from_raw_fd(dup_fd)) } {
@@ -2111,19 +2181,20 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         Err(e) => {
             log::error!("[x11] failed to create AsyncFd for event connection: {}", e);
             // Clean up pipeline tasks and connections before returning
+            // Signal PA mainloop and all async tasks to stop
+            audio_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Wake up PA mainloop (thread-safe) so iterate(true) returns immediately.
+            {
+                let ptr = pa_mainloop_ptr.load(std::sync::atomic::Ordering::Acquire);
+                if !ptr.is_null() { unsafe { (&mut *ptr).wakeup(); } }
+            }
             cancel.cancel();
             drop(yuv_tx); drop(enc_tx); drop(pcm_tx); drop(opus_tx);
-            if let Err(e) = cap_handle.await { log::error!("[pipeline] capture task panicked: {:?}", e); }
-            if let Err(e) = enc_handle.await { log::error!("[pipeline] encode task panicked: {:?}", e); }
-            if let Err(e) = send_handle.await { log::error!("[pipeline] send task panicked: {:?}", e); }
-            if let Err(e) = audio_cap_handle.await { log::error!("[pipeline] audio capture panicked: {:?}", e); }
-            if let Err(e) = audio_enc_handle.await { log::error!("[pipeline] audio encode panicked: {:?}", e); }
-            if let Err(e) = audio_send_handle.await { log::error!("[pipeline] audio send panicked: {:?}", e); }
-            drop(handler);
-            let _ = ice_forward.await;
+            tasks.shutdown().await;
             let _ = pc.close().await;
-            io_handle.abort();
-            let _ = io_handle.await;
+            drop(pc);
+            drop(handler);
+            tasks.shutdown().await;
             return;
         }
     };
@@ -2315,7 +2386,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // ── CLEANUP ──
     log::info!("[cleanup] client disconnected, shutting down pipeline...");
 
-    // Signal all pipeline tasks to stop via CancellationToken
+    // Signal the PA mainloop and all async tasks to stop
+    audio_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Wake up PA mainloop (thread-safe) so iterate(true) returns immediately.
+    {
+        let ptr = pa_mainloop_ptr.load(std::sync::atomic::Ordering::Acquire);
+        if !ptr.is_null() { unsafe { (&mut *ptr).wakeup(); } }
+    }
     cancel.cancel();
 
     // Release all pressed keys on the X server to prevent stuck keys
@@ -2337,24 +2414,12 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     drop(pcm_tx);
     drop(opus_tx);
 
-    // Wait for pipeline tasks to finish (log any panics)
-    if let Err(e) = cap_handle.await { log::error!("[pipeline] capture task panicked: {:?}", e); }
-    if let Err(e) = enc_handle.await { log::error!("[pipeline] encode task panicked: {:?}", e); }
-    if let Err(e) = send_handle.await { log::error!("[pipeline] send task panicked: {:?}", e); }
-    if let Err(e) = audio_cap_handle.await { log::error!("[pipeline] audio capture panicked: {:?}", e); }
-    if let Err(e) = audio_enc_handle.await { log::error!("[pipeline] audio encode panicked: {:?}", e); }
-    if let Err(e) = audio_send_handle.await { log::error!("[pipeline] audio send panicked: {:?}", e); }
+    tasks.shutdown().await;
 
-    // ICE forward: drop handler to close ice channel, then await task completion
-    drop(handler);
-    let _ = ice_forward.await;
-
-    // Close PeerConnection first (sends DTLS close alert), then the WebSocket.
+    // Close PeerConnection and release handler.
     let _ = pc.close().await;
-
-    // Finally, abort the WebSocket I/O task (no longer needed).
-    io_handle.abort();
-    let _ = io_handle.await;
+    drop(pc);
+    drop(handler);
     log::info!("[ws] cleanup complete");
 }
 

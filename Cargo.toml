@@ -1,6 +1,6 @@
 [package]
 name = "vnrit"
-version = "0.2.11"
+version = "0.2.14"
 edition = "2024"
 description = "Lightweight X11 desktop WebRTC streaming server (pure Rust, no GStreamer)"
 license = "Apache-2.0"  
@@ -43,7 +43,8 @@ openh264 = { version = "0.9", features = ["source"] }
 openh264-sys2 = "0.9"
 
 # shiguredo_libyuv — Rust bindings for Google's libyuv (SIMD-accelerated conversion + scaling)
-shiguredo_libyuv = { version = "2026.2.0-canary.1", features = ["source-build"] }
+# Fork: vnrit-libyuv (Android build fixes, Gitee mirrors for git clone)
+vnrit-libyuv = { version = "0.1.3", features = ["source-build"] }
 
 # Audio capture via PulseAudio
 libpulse-binding = { version = "2.29", default-features = false }
