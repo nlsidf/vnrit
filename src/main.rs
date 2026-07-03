@@ -1321,16 +1321,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 outgoing = out_rx.recv() => {
                     match outgoing {
                         Some(msg) => {
-                            // Application-level deflate compression for text messages
+                            // Compress non-signaling text messages > 512 bytes.
+                            // Signaling (offer/answer/ice/ready) is always sent as
+                            // raw Text frames for maximum browser compatibility.
                             let msg = match msg {
-                                Message::Text(t) if t.len() > 512 => {
+                                Message::Text(t) if t.len() > 512
+                                    && !is_signaling_message(&t) => {
                                     compress_text(&t)
-                                }
-                                Message::Text(t) => {
-                                    let mut buf = Vec::with_capacity(1 + t.len());
-                                    buf.push(0);
-                                    buf.extend_from_slice(t.as_bytes());
-                                    Message::Binary(buf.into())
                                 }
                                 other => other,
                             };
@@ -2589,6 +2586,15 @@ fn code_to_keysym(code: &str) -> u32 {
 //
 // Application-level deflate compression for text messages > 512 bytes.
 // Protocol: first byte = 0 (uncompressed) or 1 (deflate-compressed), followed by payload.
+
+/// Returns true if the JSON text is a WebRTC signaling message.
+/// Signaling is always sent as uncompressed Text for browser compatibility.
+fn is_signaling_message(text: &str) -> bool {
+    text.starts_with("{\"type\":\"offer\"")
+        || text.starts_with("{\"type\":\"answer\"")
+        || text.starts_with("{\"type\":\"ice\"")
+        || text.starts_with("{\"type\":\"ready\"")
+}
 
 /// Compress a text string with deflate and wrap as Binary with prefix byte 0x01.
 fn compress_text(text: &str) -> Message {

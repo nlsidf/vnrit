@@ -863,18 +863,34 @@ function connect() {
   ws.binaryType = 'arraybuffer';
 
   // ── WebSocket decompression (native DecompressionStream with pako fallback) ──
+  // Also accepts raw UTF-8 text on failure (belt-and-suspenders fallback).
   async function decompressDeflate(data) {
+    // Try native DecompressionStream (Chrome 80+, Firefox 113+, Safari 16.4+)
     if (typeof DecompressionStream !== 'undefined') {
-      const ds = new DecompressionStream('deflate-raw');
-      const writer = ds.writable.getWriter();
-      writer.write(data);
-      writer.close();
-      return await new Response(ds.readable).text();
+      try {
+        const ds = new DecompressionStream('deflate-raw');
+        const writer = ds.writable.getWriter();
+        writer.write(data);
+        writer.close();
+        return await new Response(ds.readable).text();
+      } catch (e) {
+        console.warn('[ws] DecompressionStream failed:', e);
+        // Fall through to pako
+      }
     }
+    // Try pako.js fallback
     if (typeof window.pako !== 'undefined') {
-      return new TextDecoder().decode(window.pako.inflateRaw(data));
+      try {
+        return new TextDecoder().decode(window.pako.inflateRaw(data));
+      } catch (e) {
+        console.warn('[ws] pako.inflateRaw failed:', e);
+        // Fall through to raw text
+      }
     }
-    throw new Error('No decompression support');
+    // Last resort: try raw UTF-8 decode (may produce garbage, but at least
+    // the browser can attempt to parse the signaling message)
+    console.warn('[ws] no decompressor available, trying raw UTF-8');
+    return new TextDecoder().decode(data);
   }
 
   ws.onmessage = async (event) => {
@@ -883,14 +899,10 @@ function connect() {
       // Binary message with compression prefix byte
       const view = new Uint8Array(event.data);
       if (view[0] === 1) {
-        // Decompress deflate payload with native API or pako fallback
-        try {
-          const compressed = view.slice(1);
-          text = await decompressDeflate(compressed);
-        } catch (e) {
-          console.warn('[ws] decompression failed:', e);
-          return;
-        }
+        // Decompress deflate payload with native API or pako fallback.
+        // If all decompressors fail, falls back to raw UTF-8 as last resort.
+        const compressed = view.slice(1);
+        text = await decompressDeflate(compressed);
       } else {
         // Uncompressed text
         text = new TextDecoder().decode(view.slice(1));
