@@ -1,6 +1,6 @@
 [package]
 name = "vnrit"
-version = "0.2.15"
+version = "0.2.16"
 edition = "2024"
 description = "Lightweight X11 desktop WebRTC streaming server (pure Rust, no GStreamer)"
 license = "Apache-2.0"  

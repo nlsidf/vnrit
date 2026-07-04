@@ -1,6 +1,11 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+// Force mimalloc to return cached memory to the OS.
+unsafe extern "C" {
+    fn mi_collect(force: bool) -> ();
+}
+
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as block_mpsc;
 use std::sync::Arc;
@@ -983,6 +988,7 @@ fn main() -> Result<()> {
     )
     .filter(Some("rtc_ice"), log::LevelFilter::Error)
     .filter(Some("rtc::peer_connection"), log::LevelFilter::Error)
+    .filter(Some("webrtc::peer_connection::driver"), log::LevelFilter::Warn)
     .filter(Some("rtc_dtls"), log::LevelFilter::Error)
     .filter(Some("openh264"), log::LevelFilter::Error)
     .format_timestamp(None)
@@ -1540,6 +1546,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // allocate new ones.
     tokio::task::yield_now().await;
     std::thread::yield_now();
+    // Force mimalloc to flush cached segments before this session allocates.
+    // Without this, freed memory from the previous session sits in mimalloc
+    // pools and the new session allocates on top of it, inflating RSS.
+    unsafe { mi_collect(true); }
 
     // ── X11 connection setup (triple connections: capture + input + event) ──
     // Build or reuse the shared keycode cache (keysym→keycode mapping)
@@ -2266,6 +2276,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         let _ = pc.close().await;
         drop(pc);
         drop(handler);
+        unsafe { mi_collect(true); }
         return;
     }
     let evt_fd = match unsafe { AsyncFd::new(std::os::unix::io::OwnedFd::from_raw_fd(dup_fd)) } {
@@ -2288,6 +2299,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             let _ = pc.close().await;
             drop(pc);
             drop(handler);
+            unsafe { mi_collect(true); }
             return;
         }
     };
@@ -2312,20 +2324,31 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     futures_util::future::pending::<Option<DataChannelEvent>>().await
                 }
             } => {
-                if let Some(DataChannelEvent::OnClose) = dc_event {
-                    log::info!("[dc] data channel closed by remote");
-                    dc_ref = None;
-                } else if let Some(DataChannelEvent::OnMessage(msg)) = dc_event {
-                    if let Ok(text) = std::str::from_utf8(&msg.data) {
-                        if text.starts_with("mr,") || text.starts_with("ma,")
-                            || text.starts_with("md,") || text.starts_with("mu,")
-                            || text.starts_with("ms,") || text.starts_with("kd,")
-                            || text.starts_with("ku,")
-                        {
-                            handle_input_message(&text, &input_state, scale_x, scale_y);
-                            send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
+                match dc_event {
+                    Some(DataChannelEvent::OnClose) => {
+                        log::info!("[dc] data channel closed by remote");
+                        dc_ref = None;
+                    }
+                    Some(DataChannelEvent::OnMessage(msg)) => {
+                        if let Ok(text) = std::str::from_utf8(&msg.data) {
+                            if text.starts_with("mr,") || text.starts_with("ma,")
+                                || text.starts_with("md,") || text.starts_with("mu,")
+                                || text.starts_with("ms,") || text.starts_with("kd,")
+                                || text.starts_with("ku,")
+                            {
+                                handle_input_message(&text, &input_state, scale_x, scale_y);
+                                send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
+                            }
                         }
                     }
+                    // poll() returning None means the channel is fully closed
+                    // and will never emit more events. Clean up to stop polling.
+                    None => {
+                        log::info!("[dc] data channel exhausted, stopping poll");
+                        dc_ref = None;
+                    }
+                    // Ignore other events (OnOpen, OnError, OnClosing, etc.)
+                    _ => {}
                 }
             }
 
@@ -2536,14 +2559,20 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // ── Phase 4: All background tasks have exited. Now it's safe to release
     //   WebRTC resources — no task is still calling write_sample() or
     //   holding Arc references to the tracks.
-    // Do NOT call dc.close() explicitly — it races with in-flight messages
-    // and causes Disconnected errors. pc.close() handles DC cleanup
-    // gracefully as part of SCTP transport shutdown.
+    // Do NOT call dc.close() — pc.close() handles DataChannel cleanup
+    // internally via SCTP transport shutdown. Calling both causes the
+    // driver to close the same channel twice, producing Disconnected errors.
     drop(dc_ref);
     let _ = pc.close().await;
     drop(pc);
     drop(handler);
     // track and audio_track are moved into send tasks, dropped when tasks exit above
+
+    // Force mimalloc to return cached memory segments to the OS.
+    // Per-session allocations (openh264 ref frames ~1.4MB, X11 buffers, audio)
+    // are freed but mimalloc retains them in thread-local heaps. Without
+    // explicit collection this manifests as a ~1.5MB/heap RSS increment.
+    unsafe { mi_collect(true); }
 
     log::info!("[ws] cleanup complete");
 }

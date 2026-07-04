@@ -822,6 +822,13 @@ function cancelPendingInputs() {
 }
 
 let inputDC = null; // WebRTC DataChannel for input
+let currentSession = 0; // monotonic counter — each connect() bumps it so
+                        // stale callbacks from a previous session bail out
+
+function safeSession() {
+  const sid = ++currentSession;
+  return () => sid === currentSession;
+}
 
 function sendInput(csv) {
   if (csv.startsWith('ma,')) {
@@ -832,7 +839,10 @@ function sendInput(csv) {
     updateCursorOverlay();
   }
   // Prefer DataChannel for lower latency; fall back to WebSocket
-  if (inputDC && inputDC.readyState === 'open') {
+  // Also verify pc.connectionState to avoid sending through a DataChannel
+  // whose underlying ICE transport has already disconnected.
+  if (inputDC && inputDC.readyState === 'open'
+      && pc && pc.connectionState === 'connected') {
     inputDC.send(csv);
   } else if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(csv);
@@ -840,20 +850,54 @@ function sendInput(csv) {
 }
 
 function connect() {
+  // ── Bump session so every callback below can bail out if a newer
+  //     connect() / handleOffer has been called in the meantime. ──
+  const isCurrent = safeSession();
+
   // Release any stuck modifiers before reconnecting
   releaseAllModifiers();
   // Cancel any pending reconnect
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   // Cancel negotiation timeout
   if (negotiationTimer) { clearTimeout(negotiationTimer); negotiationTimer = null; }
-  // Close existing connection before opening a new one
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.close();
+
+  // ── Fully tear down any existing WebRTC session before starting fresh ──
+  // Detach event handlers first so no stale callback can touch the new
+  // connection's pc/ws (which will be overwritten on the next line).
+  if (ws) {
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      ws.close();
+    }
   }
+  // Close old PeerConnection — if we don't, the stale DataChannel and ICE
+  // transports remain active and the server's webrtc driver will report
+  // Disconnected errors when it tries to deliver in-flight messages.
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+  // Release stale DataChannel reference — without this, the callbacks on the
+  // new connection reuse the old, already-closed DC and miss the new one.
+  inputDC = null;
+  // Stop media tracks
+  if (video.srcObject) {
+    video.srcObject.getTracks().forEach(t => t.stop());
+    video.srcObject = null;
+  }
+  const audioEl = document.getElementById('remote-audio');
+  if (audioEl && audioEl.srcObject) {
+    audioEl.srcObject.getTracks().forEach(t => t.stop());
+    audioEl.srcObject = null;
+  }
+
   setStatus('Connecting...', false);
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
+    if (!isCurrent()) return;
     setStatus('Connected', true);
     reconnectDelay = 1000;
     ws.send(JSON.stringify({ type: 'ready' }));
@@ -894,6 +938,7 @@ function connect() {
   }
 
   ws.onmessage = async (event) => {
+    if (!isCurrent()) return;
     let text;
     if (event.data instanceof ArrayBuffer) {
       // Binary message with compression prefix byte
@@ -962,6 +1007,7 @@ function connect() {
   };
 
   ws.onclose = () => {
+    if (!isCurrent()) return;
     releaseAllModifiers();
     setStatus('Disconnected, retrying...', false);
     cursorOverlay.style.display = 'none';
@@ -981,13 +1027,20 @@ function connect() {
   };
 
   ws.onerror = () => {
+    if (!isCurrent()) return;
     releaseAllModifiers();
     ws.close();
   };
 }
 
 async function handleOffer(sdp) {
+  // Inherit the session from the connect() that created the WebSocket
+  // whose onmessage is calling us. If a newer connect() has run, bail.
+  const offerSession = currentSession;
+  const isCur = () => offerSession === currentSession;
+
   if (pc) { pc.close(); pc = null; }
+  if (!isCur()) return;
 
   setStatus('Negotiating...', false);
 
@@ -1002,9 +1055,11 @@ async function handleOffer(sdp) {
   pc = new RTCPeerConnection(pcConfig);
 
   pc.ontrack = (event) => {
+    if (!isCur()) return;
     if (event.track.kind === 'video') {
       video.srcObject = event.streams[0];
       video.onloadedmetadata = () => {
+        if (!isCur()) return;
         const newW = video.videoWidth;
         const newH = video.videoHeight;
         // Reset zoom if remote resolution changed
@@ -1044,9 +1099,12 @@ async function handleOffer(sdp) {
   };
 
   const onConnectionFail = () => {
+    if (!isCur()) return;
     if (!pc) return;
     const st = pc.connectionState;
     const ice = pc.iceConnectionState;
+    // Clear inputDC first so sendInput() immediately falls back to WebSocket
+    inputDC = null;
     // Clear negotiation timer on success
     if (st === 'connected' && negotiationTimer) {
       clearTimeout(negotiationTimer);
@@ -1080,9 +1138,11 @@ async function handleOffer(sdp) {
 
     // ── DataChannel for input: listen for server-initiated channel ──
     pc.ondatachannel = (event) => {
+      if (!isCur()) return;
       inputDC = event.channel;
-      inputDC.onopen = () => console.log('[dc] input channel open');
-      inputDC.onclose = () => console.log('[dc] input channel closed');
+      inputDC.onopen = () => { if (!isCur()) return; console.log('[dc] input channel open'); };
+      inputDC.onclose = () => { if (!isCur()) return; console.log('[dc] input channel closed'); inputDC = null; };
+      inputDC.onerror = () => { if (!isCur()) return; console.warn('[dc] input channel error'); inputDC = null; };
     };
 
     negotiationTimer = setTimeout(() => {
