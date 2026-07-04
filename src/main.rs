@@ -616,6 +616,47 @@ const fn build_motion_table() -> [u8; 256] {
 /// MAD = 0 (still) → 255 (full); MAD = 25+ (fast motion) → ≈ 0.
 const MOTION_TABLE: [u8; 256] = build_motion_table();
 
+/// Local-sharpening table: |diff| → Q8 multiplier [256, 384].
+///   [0,  8) → 256 (1.0)           dead zone
+///   [8, 40) → 256..384 (1..1.5)   linear ramp
+///   [40, ∞) → 384 (1.5)           saturate
+const fn build_local_q8_table() -> [u32; 256] {
+    let mut t = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = if i < 8 { 256 }
+            else if i < 40 { 256 + ((i - 8) * 4) as u32 }
+            else { 384 };
+        i += 1;
+    }
+    t
+}
+const LOCAL_Q8_TABLE: [u32; 256] = build_local_q8_table();
+
+/// Texture-adaptation table: prev_abs_diff × abs_diff → Q8 multiplier.
+/// 0.75x when adjacent pixels have similar |diff| (texture region).
+/// Uses 5-bit quantization: idx = value >> 3 → 32×32 = 4KB LUT.
+const fn build_texture_table() -> [[u32; 32]; 32] {
+    let mut t = [[256u32; 32]; 32];
+    let mut p = 0usize;
+    while p < 32 {
+        let mut c = 0usize;
+        while c < 32 {
+            let prev_v = (p * 8 + 4) as u32;  // bucket midpoint [4, 252]
+            let curr_v = (c * 8 + 4) as u32;
+            let mx = if prev_v > curr_v { prev_v } else { curr_v };
+            let mn = if prev_v <= curr_v { prev_v } else { curr_v };
+            if mx >= 8 && mn >= (mx >> 1) {
+                t[p][c] = 192;
+            }
+            c += 1;
+        }
+        p += 1;
+    }
+    t
+}
+const TEXTURE_TABLE: [[u32; 32]; 32] = build_texture_table();
+
 /// Apply unsharp mask to the Y (luminance) plane of an I420 frame.
 ///
 /// Features:
@@ -635,7 +676,8 @@ const MOTION_TABLE: [u8; 256] = build_motion_table();
 /// This avoids a separate `prev` allocation.  `blur_buf` is `tmp_argb`
 /// from the capture pipeline (already ≈3 MB), so the 2× expansion from
 /// `y_size` to `2×y_size` never reallocates after the first frame.
-fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32, blur_buf: &mut Vec<u8>) {
+fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
+    blur_buf: &mut Vec<u8>, chroma_tick: &mut u32, last_chroma_boost: &mut u32) {
     if strength <= 0.0 || w < 3 || h < 3 {
         return;
     }
@@ -657,23 +699,25 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32, blur_bu
         blur_buf[y_size..total_req].copy_from_slice(y_plane);
     }
 
-    // ── 0.  Chroma activity ─────────────────────────────────────
-    // Compute mean absolute chroma deviation from 128 (neutral).
-    // Do this BEFORE splitting y_plane from i420 to satisfy the borrow checker.
-    let chroma_boost_q8 = if uv_size > 0 && i420.len() >= y_size + 2 * uv_size {
-        let mut chroma_sum: u64 = 0;
-        for &p in &i420[y_size..y_size + 2 * uv_size] {
-            chroma_sum += (p as i32 - 128).unsigned_abs() as u64;
-        }
-        let avg_chroma = (chroma_sum / (2 * uv_size as u64)) as u32; // [0, 127]
-        //  avg_chroma → chroma_boost_q8 (Q8):
-        //    0 (grayscale) → 256 (1.0×,  no boost)
-        //   40 (colorful)  → 376 (1.47×, near max)
-        //   85+            → 384 (1.5×,  saturate)
-        256u32 + (avg_chroma * 3).min(128)
+    // ── 0.  Chroma activity (recomputed every 8 frames) ─────────
+    // Chroma changes much slower than framerate; amortize the UV traversal.
+    let chroma_boost_q8 = if *chroma_tick == 0 {
+        let boost = if uv_size > 0 && i420.len() >= y_size + 2 * uv_size {
+            let mut chroma_sum: u64 = 0;
+            for &p in &i420[y_size..y_size + 2 * uv_size] {
+                chroma_sum += (p as i32 - 128).unsigned_abs() as u64;
+            }
+            let avg_chroma = (chroma_sum / (2 * uv_size as u64)) as u32;
+            256u32 + (avg_chroma * 3).min(128)
+        } else {
+            256u32
+        };
+        *last_chroma_boost = boost;
+        boost
     } else {
-        256u32
+        *last_chroma_boost
     };
+    *chroma_tick = (*chroma_tick + 1) & 7;
 
     let (blur_copy, prev) = blur_buf.split_at_mut(y_size);
     let y_plane = &mut i420[..y_size];
@@ -699,14 +743,23 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32, blur_bu
     let avg_tv = (tv_sum / (y_size.saturating_sub(1)) as u64) as u32; // [0, 255]
     let motion_factor = MOTION_TABLE[mad.min(255)] as u32;  // [0, 255]
 
+    // When motion_factor < 16 (< 6% strength), USM effect is imperceptible.
+    // Skip stack_blur + per-pixel USM; just save Y as prev for next frame's MAD.
+    if motion_factor < 16 {
+        prev.copy_from_slice(y_plane);
+        return;
+    }
+
     // ── 2.  Stack blur (SIMD, O(1)) ────────────────────────────
+    // Resolution-adaptive radius: 640px→1, 1280px→2, 1920px→3
+    let blur_radius = ((w + 320) / 640).clamp(1, 3);
     {
         let mut img = BlurImageMut::borrow(
             blur_copy,
             w as u32, h as u32,
             FastBlurChannels::Plane,
         );
-        let radius = AnisotropicRadius::new(2);
+        let radius = AnisotropicRadius::new(blur_radius as u32);
         let _ = libblur::stack_blur(&mut img, radius, ThreadingPolicy::Single);
     }
 
@@ -727,34 +780,36 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32, blur_bu
     //    avg_chroma ≈ 85+            → 384  (1.5×,  saturate)
     let effective_base = ((effective_base * chroma_boost_q8 + 128) >> 8).min(1023);
 
-    for (yp, &blur) in y_plane.iter_mut().zip(blur_copy.iter()) {
+    let mut prev_abs_diff = 0u32;
+    let mut col = 0usize;
+
+    // USM loop: write enhanced Y and save to prev simultaneously (eliminates separate copy pass).
+    for ((yp, &blur), p) in y_plane.iter_mut().zip(blur_copy.iter()).zip(prev.iter_mut()) {
         let diff = *yp as i32 - blur as i32;
         let abs_diff = diff.unsigned_abs();
 
-        // Local factor Q8: piecewise linear in |diff|
-        //   [0,  8) → 256 (1.0)           dead zone — no boost
-        //   [8, 40) → 256..384 (1..1.5)   linear ramp
-        //   [40, ∞) → 384 (1.5)           saturate
-        let local_q8 = if abs_diff < 8 {
-            256u32
-        } else if abs_diff < 40 {
-            // 256 + (abs_diff - 8) × 4 = 256 + ((abs_diff - 8) << 2)
-            256 + (((abs_diff - 8) as u32) << 2)
-        } else {
-            384u32
-        };
+        // Local factor Q8: lookup from compile-time LUT.
+        let local_q8 = LOCAL_Q8_TABLE[abs_diff as usize];
 
-        // Combined multiplier: motion × local  (Q8)
+        // Texture factor Q8: lookup from 32×32 compile-time LUT.
+        let texture_q8 = TEXTURE_TABLE[(prev_abs_diff >> 3) as usize][(abs_diff >> 3) as usize];
+
+        // Combined multiplier: motion × local × texture  (Q8)
         let combined_q8 = (motion_factor * local_q8 + 128) >> 8;
+        let combined_q8 = (combined_q8 * texture_q8 + 128) >> 8;
         // Final Q8 amount, clamped to safe range
         let amount = ((effective_base * combined_q8 + 128) >> 8).min(1023);
 
         let adj = (diff as i32 * amount as i32 + 128) >> 8;
-        *yp = ((*yp as i32 + adj).clamp(0, 255)) as u8;
-    }
+        let enhanced = ((*yp as i32 + adj).clamp(0, 255)) as u8;
+        *yp = enhanced;
+        *p = enhanced;  // save to prev for next frame's MAD
 
-    // ── 4.  Save current Y as prev for next frame ──────────────
-    prev.copy_from_slice(y_plane);
+        // Update row-aware prev_abs_diff for next pixel
+        prev_abs_diff = if col > 0 { abs_diff } else { 0 };
+        col = if col + 1 < w { col + 1 } else { 0 };
+    }
+    // ── prev is updated in-loop above, no separate copy_from_slice needed ──
 }
 
 /// BGRA → I420, writing into a pre-sized buffer (no resize).
@@ -796,7 +851,7 @@ impl VideoEncoder {
             .bitrate(BitRate::from_bps(bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(framerate))
             .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Quality)
+            .rate_control_mode(RateControlMode::Bitrate)
             .complexity(Complexity::Low)
             .intra_frame_period(IntraFramePeriod::from_num_frames(intra_period))
             .profile(Profile::Baseline);
@@ -1836,6 +1891,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     tasks.spawn_blocking(move || {
         let mut last_raw: Option<Bytes> = None;
         let mut tmp_argb = Vec::new();
+        let mut chroma_tick = 0u32;
+        let mut last_chroma_boost = 256u32;
         loop {
             if cap_stop.is_cancelled() { break; }
 
@@ -1878,6 +1935,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         &mut i420[..y_size + 2 * uv_size],
                         out_w as usize, out_h as usize,
                         enhance, &mut tmp_argb,
+                        &mut chroma_tick, &mut last_chroma_boost,
                     );
                 }
                 // Zero-copy: Vec -> Bytes (takes ownership of Vec allocation)
@@ -2415,7 +2473,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                                     // >5% loss → cut to 80% of current
                                     let cur = target_bps.load(Ordering::Relaxed);
                                     desired_bps = (cur as f64 * 0.8) as u32;
-                                    log::info!("[abr] loss={:.1}%, cutting to {}kbps", ratio * 100.0, desired_bps / 1000);
+                                    log::debug!("[abr] loss={:.1}%, cutting to {}kbps", ratio * 100.0, desired_bps / 1000);
                                 }
                             }
                             break;
@@ -2425,7 +2483,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                             let new_bps = desired_bps.max(200_000).min(initial_bitrate_bps);
                             if (new_bps as i32 - current_bps as i32).abs() >= 50000 {
                                 target_bps.store(new_bps, Ordering::Relaxed);
-                                log::info!("[abr] bitrate={}kbps (twcc={}kbps)", new_bps / 1000, desired_bps / 1000);
+                                log::debug!("[abr] bitrate={}kbps (twcc={}kbps)", new_bps / 1000, desired_bps / 1000);
                             }
                         }
                     }
