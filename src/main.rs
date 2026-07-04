@@ -92,7 +92,8 @@ struct ServerState {
     args: Arc<Args>,
     token: Option<String>,
     /// Pre-rendered HTML page (template substitution done once at startup).
-    index_html: String,
+    /// Arc avoids cloning the ~10-30KB HTML on every HTTP request.
+    index_html: Arc<String>,
     /// Shared keycode cache (keysym→keycode), built once on first connection.
     keycode_cache: std::sync::OnceLock<std::sync::Arc<std::collections::HashMap<u32, u8>>>,
 }
@@ -1002,7 +1003,7 @@ fn main() -> Result<()> {
     let state = ServerState {
         args: Arc::new(args),
         token,
-        index_html,
+        index_html: Arc::new(index_html),
         keycode_cache: std::sync::OnceLock::new(),
     };
 
@@ -1039,7 +1040,7 @@ fn main() -> Result<()> {
 }
 
 async fn root_handler(State(state): State<ServerState>) -> Html<String> {
-    Html(state.index_html.clone())
+    Html((*state.index_html).clone())
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<ServerState>) -> impl IntoResponse {
@@ -1840,8 +1841,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
             let frame_start = std::time::Instant::now();
 
-            // Allocate I420 buffer (fresh allocation per frame; Bytes shares ownership downstream)
-            let mut i420 = vec![0u8; frame_size];
+            // Allocate I420 buffer — Vec::with_capacity + set_len avoids unnecessary
+            // zero-initialization (capture_to_i420 fills every byte via libyuv).
+            // Bytes::from takes ownership zero-copy for downstream.
+            let mut i420 = Vec::with_capacity(frame_size);
+            // SAFETY: capture_to_i420 fills every byte through with_resize_uninit
+            // (clear → set_len → libyuv write). No byte is read before being written.
+            unsafe { i420.set_len(frame_size); }
 
             if let Err(e) = screen_capture.capture_to_i420(&mut i420, out_w, out_h,
                 needs_scaling, &mut tmp_argb)
@@ -2193,7 +2199,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     };
                     opus_out.clear();
                     opus_out.reserve(4096);
-                    opus_out.resize(4096, 0);
+                    // SAFETY: encoder.encode 写入前 n 字节，不读 buf，truncate 丢弃未写部分
+                    unsafe { opus_out.set_len(4096); }
                     match encoder.encode(samples, &mut opus_out) {
                         Ok(n) => {
                             opus_out.truncate(n);
