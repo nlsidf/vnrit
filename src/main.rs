@@ -1658,7 +1658,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // Force mimalloc to flush cached segments before this session allocates.
     // Without this, freed memory from the previous session sits in mimalloc
     // pools and the new session allocates on top of it, inflating RSS.
-    unsafe { mi_collect(true); }
+    unsafe { mi_collect(false); }
 
     // ── X11 connection setup (triple connections: capture + input + event) ──
     // Build or reuse the shared keycode cache (keysym→keycode mapping)
@@ -2395,7 +2395,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         let _ = pc.close().await;
         drop(pc);
         drop(handler);
-        unsafe { mi_collect(true); }
+        unsafe { mi_collect(false); }
         return;
     }
     let evt_fd = match unsafe { AsyncFd::new(std::os::unix::io::OwnedFd::from_raw_fd(dup_fd)) } {
@@ -2418,7 +2418,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             let _ = pc.close().await;
             drop(pc);
             drop(handler);
-            unsafe { mi_collect(true); }
+            unsafe { mi_collect(false); }
             return;
         }
     };
@@ -2695,7 +2695,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // Per-session allocations (openh264 ref frames ~1.4MB, X11 buffers, audio)
     // are freed but mimalloc retains them in thread-local heaps. Without
     // explicit collection this manifests as a ~1.5MB/heap RSS increment.
-    unsafe { mi_collect(true); }
+    unsafe { mi_collect(false); }
 
     log::info!("[ws] cleanup complete");
 }
