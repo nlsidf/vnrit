@@ -992,6 +992,11 @@ impl PeerConnectionEventHandler for WebrtcHandler {
 
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
         log::info!("[dc] incoming data channel (id={})", data_channel.id());
+        // NOTE: handle_ws uses input_dc from create_data_channel directly, NOT this
+        // watch channel value. The reference received here may be a different
+        // Arc<dyn DataChannel> wrapping the same SCTP stream. On reconnect, we've
+        // observed this reference arriving already in an exhausted state — poll()
+        // returns None immediately. Sending to dc_tx as a fallback is harmless.
         let _ = self.dc_tx.send(Some(data_channel));
     }
 }
@@ -1044,7 +1049,7 @@ fn main() -> Result<()> {
     )
     .filter(Some("rtc_ice"), log::LevelFilter::Error)
     .filter(Some("rtc::peer_connection"), log::LevelFilter::Error)
-    .filter(Some("webrtc::peer_connection::driver"), log::LevelFilter::Warn)
+    .filter(Some("webrtc::peer_connection::driver"), log::LevelFilter::Off)
     .filter(Some("rtc_dtls"), log::LevelFilter::Error)
     .filter(Some("openh264"), log::LevelFilter::Error)
     .format_timestamp(None)
@@ -1061,6 +1066,41 @@ fn main() -> Result<()> {
         index_html: Arc::new(index_html),
         keycode_cache: std::sync::OnceLock::new(),
     };
+
+    // ── Signal handler: release stuck XTest keys before exit ──
+    // When streaming vnrit's own display (e.g. `:1`), pressing Ctrl+C in the
+    // browser injects Ctrl+C via XTest into the terminal, which sends SIGINT
+    // to vnrit. Without cleanup the X server keeps the keys held, causing
+    // keyboard repeat to flood the terminal with ^C after exit.
+    // Covers SIGINT/Ctrl+C, SIGTERM/kill, SIGQUIT/Ctrl+\ and SIGHUP/hangup.
+    use tokio::signal::unix::{signal, SignalKind};
+    let display = state.args.display.clone();
+    tokio::spawn(async move {
+        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        let mut sigquit = signal(SignalKind::quit()).unwrap();
+        let mut sighup = signal(SignalKind::hangup()).unwrap();
+
+        tokio::select! {
+            _ = sigint.recv() => log::info!("[signal] SIGINT received"),
+            _ = sigterm.recv() => log::info!("[signal] SIGTERM received"),
+            _ = sigquit.recv() => log::info!("[signal] SIGQUIT received"),
+            _ = sighup.recv() => log::info!("[signal] SIGHUP received"),
+        }
+
+        log::info!("[signal] releasing stuck XTest keys...");
+        let _ = tokio::task::spawn_blocking(move || {
+            let Ok((conn, _)) = connect_to_display(&display) else { return };
+            // Release all possible keycodes (unpressed ones are silently ignored)
+            for kc in 8..=255u8 {
+                let _ = xtest::fake_input(&conn, X11_KEY_RELEASE, kc, 0, 0, 0, 0, 0);
+            }
+            let _ = conn.flush();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }).await;
+        log::info!("[signal] keys released, exiting");
+        std::process::exit(0);
+    });
 
     let addr = format!("0.0.0.0:{}", state.args.port);
     println!("vnrit listening on http://{}", addr);
@@ -1366,6 +1406,10 @@ struct SignalingOutput {
     track: Arc<TrackLocalStaticSample>,
     audio_track: Arc<TrackLocalStaticSample>,
     audio_ssrc: u32,
+    /// DataChannel from create_data_channel, returned directly to handle_ws.
+    /// The on_data_channel callback provides a separate reference that may be
+    /// invalid on reconnect; using this field avoids that race.
+    input_dc: Option<Arc<dyn DataChannel>>,
 }
 
 /// Run the WebRTC signaling phase inside a Result so that all early exits
@@ -1474,7 +1518,7 @@ async fn run_signaling(
     log::info!("[pc] PeerConnection created");
 
     // ── Post-pc operations (tracks, offer/answer) — close pc on error ──
-    let (track, audio_track, audio_ssrc) = match async {
+    let v = match async {
         // ── Create video track ──
         let ssrc = rand::rng().random::<u32>();
         let rtp_codec = video_codec.rtp_codec.clone();
@@ -1523,13 +1567,19 @@ async fn run_signaling(
         log::info!("[pc] audio track added, creating offer...");
 
         // Create input DataChannel BEFORE create_offer so the browser includes it in the answer SDP.
-        // The channel is delivered to the main loop via dc_tx watch channel.
-        if let Ok(dc) = pc.create_data_channel("input", None).await {
-            log::info!("[dc] input channel created (id={})", dc.id());
-            let _ = dc_tx.send(Some(dc));
-        } else {
-            log::warn!("[dc] create_data_channel failed");
-        }
+        // Return the DC directly to handle_ws, bypassing the on_data_channel callback
+        // (which may provide a different, already-exhausted Arc<dyn DataChannel> on reconnect).
+        let input_dc = match pc.create_data_channel("input", None).await {
+            Ok(dc) => {
+                log::info!("[dc] input channel created (id={})", dc.id());
+                let _ = dc_tx.send(Some(dc.clone()));
+                Some(dc)
+            }
+            Err(e) => {
+                log::warn!("[dc] create_data_channel failed: {}", e);
+                None
+            }
+        };
 
         // ── Create offer and send to browser ──
         let offer = pc.create_offer(None).await
@@ -1569,7 +1619,7 @@ async fn run_signaling(
             .context("set_remote_description")?;
         log::info!("[sdp] remote description set");
 
-        anyhow::Ok((track, audio_track, audio_ssrc))
+        anyhow::Ok((track, audio_track, audio_ssrc, input_dc))
     }.await {
         Ok(v) => v,
         Err(e) => {
@@ -1577,6 +1627,8 @@ async fn run_signaling(
             return Err(e);
         }
     };
+
+    let (track, audio_track, audio_ssrc, input_dc) = v;
 
     Ok(SignalingOutput {
         pc,
@@ -1590,6 +1642,7 @@ async fn run_signaling(
         track,
         audio_track,
         audio_ssrc,
+        input_dc,
     })
 }
 
@@ -1783,6 +1836,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let track = sig.track;
     let audio_track = sig.audio_track;
     let audio_ssrc = sig.audio_ssrc;
+    let input_dc = sig.input_dc;
 
     // ── Send initial cursor position ──
     send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
@@ -2376,7 +2430,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // ── Input handling runs in main task (non-blocking) ──
     let scale_x = native_w as f64 / out_w as f64;
     let scale_y = native_h as f64 / out_h as f64;
-    let mut dc_ref: Option<Arc<dyn DataChannel>> = None;
+    // Use the DataChannel from create_data_channel directly, NOT the one from
+    // on_data_channel (which may be exhausted on reconnect). See on_data_channel.
+    let mut dc_ref: Option<Arc<dyn DataChannel>> = input_dc;
     let mut stats_tick = 0u32;
 
     loop {
@@ -2537,8 +2593,11 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 }
             }
 
-            // Watch for DataChannel registration from on_data_channel handler.
-            // Once registered, skip this branch to avoid polling dc_rx forever.
+            // Register DataChannel (fallback): dc_ref is set from input_dc (returned by
+            // create_data_channel) right after signaling. The on_data_channel callback
+            // may provide a separate Arc<dyn DataChannel> reference that has already
+            // exhausted on reconnect — so we always prefer the create_data_channel one.
+            // This branch only fires if dc_ref somehow remains None (shouldn't happen).
             _ = async {
                 if dc_ref.is_some() {
                     futures_util::future::pending::<()>().await
@@ -2574,6 +2633,20 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         }
     }
 
+    // ── Phase 0: Immediately release pressed keys ──
+    // Must happen before cleanup (which can take seconds), so a reconnecting
+    // session doesn't inherit stuck modifier keys from the old one.
+    {
+        let keys = input_state.pressed_keys.lock().unwrap();
+        for &kc in keys.iter() {
+            let _ = xtest::fake_input(&input_state.conn, X11_KEY_RELEASE,
+                kc, 0, input_state.root, 0, 0, 0);
+        }
+        if !keys.is_empty() {
+            let _ = input_state.conn.flush();
+        }
+    }
+
     // ── CLEANUP ──
     log::info!("[cleanup] client disconnected, shutting down pipeline...");
 
@@ -2591,19 +2664,6 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     }
     cancel.cancel();
 
-    // Release all pressed keys on the X server to prevent stuck keys
-    // (e.g. from virtual keyboard clicks where ku is lost on disconnect)
-    {
-        let keys = input_state.pressed_keys.lock().unwrap();
-        for &kc in keys.iter() {
-            let _ = xtest::fake_input(&input_state.conn, X11_KEY_RELEASE,
-                kc, 0, input_state.root, 0, 0, 0);
-        }
-        if !keys.is_empty() {
-            let _ = input_state.conn.flush();
-        }
-    }
-
     // ── Phase 2: Drop all channels first — this makes blocking recv tasks
     //   get Disconnected instantly and the async recv tasks see None,
     //   causing them to exit their loops. We drop channels BEFORE waiting
@@ -2613,11 +2673,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     drop(pcm_tx);
     drop(opus_tx);
 
-    // ── Phase 3: Wait for all tasks to exit — tasks hold Arc references to
-    //   track/audio_track/screen_capture/encoder, so we must wait for them
-    //   to finish before releasing WebRTC resources. Extended timeout from
-    //   6s to 10s for slow blocking tasks (PA mainloop, encoder flush).
-    if let Err(_) = tokio::time::timeout(Duration::from_secs(10), tasks.shutdown()).await {
+    // ── Phase 3: Wait for tasks to exit — Pipeline tasks check cancel token
+    //   and should exit within ~100ms after cancel. 3s safety net for edge cases.
+    if let Err(_) = tokio::time::timeout(Duration::from_secs(3), tasks.shutdown()).await {
         log::error!("[cleanup] shutdown timed out — some tasks may still be running");
     }
 

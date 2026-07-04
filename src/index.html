@@ -1009,6 +1009,7 @@ function connect() {
   ws.onclose = () => {
     if (!isCurrent()) return;
     releaseAllModifiers();
+    inputDC = null;
     setStatus('Disconnected, retrying...', false);
     cursorOverlay.style.display = 'none';
     // Stop media tracks
@@ -1497,6 +1498,7 @@ document.addEventListener('keyup', (e) => {
 // ── Page unload: release modifier keys before connection drops ──
 window.addEventListener('beforeunload', () => {
   releaseAllModifiers();
+  inputDC = null;
   flushRelInput();
   cancelCursorAnim();
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
