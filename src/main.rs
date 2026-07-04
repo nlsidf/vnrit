@@ -2251,41 +2251,43 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         // Clean up pipeline tasks and connections before returning
         // Signal PA mainloop and all async tasks to stop
         audio_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-        // Wake up PA mainloop (thread-safe) so iterate(true) returns immediately.
         {
-            let guard = pa_mainloop_ptr.0.lock().unwrap();
+            let mut guard = pa_mainloop_ptr.0.lock().unwrap();
             if let Some(ptr) = *guard {
                 unsafe { (&mut *ptr).wakeup(); }
+                *guard = None;
             }
         }
         cancel.cancel();
+        // Drop channels before waiting for tasks — makes blocking recv exit
         drop(yuv_tx); drop(enc_tx); drop(pcm_tx); drop(opus_tx);
+        // Wait for tasks to exit before releasing WebRTC resources
+        tasks.shutdown().await;
         let _ = pc.close().await;
         drop(pc);
         drop(handler);
-        tasks.shutdown().await;
         return;
     }
     let evt_fd = match unsafe { AsyncFd::new(std::os::unix::io::OwnedFd::from_raw_fd(dup_fd)) } {
         Ok(fd) => fd,
         Err(e) => {
             log::error!("[x11] failed to create AsyncFd for event connection: {}", e);
-            // Clean up pipeline tasks and connections before returning
-            // Signal PA mainloop and all async tasks to stop
             audio_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-            // Wake up PA mainloop (thread-safe) so iterate(true) returns immediately.
             {
-                let guard = pa_mainloop_ptr.0.lock().unwrap();
+                let mut guard = pa_mainloop_ptr.0.lock().unwrap();
                 if let Some(ptr) = *guard {
                     unsafe { (&mut *ptr).wakeup(); }
+                    *guard = None;
                 }
             }
             cancel.cancel();
+            // Drop channels before waiting for tasks — makes blocking recv exit
             drop(yuv_tx); drop(enc_tx); drop(pcm_tx); drop(opus_tx);
+            // Wait for tasks to exit before releasing WebRTC resources
+            tasks.shutdown().await;
             let _ = pc.close().await;
             drop(pc);
             drop(handler);
-            tasks.shutdown().await;
             return;
         }
     };
@@ -2310,7 +2312,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     futures_util::future::pending::<Option<DataChannelEvent>>().await
                 }
             } => {
-                if let Some(DataChannelEvent::OnMessage(msg)) = dc_event {
+                if let Some(DataChannelEvent::OnClose) = dc_event {
+                    log::info!("[dc] data channel closed by remote");
+                    dc_ref = None;
+                } else if let Some(DataChannelEvent::OnMessage(msg)) = dc_event {
                     if let Ok(text) = std::str::from_utf8(&msg.data) {
                         if text.starts_with("mr,") || text.starts_with("ma,")
                             || text.starts_with("md,") || text.starts_with("mu,")
@@ -2484,15 +2489,18 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // ── CLEANUP ──
     log::info!("[cleanup] client disconnected, shutting down pipeline...");
 
-    // Signal the PA mainloop and all async tasks to stop
+    // ── Phase 1: Signal cancellation and wake blocking tasks ──
+    // Cancel the main CancellationToken first so all async select! branches
+    // that listen on cancel.cancelled() bail out immediately.
     audio_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-    // Wake up PA mainloop (thread-safe) so iterate(true) returns immediately.
     {
-            let guard = pa_mainloop_ptr.0.lock().unwrap();
-            if let Some(ptr) = *guard {
-                unsafe { (&mut *ptr).wakeup(); }
-            }
+        let mut guard = pa_mainloop_ptr.0.lock().unwrap();
+        if let Some(ptr) = *guard {
+            unsafe { (&mut *ptr).wakeup(); }
+            // Clear the pointer so wakeup() is never called again on a dangling ptr
+            *guard = None;
         }
+    }
     cancel.cancel();
 
     // Release all pressed keys on the X server to prevent stuck keys
@@ -2508,38 +2516,34 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         }
     }
 
-    // ── Phase 1: Signal cancellation to all pipeline tasks ──
-    audio_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-    {
-        let guard = pa_mainloop_ptr.0.lock().unwrap();
-        if let Some(ptr) = *guard {
-            unsafe { (&mut *ptr).wakeup(); }
-        }
-    }
-    cancel.cancel();
-
-    // Drop DataChannel reference before PC close so the DataChannel's Arc
-    // count reaches 1 (held only by PC) — when PC is dropped, the DataChannel
-    // is freed immediately rather than lingering as a self-reference.
-    drop(dc_ref);
-
-    // ── Phase 2: Close PeerConnection first — this immediately releases webrtc-rs
-    //   internals (tracks, SSRC observers, RTCP statistics) and causes any in-progress
-    //   write_sample calls to fail, letting send tasks exit quickly.
-    let _ = pc.close().await;
-    drop(pc);
-    drop(handler);
-
-    // ── Phase 3: Drop channels — blocking recv tasks get Disconnected and exit ──
+    // ── Phase 2: Drop all channels first — this makes blocking recv tasks
+    //   get Disconnected instantly and the async recv tasks see None,
+    //   causing them to exit their loops. We drop channels BEFORE waiting
+    //   for tasks so that tasks aren't stuck in recv() calls.
     drop(yuv_tx);
     drop(enc_tx);
     drop(pcm_tx);
     drop(opus_tx);
 
-    // ── Phase 4: Wait for all tasks to finish (safety net with timeout) ──
-    if tokio::time::timeout(Duration::from_secs(6), tasks.shutdown()).await.is_err() {
-        log::error!("[cleanup] shutdown timed out — some blocking tasks may still be running");
+    // ── Phase 3: Wait for all tasks to exit — tasks hold Arc references to
+    //   track/audio_track/screen_capture/encoder, so we must wait for them
+    //   to finish before releasing WebRTC resources. Extended timeout from
+    //   6s to 10s for slow blocking tasks (PA mainloop, encoder flush).
+    if let Err(_) = tokio::time::timeout(Duration::from_secs(10), tasks.shutdown()).await {
+        log::error!("[cleanup] shutdown timed out — some tasks may still be running");
     }
+
+    // ── Phase 4: All background tasks have exited. Now it's safe to release
+    //   WebRTC resources — no task is still calling write_sample() or
+    //   holding Arc references to the tracks.
+    // Do NOT call dc.close() explicitly — it races with in-flight messages
+    // and causes Disconnected errors. pc.close() handles DC cleanup
+    // gracefully as part of SCTP transport shutdown.
+    drop(dc_ref);
+    let _ = pc.close().await;
+    drop(pc);
+    drop(handler);
+    // track and audio_track are moved into send tasks, dropped when tasks exit above
 
     log::info!("[ws] cleanup complete");
 }
