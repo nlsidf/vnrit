@@ -1111,31 +1111,50 @@ async fn auth_middleware(
 
 /// Connect to an X11 display, trying standard method first then Termux socket.
 fn connect_to_display(display: &str) -> Result<(RustConnection, usize)> {
-    match RustConnection::connect(Some(display)) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            log::info!("[x11] standard connect failed: {}, trying Termux socket path...", e);
-            let display_num: u16 = display.trim_start_matches(':').split('.').next()
-                .and_then(|s| s.parse().ok())
-                .context("invalid display format")?;
-            let sock = format!(
+    // Always construct the connection manually so we can set SO_RCVTIMEO
+    // on the socket.  The X server is always on a local Unix socket or
+    // Termux path — there is no remote display scenario.
+    let display_num: u16 = display.trim_start_matches(':').split('.').next()
+        .and_then(|s| s.parse().ok())
+        .context("invalid display format")?;
+
+    // Try the standard X11 socket path first, then fall back to Termux.
+    let sock = format!("/tmp/.X11-unix/X{}", display_num);
+    let unix_stream = match UnixStream::connect(&sock) {
+        Ok(s) => s,
+        Err(_) => {
+            let termux_sock = format!(
                 "/data/data/com.termux/files/usr/tmp/.X11-unix/X{}", display_num
             );
-            log::info!("[x11] connecting to {}", sock);
-            let unix_stream = UnixStream::connect(&sock)
-                .context("cannot connect to Termux X11 socket")?;
-            let (stream, (family, address)) = DefaultStream::from_unix_stream(unix_stream)
-                .context("from_unix_stream failed")?;
-            let (auth_name, auth_data) = get_auth(family, &address, display_num)
-                .unwrap_or(None)
-                .unwrap_or_else(|| (Vec::new(), Vec::new()));
-            let conn = RustConnection::connect_to_stream_with_auth_info(
-                stream, 0, auth_name, auth_data,
-            ).context("connect_to_stream failed")?;
-            log::info!("[x11] connected via Termux socket path");
-            Ok((conn, 0usize))
+            log::info!("[x11] connecting via Termux socket path: {}", termux_sock);
+            UnixStream::connect(&termux_sock)
+                .context("cannot connect to Termux X11 socket")?
         }
+    };
+
+    // Set 5-second receive timeout on all X11 sockets so that blocking
+    // reply() calls (e.g. mit-shm get_image) don't hang forever.
+    let fd = unix_stream.as_raw_fd();
+    let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
+    unsafe {
+        libc::setsockopt(
+            fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+            &tv as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
     }
+    log::info!("[x11] SO_RCVTIMEO=5s set on display {}", display);
+
+    let (stream, (family, address)) = DefaultStream::from_unix_stream(unix_stream)
+        .context("from_unix_stream failed")?;
+    let (auth_name, auth_data) = get_auth(family, &address, display_num)
+        .unwrap_or(None)
+        .unwrap_or_else(|| (Vec::new(), Vec::new()));
+    let conn = RustConnection::connect_to_stream_with_auth_info(
+        stream, 0, auth_name, auth_data,
+    ).context("connect_to_stream failed")?;
+    log::info!("[x11] connected");
+    Ok((conn, 0usize))
 }
 
 fn setup_x11_connections(display: &str, keycode_cache: std::sync::Arc<std::collections::HashMap<u32, u8>>) -> Result<(Arc<CaptureState>, Arc<InputState>, u16, u16, u8, RustConnection)> {
@@ -1441,6 +1460,15 @@ async fn run_signaling(
             .context("add audio track")?;
         log::info!("[pc] audio track added, creating offer...");
 
+        // Create input DataChannel BEFORE create_offer so the browser includes it in the answer SDP.
+        // The channel is delivered to the main loop via dc_tx watch channel.
+        if let Ok(dc) = pc.create_data_channel("input", None).await {
+            log::info!("[dc] input channel created (id={})", dc.id());
+            let _ = dc_tx.send(Some(dc));
+        } else {
+            log::warn!("[dc] create_data_channel failed");
+        }
+
         // ── Create offer and send to browser ──
         let offer = pc.create_offer(None).await
             .context("create_offer")?;
@@ -1505,6 +1533,13 @@ async fn run_signaling(
 
 async fn handle_ws(ws: WebSocket, state: ServerState) {
     log::info!("[ws] client connected");
+
+    // Pre-connection yield: give orphaned blocking threads from a previous
+    // timed-out shutdown a chance to make progress (e.g. X11 reply() timeout
+    // expiry, PA mainloop exit), so their resources are freed before we
+    // allocate new ones.
+    tokio::task::yield_now().await;
+    std::thread::yield_now();
 
     // ── X11 connection setup (triple connections: capture + input + event) ──
     // Build or reuse the shared keycode cache (keysym→keycode mapping)
@@ -1676,13 +1711,12 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let mut ice_rx = sig.ice_rx;
     let mut gather_complete_rx = sig.gather_complete_rx;
     let mut connected_rx = sig.connected_rx;
-    let dc_tx = sig.dc_tx;
+    let _dc_tx = sig.dc_tx;
     let mut dc_rx = sig.dc_rx;
     let done = sig.done;
     let track = sig.track;
     let audio_track = sig.audio_track;
     let audio_ssrc = sig.audio_ssrc;
-    let input_dc_tx = dc_tx.clone();
 
     // ── Send initial cursor position ──
     send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
@@ -1755,15 +1789,6 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     }
     log::info!("[pc] connection established!");
 
-    // ── Create input DataChannel (server-initiated) ──
-    match pc.create_data_channel("input", None).await {
-        Ok(dc) => {
-            log::info!("[dc] input channel created (id={})", dc.id());
-            let _ = input_dc_tx.send(Some(dc));
-        }
-        Err(e) => log::warn!("[dc] create_data_channel failed: {}", e),
-    }
-
     // ── Pipeline: 3-stage capture → encode → send ──
     let frame_duration = std::time::Duration::from_nanos(1_000_000_000 / state.args.framerate as u64);
     let track_ssrc = *track.ssrcs().await.first().unwrap_or(&0);
@@ -1792,6 +1817,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // Shutdown signal — unified CancellationToken for all pipeline tasks
     let cancel = tokio_util::sync::CancellationToken::new();
     let cap_stop = cancel.clone();
+    let cap_done = done.clone();
     let yuv_tx_cap = yuv_tx.clone();
     let frame_size = (out_w * out_h * 3 / 2) as usize;
 
@@ -1811,11 +1837,15 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 needs_scaling, &mut tmp_argb)
             {
                 log::info!("[capture] error: {:#}, repeating last frame", e);
-                if let Some(ref mut last) = last_raw {
-                    // O(1) pointer swap — swap Arc<[u8]> refs instead of 3MB memcpy
-                    let mut old_frame = Bytes::from(i420);
-                    std::mem::swap(&mut old_frame, last);
-                    // old_frame holds last frame's data, dropped at end of scope
+                if let Some(ref last) = last_raw {
+                    // Send the previous frame (zero-copy: Arc refcount++), keep last_raw intact.
+                    if let Err(e) = yuv_tx_cap.try_send(last.clone()) {
+                        if matches!(e, block_mpsc::TrySendError::Disconnected(_)) {
+                            log::debug!("[capture] output channel closed, exiting");
+                            cap_done.notify_one();
+                            return;
+                        }
+                    }
                 } else {
                     let elapsed = frame_start.elapsed();
                     if elapsed < frame_duration {
@@ -1846,6 +1876,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         }
                         block_mpsc::TrySendError::Disconnected(_) => {
                             log::debug!("[capture] output channel closed, exiting");
+                            cap_done.notify_one();
                             return;
                         }
                     }
@@ -1867,11 +1898,15 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let target_bps = Arc::new(AtomicU32::new(initial_bitrate_bps));
     let enc_bps = target_bps.clone();
     let enc_done = done.clone();
+    let enc_args = state.args.clone();
+    let (enc_w, enc_h) = (out_w, out_h);
     tasks.spawn_blocking(move || {
         let mut enc_buf = Vec::with_capacity(65536);
         let mut last_idr = std::time::Instant::now();
         let mut enc_failures = 0u32;
+        let mut hard_failures = 0u32;
         const ENC_MAX_FAILURES: u32 = 10;
+        const ENC_HARD_LIMIT: u32 = 3;
         const IDR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
         loop {
             if enc_stop.is_cancelled() { break; }
@@ -1883,13 +1918,31 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     enc_buf.clear();
                     if let Err(e) = encoder.encode(yuv.as_ref(), &mut enc_buf) {
                         enc_failures += 1;
-                        log::error!("[encoder] error #{}/{}: {:#}", enc_failures, ENC_MAX_FAILURES, e);
-                        if enc_failures >= ENC_MAX_FAILURES {
-                            log::error!("[encoder] too many failures, aborting encoder task");
+                        hard_failures += 1;
+                        log::error!("[encoder] error #{}/{} (hard={}/{}): {:#}",
+                            enc_failures, ENC_MAX_FAILURES, hard_failures, ENC_HARD_LIMIT, e);
+                        // Hard limit: if encoder keeps failing after multiple resets, give up
+                        if hard_failures >= ENC_HARD_LIMIT {
+                            log::error!("[encoder] hard limit reached, disconnecting");
                             enc_done.notify_one();
                             break;
                         }
+                        if enc_failures >= ENC_MAX_FAILURES {
+                            log::error!("[encoder] too many failures, resetting encoder");
+                            // Give the encoder some breathing room, then recreate it
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                enc_failures as u64 * 100));
+                            encoder = match VideoEncoder::new(&enc_args, enc_w, enc_h) {
+                                Ok(e) => e,
+                                Err(_) => { enc_done.notify_one(); break; }
+                            };
+                            enc_failures = 0;
+                            continue;
+                        }
                         encoder.force_keyframe();
+                        // Exponential backoff before retry
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            enc_failures.min(10) as u64 * 100));
                         continue;
                     }
                     enc_failures = 0; // reset on success
@@ -1914,7 +1967,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     }
                 }
                 Err(block_mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(block_mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(block_mpsc::RecvTimeoutError::Disconnected) => {
+                    enc_done.notify_one();
+                    break;
+                }
             }
         }
         log::debug!("[encoder] task ended");
@@ -1981,13 +2037,15 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let audio_pcm_tx_thread = pcm_tx.clone();
     let pcm_pool_cap = pcm_pool.clone();
     let audio_source_thread = audio_source.clone();
-    // Atomic pointer for PA mainloop wakeup from the async context.
-    // pa_mainloop_wakeup() is documented as thread-safe; we only call wakeup(), not quit().
-    use std::sync::atomic::AtomicPtr;
-    let pa_mainloop_ptr: Arc<AtomicPtr<pulse::mainloop::standard::Mainloop>> =
-        Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+    // PA mainloop pointer, protected by mutex for thread-safe wakeup.
+    // pa_mainloop_wakeup() is explicitly documented as thread-safe by PulseAudio.
+    // We only call wakeup() through the pointer, never drop() — safe even though Mainloop !Send.
+    use std::sync::Mutex;
+    struct PaMainloopPtr(Mutex<Option<*mut pulse::mainloop::standard::Mainloop>>);
+    unsafe impl Send for PaMainloopPtr {}
+    unsafe impl Sync for PaMainloopPtr {}
+    let pa_mainloop_ptr = Arc::new(PaMainloopPtr(Mutex::new(None)));
     let pa_mainloop_ptr_clone = pa_mainloop_ptr.clone();
-
     tasks.spawn_blocking(move || {
         use pulse::mainloop::standard::IterateResult;
 
@@ -2007,7 +2065,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         };
 
         // Store pointer for external wakeup (called from cleanup on any thread).
-        pa_mainloop_ptr_clone.store(&mut mainloop as *mut _, std::sync::atomic::Ordering::Release);
+        *pa_mainloop_ptr_clone.0.lock().unwrap() = Some(&mut mainloop as *mut _);
 
         let mut ctx = match pulse::context::Context::new(&mainloop, "vnrit") {
             Some(c) => c,
@@ -2027,6 +2085,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         }
         if ctx.get_state() != pulse::context::State::Ready {
             log::error!("[audio] PA context not ready");
+            *pa_mainloop_ptr_clone.0.lock().unwrap() = None;
             return;
         }
 
@@ -2034,7 +2093,11 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         let dev = audio_source_thread.as_deref();
         let mut stream = match pulse::stream::Stream::new(&mut ctx, "audio-capture", &spec, None) {
             Some(s) => s,
-            None => { log::error!("[audio] PA Stream::new failed"); return; }
+            None => {
+                log::error!("[audio] PA Stream::new failed");
+                *pa_mainloop_ptr_clone.0.lock().unwrap() = None;
+                return;
+            }
         };
 
         // Connect for recording
@@ -2047,6 +2110,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
         // Event-driven mainloop: iterate(true) blocks until PA events arrive.
         // After each event, drain available audio data with non-blocking peek().
+        // PCM accumulation buffer: PA may deliver partial frames; accumulate until 3840 bytes ready.
+        use std::collections::VecDeque;
+        let mut pcm_accum = VecDeque::<u8>::with_capacity(PCM_FRAME_BYTES);
         while !audio_cancelled_clone.load(std::sync::atomic::Ordering::Relaxed) {
             match mainloop.iterate(true) {
                 IterateResult::Quit(_) => break,
@@ -2056,29 +2122,44 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             loop {
                 match stream.peek() {
                     Ok(pulse::stream::PeekResult::Data(data)) => {
-                        // Pop a buffer from pool, or allocate fresh if pool empty
-                        let mut buf = match pcm_pool_cap.pop() {
-                            Some(b) => b,
-                            None => vec![0u8; PCM_FRAME_BYTES],
-                        };
-                        let n = data.len().min(buf.len());
-                        buf[..n].copy_from_slice(&data[..n]);
-                        if audio_pcm_tx_thread.send(buf).is_err() {
-                            log::debug!("[audio] PCM channel closed, exiting");
-                            return;
-                        }
+                        pcm_accum.extend(&data[..]);
                         let _ = stream.discard();
+                        // Safety cap: if accumulator exceeds 2 frames, trim oldest data.
+                        // Prevents unbounded growth from pathological PA fragment sizes.
+                        const PCM_ACCUM_MAX: usize = PCM_FRAME_BYTES * 2;
+                        if pcm_accum.len() > PCM_ACCUM_MAX {
+                            let excess = pcm_accum.len() - PCM_ACCUM_MAX;
+                            pcm_accum.drain(..excess);
+                        }
+                        // Emit complete frames from the accumulator
+                        while pcm_accum.len() >= PCM_FRAME_BYTES {
+                            let mut buf = match pcm_pool_cap.pop() {
+                                Some(b) => b,
+                                None => vec![0u8; PCM_FRAME_BYTES],
+                            };
+                            for (i, byte) in pcm_accum.drain(..PCM_FRAME_BYTES).enumerate() {
+                                buf[i] = byte;
+                            }
+                            if audio_pcm_tx_thread.send(buf).is_err() {
+                                log::debug!("[audio] PCM channel closed, exiting");
+                                *pa_mainloop_ptr_clone.0.lock().unwrap() = None;
+                                return;
+                            }
+                        }
                     }
                     _ => break, // Empty or Hole → no more data
                 }
             }
         }
 
+        // Clear PA mainloop pointer before exit (prevents dangling pointer in cleanup)
+        *pa_mainloop_ptr_clone.0.lock().unwrap() = None;
         log::debug!("[audio] capture task ended");
     });
 
     // ── Audio Stage 2: Opus encode (spawn_blocking) ──
     let audio_enc_stop = cancel.clone();
+    let audio_enc_done = done.clone();
     let audio_opus_tx = opus_tx.clone();
     let pcm_pool_enc = pcm_pool.clone();
     tasks.spawn_blocking(move || {
@@ -2121,7 +2202,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     }
                 }
                 Err(block_mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(block_mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(block_mpsc::RecvTimeoutError::Disconnected) => {
+                    audio_enc_done.notify_one();
+                    break;
+                }
             }
         }
         log::debug!("[audio] encode task ended");
@@ -2169,15 +2253,17 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         audio_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
         // Wake up PA mainloop (thread-safe) so iterate(true) returns immediately.
         {
-            let ptr = pa_mainloop_ptr.load(std::sync::atomic::Ordering::Acquire);
-            if !ptr.is_null() { unsafe { (&mut *ptr).wakeup(); } }
+            let guard = pa_mainloop_ptr.0.lock().unwrap();
+            if let Some(ptr) = *guard {
+                unsafe { (&mut *ptr).wakeup(); }
+            }
         }
         cancel.cancel();
         drop(yuv_tx); drop(enc_tx); drop(pcm_tx); drop(opus_tx);
-        tasks.shutdown().await;
         let _ = pc.close().await;
         drop(pc);
         drop(handler);
+        tasks.shutdown().await;
         return;
     }
     let evt_fd = match unsafe { AsyncFd::new(std::os::unix::io::OwnedFd::from_raw_fd(dup_fd)) } {
@@ -2189,12 +2275,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             audio_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
             // Wake up PA mainloop (thread-safe) so iterate(true) returns immediately.
             {
-                let ptr = pa_mainloop_ptr.load(std::sync::atomic::Ordering::Acquire);
-                if !ptr.is_null() { unsafe { (&mut *ptr).wakeup(); } }
+                let guard = pa_mainloop_ptr.0.lock().unwrap();
+                if let Some(ptr) = *guard {
+                    unsafe { (&mut *ptr).wakeup(); }
+                }
             }
             cancel.cancel();
             drop(yuv_tx); drop(enc_tx); drop(pcm_tx); drop(opus_tx);
-            tasks.shutdown().await;
             let _ = pc.close().await;
             drop(pc);
             drop(handler);
@@ -2378,6 +2465,13 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 break;
             }
 
+            // Safety net: if all tasks have been cancelled (e.g., cancelled before done triggered),
+            // exit the main loop rather than blocking forever on out_tx.closed() below.
+            _ = cancel.cancelled() => {
+                log::debug!("[loop] cancel triggered, exiting");
+                break;
+            }
+
             // Detect WebSocket disconnect: when the WS send task exits,
             // out_tx's receiver is dropped, and closed() resolves immediately.
             _ = out_tx.closed() => {
@@ -2394,15 +2488,17 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     audio_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
     // Wake up PA mainloop (thread-safe) so iterate(true) returns immediately.
     {
-        let ptr = pa_mainloop_ptr.load(std::sync::atomic::Ordering::Acquire);
-        if !ptr.is_null() { unsafe { (&mut *ptr).wakeup(); } }
-    }
+            let guard = pa_mainloop_ptr.0.lock().unwrap();
+            if let Some(ptr) = *guard {
+                unsafe { (&mut *ptr).wakeup(); }
+            }
+        }
     cancel.cancel();
 
     // Release all pressed keys on the X server to prevent stuck keys
     // (e.g. from virtual keyboard clicks where ku is lost on disconnect)
     {
-        let keys = input_state.pressed_keys.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = input_state.pressed_keys.lock().unwrap();
         for &kc in keys.iter() {
             let _ = xtest::fake_input(&input_state.conn, X11_KEY_RELEASE,
                 kc, 0, input_state.root, 0, 0, 0);
@@ -2412,18 +2508,39 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         }
     }
 
-    // Drop channel senders so receivers stop blocking
+    // ── Phase 1: Signal cancellation to all pipeline tasks ──
+    audio_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    {
+        let guard = pa_mainloop_ptr.0.lock().unwrap();
+        if let Some(ptr) = *guard {
+            unsafe { (&mut *ptr).wakeup(); }
+        }
+    }
+    cancel.cancel();
+
+    // Drop DataChannel reference before PC close so the DataChannel's Arc
+    // count reaches 1 (held only by PC) — when PC is dropped, the DataChannel
+    // is freed immediately rather than lingering as a self-reference.
+    drop(dc_ref);
+
+    // ── Phase 2: Close PeerConnection first — this immediately releases webrtc-rs
+    //   internals (tracks, SSRC observers, RTCP statistics) and causes any in-progress
+    //   write_sample calls to fail, letting send tasks exit quickly.
+    let _ = pc.close().await;
+    drop(pc);
+    drop(handler);
+
+    // ── Phase 3: Drop channels — blocking recv tasks get Disconnected and exit ──
     drop(yuv_tx);
     drop(enc_tx);
     drop(pcm_tx);
     drop(opus_tx);
 
-    tasks.shutdown().await;
+    // ── Phase 4: Wait for all tasks to finish (safety net with timeout) ──
+    if tokio::time::timeout(Duration::from_secs(6), tasks.shutdown()).await.is_err() {
+        log::error!("[cleanup] shutdown timed out — some blocking tasks may still be running");
+    }
 
-    // Close PeerConnection and release handler.
-    let _ = pc.close().await;
-    drop(pc);
-    drop(handler);
     log::info!("[ws] cleanup complete");
 }
 
@@ -2511,7 +2628,7 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
             if keysym != 0 {
                 let kc = find_keycode(state, keysym);
                 if kc > 0 {
-                    state.pressed_keys.lock().unwrap_or_else(|e| e.into_inner()).insert(kc);
+                    state.pressed_keys.lock().unwrap().insert(kc);
                     let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
                     let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
                     let _ = xtest::fake_input(&state.conn, X11_KEY_PRESS,
@@ -2528,7 +2645,7 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
             if keysym != 0 {
                 let kc = find_keycode(state, keysym);
                 if kc > 0 {
-                    state.pressed_keys.lock().unwrap_or_else(|e| e.into_inner()).remove(&kc);
+                    state.pressed_keys.lock().unwrap().remove(&kc);
                     let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
                     let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
                     let _ = xtest::fake_input(&state.conn, X11_KEY_RELEASE,
