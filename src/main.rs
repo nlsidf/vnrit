@@ -751,8 +751,8 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
     }
 
     // ── 2.  Stack blur (SIMD, O(1)) ────────────────────────────
-    // Resolution-adaptive radius: 640px→1, 1280px→2, 1920px→3
-    let blur_radius = ((w + 320) / 640).clamp(1, 3);
+    // Resolution-adaptive radius: 640px→2, 1280px→3, 1920px→4
+    let blur_radius = ((w + 320) / 640).clamp(2, 4);
     {
         let mut img = BlurImageMut::borrow(
             blur_copy,
