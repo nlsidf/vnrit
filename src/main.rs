@@ -3604,6 +3604,16 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     drop(handler);
     // track and audio_track are moved into send tasks, dropped when tasks exit above
 
+    // ── Phase 5: Release X11 resources ──
+    // All pipeline tasks have exited — no captures or events are in flight.
+    // evt_conn holds the X11 display fd (one per session); dropping it closes
+    // the connection.  capture_state and input_state are the final Arc refs
+    // held by handle_ws — dropping them frees the X11 connection inside.
+    drop(evt_fd);
+    drop(evt_conn);
+    drop(capture_state);
+    drop(input_state);
+
     // Force mimalloc to return cached memory segments to the OS.
     // Per-session allocations (openh264 ref frames ~1.4MB, X11 buffers, audio)
     // are freed but mimalloc retains them in thread-local heaps. Without
