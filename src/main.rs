@@ -12,8 +12,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
+use wide::i16x8;
 use wide::i32x4;
-use axum::{
+use wide::i32x8;
+use wide::u8x16;use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::{Request, State},
     http::StatusCode,
@@ -757,7 +759,64 @@ fn bicubic_scale_y_with_weights(src: &[u8], src_w: usize, src_h: usize,
         for ry in 0..tile_src_h {
             let sr = &src[(src_y0 + ry) * src_w..];
             let dr = &mut tile_horiz[ry * tile_w..];
-            for ox_local in 0..tile_w {
+            // ── Horizontal pass: SIMD i32x4 (4 pixels/batch) ──
+            // Each pixel uses its own base index and 4 tap weights.
+            // Weights are in hw.w at stride-4 offsets: pixel j uses w[wo+j*4..wo+j*4+4].
+            let mut ox_local = 0usize;
+            while ox_local + 4 <= tile_w {
+                let ox_global = out_x0 + ox_local;
+                let wo = ox_global * 4;
+                let b0 = hw.base[ox_global] as usize;
+                let b1 = hw.base[ox_global + 1] as usize;
+                let b2 = hw.base[ox_global + 2] as usize;
+                let b3 = hw.base[ox_global + 3] as usize;
+                // Tap 0: w[wo..wo+12:4], sr[base_j + 0]
+                let s0 = i32x4::new([
+                    sr[b0] as i32, sr[b1] as i32, sr[b2] as i32, sr[b3] as i32,
+                ]);
+                let w0 = i32x4::new([
+                    hw.w[wo] as i32, hw.w[wo + 4] as i32,
+                    hw.w[wo + 8] as i32, hw.w[wo + 12] as i32,
+                ]);
+                let mut acc = s0 * w0;
+                // Tap 1: w[wo+1..wo+13:4], sr[base_j + 1]
+                let s1 = i32x4::new([
+                    sr[b0 + 1] as i32, sr[b1 + 1] as i32,
+                    sr[b2 + 1] as i32, sr[b3 + 1] as i32,
+                ]);
+                let w1 = i32x4::new([
+                    hw.w[wo + 1] as i32, hw.w[wo + 5] as i32,
+                    hw.w[wo + 9] as i32, hw.w[wo + 13] as i32,
+                ]);
+                acc = acc + s1 * w1;
+                // Tap 2: w[wo+2..wo+14:4], sr[base_j + 2]
+                let s2 = i32x4::new([
+                    sr[b0 + 2] as i32, sr[b1 + 2] as i32,
+                    sr[b2 + 2] as i32, sr[b3 + 2] as i32,
+                ]);
+                let w2 = i32x4::new([
+                    hw.w[wo + 2] as i32, hw.w[wo + 6] as i32,
+                    hw.w[wo + 10] as i32, hw.w[wo + 14] as i32,
+                ]);
+                acc = acc + s2 * w2;
+                // Tap 3: w[wo+3..wo+15:4], sr[base_j + 3]
+                let s3 = i32x4::new([
+                    sr[b0 + 3] as i32, sr[b1 + 3] as i32,
+                    sr[b2 + 3] as i32, sr[b3 + 3] as i32,
+                ]);
+                let w3 = i32x4::new([
+                    hw.w[wo + 3] as i32, hw.w[wo + 7] as i32,
+                    hw.w[wo + 11] as i32, hw.w[wo + 15] as i32,
+                ]);
+                acc = acc + s3 * w3 + i32x4::splat(2048);
+                let [r0, r1, r2, r3] = (acc >> 12_i32).to_array();
+                dr[ox_local] = r0.clamp(0, 255) as u8;
+                dr[ox_local + 1] = r1.clamp(0, 255) as u8;
+                dr[ox_local + 2] = r2.clamp(0, 255) as u8;
+                dr[ox_local + 3] = r3.clamp(0, 255) as u8;
+                ox_local += 4;
+            }
+            for ox_local in ox_local..tile_w {
                 let ox_global = out_x0 + ox_local;
                 let b = hw.base[ox_global] as usize;
                 let wo = ox_global * 4;
@@ -926,34 +985,60 @@ const MOTION_TABLE: [u8; 256] = build_motion_table();
 /// Texture-adaptation: prev_abs_diff × abs_diff → Q8 multiplier [192 or 256].
 /// Returns 192 (0.75×) when adjacent |diff| values are similar and
 /// both non-trivial — reduces gain in texture regions.
-/// Branchless SIMD-friendly: uses only min/max/compare/shift.
+/// Branchless: uses only min/max/compare/shift — no `if`.
 #[inline(always)]
 fn texture_weight(prev: u32, curr: u32) -> u32 {
-    let mx = if prev > curr { prev } else { curr };
-    let mn = if prev <= curr { prev } else { curr };
-    // texture = mn >= mx/2 && mx >= 8 ? 192 : 256
-    if mx >= 8 && mn >= (mx >> 1) { 192 } else { 256 }
+    let mx = prev.max(curr);
+    let mn = prev.min(curr);
+    // condition = mx >= 8 && mn >= mx/2
+    let c = ((mx >= 8) as u32) & ((mn >= (mx >> 1)) as u32);
+    // c==1 → 192, c==0 → 256
+    256 - c * 64
 }
 
 /// Gradient-aware edge refine weight: (grad, diff) → weight [0, 192].
-/// Combines horizontal gradient (|Y[i] - Y[i-1]|) with |Y - blur| to
-/// distinguish real edges from texture/noise:
-///   grad ≥ 16 + diff ≥ 16  →  real edge          →  192
-///   grad ≥ 8  + diff ≥ 8   →  weak edge          →  160
-///   diff ≥ 16              →  texture/noise      →  64
-///   grad ≥ 8               →  subtle edge        →  96
-///   else                   →  flat area           →  0
-/// Branchless SIMD-friendly: uses only compare/select/shift.
+/// Branchless priority encoder: arithmetic select without `if`.
+/// Values are ordered by descending priority:
+///   g≥4 & d≥4 → 192 (extremely strong)
+///   g≥2 & d≥2 → 128 (strong)
+///   g≥1 & d≥1 → 64  (medium)
+///   else      → 0   (flat)
 #[inline(always)]
 fn edge_refine_weight(grad: u32, diff: u32) -> u32 {
     let g = grad >> 3;
     let d = diff >> 3;
-    // Only pull back VERY strong edges where halos are visible.
-    // Medium edges are left for the USM to enhance → more perceived sharpness.
-    if g >= 4 && d >= 4 { 192 }       // extremely strong → 75% pullback
-    else if g >= 2 && d >= 2 { 128 }  // strong edges → 50% pullback
-    else if g >= 1 && d >= 1 { 64 }   // medium edges → 25% pullback (light)
-    else { 0 }                         // weak/flat → no pullback, USM handles it
+    let c3 = ((g >= 4) as u32) & ((d >= 4) as u32);
+    let c2 = ((g >= 2) as u32) & ((d >= 2) as u32);
+    let c1 = ((g >= 1) as u32) & ((d >= 1) as u32);
+    // Priority: c3 > c2 > c1.  Arithmetic select avoids branches.
+    c3 * 192 + c2 * (1 - c3) * 128 + c1 * (1 - c3) * (1 - c2) * 64
+}
+
+/// Merged per-pixel enhancement tables — co-located in memory for cache efficiency.
+/// All tables are 256-entry indexed by u8 pixel values.
+#[repr(C)]
+struct EnhanceTables {
+    /// |Y-blur| → blend weight [0, 128]. Flat areas smoothed toward blur.
+    denoise:      [u8;  256],
+    /// edge_refine_weight → contrast boost [0, 32] (Q5).
+    edge_boost:   [u8;  256],
+    /// |diff| → non-linear gain (Q8). Feature Self-Transform quadratic mapping.
+    nonlinear:    [u16; 256],
+    /// Y → Q8 amount multiplier [128, 512]. Midtones peak at 2.0×.
+    midtone:      [u16; 256],
+    /// Y_in → Y_out S-curve (fallback kept for validation; branchless path preferred).
+    tone_curve:   [u8;  256],
+}
+
+/// Branchless S-curve tone mapping: arithmetic computation, no table lookup.
+/// Lifts shadows up to +6, compresses highlights down to -4, midtones pass through.
+/// Same output as `build_tone_curve()` but executable in any context (no table needed).
+#[inline(always)]
+fn tone_curve_branchless(v: u8) -> u8 {
+    let v = v as u32;
+    let lift = (64u32.saturating_sub(v)) * 6 / 64;   // +6 at v=0, 0 at v>=64
+    let comp = v.saturating_sub(191) * 4 / 64;        // 0 at v<=191, -4 at v=255
+    (v + lift - comp) as u8
 }
 
 /// Edge contrast boost table: edge_refine_weight → boost amount [0, 32] (Q5).
@@ -975,7 +1060,6 @@ const fn build_edge_boost_table() -> [u8; 256] {
     }
     t
 }
-const EDGE_BOOST_TABLE: [u8; 256] = build_edge_boost_table();
 
 /// Spatial denoise weight table: |Y-blur| → blend weight [0, 128].
 ///
@@ -997,7 +1081,6 @@ const fn build_denoise_table() -> [u8; 256] {
     }
     t
 }
-const DENOISE_TABLE: [u8; 256] = build_denoise_table();
 
 /// Non-linear gain table replacing the linear local_q8.
 ///
@@ -1025,7 +1108,6 @@ const fn build_nonlinear_table() -> [u16; 256] {
     }
     t
 }
-const NONLINEAR_TABLE: [u16; 256] = build_nonlinear_table();
 
 /// Global luminance boost table: avg_y → Q8 multiplier [128, 448].
 ///
@@ -1075,7 +1157,6 @@ const fn build_midtone_table() -> [u16; 256] {
     }
     t
 }
-const MIDTONE_TABLE: [u16; 256] = build_midtone_table();
 
 /// Photographic S-curve tone mapping table: Y_in → Y_out [0, 255].
 ///
@@ -1101,7 +1182,117 @@ const fn build_tone_curve() -> [u8; 256] {
     }
     t
 }
-const TONE_CURVE: [u8; 256] = build_tone_curve();
+
+const ENHANCE_TABLES: EnhanceTables = EnhanceTables {
+    denoise:    build_denoise_table(),
+    edge_boost: build_edge_boost_table(),
+    nonlinear:  build_nonlinear_table(),
+    midtone:    build_midtone_table(),
+    tone_curve: build_tone_curve(),
+};
+
+// ── SIMD enhancement helpers (i16x8, 8 pixels per batch) ──────────────
+
+/// SIMD priority encoder: (grad, raw_diff) → weight {0, 64, 128, 192}.
+#[inline(always)]
+fn edge_refine_weight_simd(grad: i16x8, raw_diff: i16x8) -> i16x8 {
+    let g = grad >> 3_i32;
+    let d = raw_diff >> 3_i32;
+    let s4 = i16x8::splat(4);
+    let s2 = i16x8::splat(2);
+    let s1 = i16x8::splat(1);
+    let c3 = g.simd_ge(s4) & d.simd_ge(s4);
+    let c2 = g.simd_ge(s2) & d.simd_ge(s2);
+    let c1 = g.simd_ge(s1) & d.simd_ge(s1);
+    let nc3 = !c3;
+    let nc2 = !c2;
+    (c3 & i16x8::splat(192))
+        | (nc3 & c2 & i16x8::splat(128))
+        | (nc3 & nc2 & c1 & i16x8::splat(64))
+}
+
+/// SIMD texture adaptation: (prev_abs_diff, abs_diff) → Q8 multiplier {192, 256}.
+#[inline(always)]
+fn texture_weight_simd(prev: i16x8, curr: i16x8) -> i16x8 {
+    let mx = prev.max(curr);
+    let mn = prev.min(curr);
+    let c = mx.simd_ge(i16x8::splat(8)) & mn.simd_ge(mx >> 1_i32);
+    i16x8::splat(256) - (c & i16x8::splat(64))
+}
+
+/// SIMD edge boost: weight {0,64,128,192} → boost {0,10,32,0}.
+#[inline(always)]
+fn edge_boost_simd(w: i16x8) -> i16x8 {
+    let c64 = w.simd_eq(i16x8::splat(64));
+    let c128 = w.simd_eq(i16x8::splat(128));
+    (c64 & i16x8::splat(10)) | (c128 & i16x8::splat(32))
+}
+
+/// SIMD non-linear gain: |diff| → Q8 gain [0, 512].
+/// 5 segments matched to `build_nonlinear_table()`.
+/// SAFETY: All multiplications verified safe in i16 (max 222×128=28416 < 32767).
+#[inline(always)]
+fn nonlinear_gain_simd(d: i16x8) -> i16x8 {
+    let z = i16x8::splat(0);
+    // Segment 2: d ∈ [1, 2] → gain = 32×d
+    let s2_pred = d.simd_ge(i16x8::splat(1)) & d.simd_le(i16x8::splat(2));
+    let s2_val = d * i16x8::splat(32);
+    // Segment 3: d ∈ [3, 5] → gain = 128 + (d-3)×43
+    let s3_pred = d.simd_ge(i16x8::splat(3)) & d.simd_le(i16x8::splat(5));
+    let s3_val = i16x8::splat(128) + (d - i16x8::splat(3)) * i16x8::splat(43);
+    // Segment 4: d ∈ [6, 10] → gain = 256 + (d-6)×51, clamp 512
+    let s4_pred = d.simd_ge(i16x8::splat(6)) & d.simd_le(i16x8::splat(10));
+    let s4_val = (i16x8::splat(256) + (d - i16x8::splat(6)) * i16x8::splat(51))
+        .min(i16x8::splat(512));
+    // Segment 5: d ∈ [11, 32] → gain = 512 - (d-11)×12
+    let s5_pred = d.simd_ge(i16x8::splat(11)) & d.simd_le(i16x8::splat(32));
+    let s5_val = i16x8::splat(512) - (d - i16x8::splat(11)) * i16x8::splat(12);
+    // Segment 6: d > 32 → gain = 256 - (d-33)×128/223, clamp 128
+    let s6_pred = d.simd_gt(i16x8::splat(32));
+    let s6_val = (i16x8::splat(256)
+        - (d - i16x8::splat(33)) * i16x8::splat(128) / i16x8::splat(223))
+        .max(i16x8::splat(128));
+    // Blend: start with 0, layer each segment (non-overlapping by design)
+    let m2 = s2_pred;
+    let m3 = s3_pred;
+    let m4 = s4_pred;
+    let m5 = s5_pred;
+    let m6 = s6_pred;
+    (z & !m2) | (s2_val & m2)
+        | (s3_val & m3)
+        | (s4_val & m4)
+        | (s5_val & m5)
+        | (s6_val & m6)
+}
+
+/// SIMD midtone clarity boost: Y → Q8 multiplier [128, 512].
+/// 4 segments matched to `build_midtone_table()`.
+/// SAFETY: All multiplications verified safe in i16 (max 255×128=32640 < 32767).
+#[inline(always)]
+fn midtone_gain_simd(v: i16x8) -> i16x8 {
+    // Segment 1: v < 96 → 128 + v×128/96
+    let s1_pred = v.simd_lt(i16x8::splat(96));
+    let s1_val = i16x8::splat(128) + v * i16x8::splat(128) / i16x8::splat(96);
+    // Segment 2: v ∈ [96, 128) → 256 + (v-96)×8
+    let s2_pred = v.simd_ge(i16x8::splat(96)) & v.simd_lt(i16x8::splat(128));
+    let s2_val = i16x8::splat(256) + (v - i16x8::splat(96)) * i16x8::splat(8);
+    // Segment 3: v ∈ [128, 160) → 512 - (v-128)×8
+    let s3_pred = v.simd_ge(i16x8::splat(128)) & v.simd_lt(i16x8::splat(160));
+    let s3_val = i16x8::splat(512) - (v - i16x8::splat(128)) * i16x8::splat(8);
+    // Segment 4: v ≥ 160 → 256 - (v-160)×128/95
+    let s4_pred = v.simd_ge(i16x8::splat(160));
+    let s4_val = i16x8::splat(256) - (v - i16x8::splat(160)) * i16x8::splat(128) / i16x8::splat(95);
+    (s1_val & s1_pred) | (s2_val & s2_pred) | (s3_val & s3_pred) | (s4_val & s4_pred)
+}
+
+/// SIMD tone curve: Y_in → Y_out with shadow lift + highlight compression.
+/// Branchless arithmetic, no table needed.
+#[inline(always)]
+fn tone_curve_simd(v: i16x8) -> i16x8 {
+    let lift = (i16x8::splat(64) - v).max(i16x8::splat(0)) * i16x8::splat(6) / i16x8::splat(64);
+    let comp = (v - i16x8::splat(191)).max(i16x8::splat(0)) * i16x8::splat(4) / i16x8::splat(64);
+    v + lift - comp
+}
 
 /// Apply unsharp mask to the Y (luminance) plane of an I420 frame.
 ///
@@ -1232,61 +1423,237 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
     //  Chroma boost (mean |C - 128| → Q8 multiplier)
     let effective_base = ((effective_base * chroma_boost_q8 + 128) >> 8).min(1023);
 
-    let mut prev_y_refine = y_plane[0];
-    let mut prev_abs_diff = 0u32;
-    let mut col = 0usize;
+    let motion_factor_s = motion_factor as i16;
+    let effective_base_s = effective_base as i16;
     let mut total_adj: u64 = 0;
 
-    for i in 0..y_size {
-        let y = y_plane[i] as u32;
-        let b = blur_copy[i] as u32;
-        let raw_diff = (y as i32 - b as i32).unsigned_abs();
+    let mf_v = i16x8::splat(motion_factor_s);
+    let eb_v = i16x8::splat(effective_base_s);
 
-        // ── Denoise: blend Y→blur in flat areas ──
-        let w_d = DENOISE_TABLE[raw_diff.min(255) as usize] as u32;
-        let y2 = (y * (256 - w_d) + b * w_d + 128) >> 8;
+    // Function-level SIMD constants (created once per frame, not per row)
+    let z = i16x8::splat(0);
+    let o = i16x8::splat(1);
+    let s16 = i16x8::splat(16);
+    let s128 = i16x8::splat(128);
+    let s255 = i16x8::splat(255);
+    let s256 = i16x8::splat(256);
+    let s1023 = i16x8::splat(1023);
+    let s128_i32 = i32x8::splat(128);
 
-        // ── Edge refine: blend blur→Y at edges ──
-        // Gradient: max(horizontal, vertical) for better halo suppression.
-        // Horizontal uses prev_y_refine (y2 of left neighbor).  Vertical uses
-        // the pixel above (y_plane[i-w], which contains final_y from prev row
-        // — close enough to y2 for edge detection).
-        let hgrad = (y2 as i32 - prev_y_refine as i32).unsigned_abs();
-        let vgrad = if i >= w {
-            (y2 as i32 - y_plane[i - w] as i32).unsigned_abs()
-        } else { 0 };
-        let grad = hgrad.max(vgrad);
-        prev_y_refine = y2 as u8;
-        let weight = edge_refine_weight(grad, raw_diff);
-        let blended = (b * (256 - weight) + y2 * weight + 128) >> 8;
-        let boost = EDGE_BOOST_TABLE[weight as usize] as u32;
-        let edge_diff = (y2 as i32 - blended as i32) as i32;
-        let boosted = (blended as i32 + ((edge_diff * boost as i32 + 16) >> 5))
-            .clamp(0, 255) as u8;
+    // ── SIMD: row-at-a-time, 8 pixels per i16x8 batch ──
+    // Process each row independently so vgrad reads from the correct
+    // previous-row y_plane and prev_abs_diff resets at row boundaries.
+    for row in 0..h {
+        let row_start = row * w;
+        // carry_y2 for hgrad: first pixel uses last pixel of previous row
+        let carry_in: i16 = if row == 0 {
+            y_plane[0] as i16
+        } else {
+            // Previous row's last pixel (y_plane[row_start-1] = final_y of prev row)
+            y_plane[row_start - 1] as i16
+        };
+        let mut carry_y2 = carry_in;
+        let mut carry_abs_diff: i16 = 0;  // resets at row start
 
-        // ── USM: sharpen difference between y2 (source) and boosted (blur) ──
-        let diff = y2 as i32 - boosted as i32;
-        let abs_diff = diff.unsigned_abs();
-        let nonlinear_gain = NONLINEAR_TABLE[abs_diff as usize] as i32;
-        let texture_q8 = texture_weight(prev_abs_diff, abs_diff);
-        let combined_q8 = (motion_factor * texture_q8 + 128) >> 8;
-        let amount = ((effective_base * combined_q8 + 128) >> 8).min(1023);
-        let midtone_q8 = MIDTONE_TABLE[y2 as usize] as u32;
-        let amount = ((amount * midtone_q8 + 128) >> 8).min(1023);
-        let adj = (((diff * nonlinear_gain + 128) >> 8) * amount as i32 + 128) >> 8;
-        total_adj += adj.unsigned_abs() as u64;
-        let enhanced = ((y2 as i32 + adj).clamp(0, 255)) as u8;
-        // Adaptive tone curve: skip S-curve at strong edges (grad >= 16)
-        // to preserve text/screen content contrast (whites stay white, blacks stay black).
-        let final_y = if grad >= 16 { enhanced } else { TONE_CURVE[enhanced as usize] };
+        // ── SIMD: process 8-pixel chunks ──
+        // ═══════════════════════════════════════════════════════════════════
+        // i16 OVERFLOW SAFETY AUDIT (2026-07-09)
+        // All i16 multiplications are categorized below.  The i16 range is
+        // [-32768, 32767].  Any product exceeding this wraps silently in
+        // release mode, causing black-pixel flickering in white areas.
+        //
+        // Protected by mul_widen → i32x8 (safe for any u8×u8 product):
+        //   [1] y_v * (256 - w_d)    max 255×256 = 65280     — denoise blend
+        //   [2] b_v * w_d            max 255×128 = 32640     — denoise blend
+        //   [3] b_v * (256 - weight) max 255×256 = 65280     — edge blend
+        //   [4] y2 * weight          max 255×192 = 48960     — edge blend
+        //   [5] mf × texture_q8      max 255×256 = 65280     — combined_q8
+        //   [6] eb × combined_q8     max 1023×255 = 260865   — amount (2×)
+        //   [7] amount × midtone_q8  max 1023×512 = 523776   — amount update
+        //   [8] diff × nonlinear     max 255×512 = 130560    — adj_a
+        //   [9] adj_a × amount       max 511×1023 = 522753   — adj
+        //
+        // Verified safe in i16 (max product < 32767):
+        //   [A] (edge_diff * boost)  max 255×32 = 8160       — boosted
+        //   [B] nonlinear_gain_simd  max 222×128 = 28416     — piecewise
+        //   [C] midtone_gain_simd    max 255×128 = 32640     — piecewise
+        //   [D] tone_curve_simd       max 64×6 = 384         — S-curve
+        //   [E] (o - raw_dc) * 128   max 1×128 = 128         — denoise weight
+        //   [F] texture_weight       no multiplication       — cmp/select only
+        //   [G] edge_refine_weight   no multiplication       — cmp/select only
+        //   [H] edge_boost           no multiplication       — cmp/select only
+        // ═══════════════════════════════════════════════════════════════════
+        let simd_limit = row_start + (w & !7);
+        let mut chunk = row_start;
+        while chunk < simd_limit {
+            // ── SIMD load + widen: u8 → i16x8 via u8x16 + from_u8x16_low ──
+            // On ARM NEON: vld1q_u8 (from aligned stack) + uxtl = 2 insns, 8 pixels.
+            // The u8x16::new(buf) is a compile-time transmute; the real work
+            // is the 8-byte copy_from_slice which LLVM widens to a single ldr/str.
+            let mut u8_buf = [0u8; 16];
+            u8_buf[..8].copy_from_slice(&y_plane[chunk..chunk + 8]);
+            let y_v = i16x8::from_u8x16_low(u8x16::new(u8_buf));
 
-        y_plane[i] = final_y;
-        prev[i] = final_y;
+            u8_buf[..8].copy_from_slice(&blur_copy[chunk..chunk + 8]);
+            let b_v = i16x8::from_u8x16_low(u8x16::new(u8_buf));
 
-        prev_abs_diff = if col > 0 { abs_diff } else { 0 };
-        col = if col + 1 < w { col + 1 } else { 0 };
+            // Above-row for vgrad (pre-compute to avoid duplication)
+            let above_v = if row > 0 {
+                u8_buf[..8].copy_from_slice(&y_plane[chunk - w..chunk - w + 8]);
+                i16x8::from_u8x16_low(u8x16::new(u8_buf))
+            } else {
+                z  // first row: vgrad = 0
+            };
+
+            // raw_diff = |y - b|
+            let raw_diff = (y_v - b_v).abs();            // ── Denoise: blend Y→blur in flat areas ──
+            let raw_dc = raw_diff.min(o);
+            let w_d = (o - raw_dc) * s128;
+            let y2 = i16x8::from_i32x8_saturate(
+                (y_v.mul_widen(s256 - w_d) + b_v.mul_widen(w_d) + s128_i32) >> 8_i32
+            );
+
+            // ── Edge refine ──
+            let y2_arr = y2.to_array();
+            // Shifted-lane trick: hgrad[j] = |y2_j - y2_{j-1}|
+            let shifted_y2 = i16x8::new([
+                carry_y2, y2_arr[0], y2_arr[1], y2_arr[2],
+                y2_arr[3], y2_arr[4], y2_arr[5], y2_arr[6],
+            ]);
+            carry_y2 = y2_arr[7];
+            let hgrad = (y2 - shifted_y2).abs();
+
+            // vgrad: zero for first row, |y2 - above| for rest
+            let vgrad = if row == 0 { z } else { (y2 - above_v).abs() };
+            let grad = hgrad.max(vgrad);
+
+            let weight = edge_refine_weight_simd(grad, raw_diff);
+
+            // blended = blend(b, y2, weight) — safe via i32x8 widen
+            let blended = i16x8::from_i32x8_saturate(
+                (b_v.mul_widen(s256 - weight) + y2.mul_widen(weight) + s128_i32) >> 8_i32
+            );
+
+            // Edge boost
+            let boost = edge_boost_simd(weight);
+            let edge_diff = y2 - blended;
+            let boosted = (blended + ((edge_diff * boost + s16) >> 5_i32))
+                .max(z)
+                .min(s255);
+
+            // ── USM ──
+            let diff = y2 - boosted;
+            let abs_diff = diff.abs();
+            let nonlinear_gain = nonlinear_gain_simd(abs_diff);
+
+            // Texture weight: shifted-lane for prev_abs_diff
+            let ad_arr = abs_diff.to_array();
+            let shifted_ad = i16x8::new([
+                carry_abs_diff, ad_arr[0], ad_arr[1], ad_arr[2],
+                ad_arr[3], ad_arr[4], ad_arr[5], ad_arr[6],
+            ]);
+            carry_abs_diff = ad_arr[7];
+            let texture_q8 = texture_weight_simd(shifted_ad, abs_diff);
+
+            // ── Overflow-safe multiplications via i32x8 widening ──
+            // combined_q8 = (motion_factor × texture_q8 + 128) >> 8
+            let combined_q8 = i16x8::from_i32x8_saturate(
+                (mf_v.mul_widen(texture_q8) + s128_i32) >> 8_i32
+            );
+
+            // amount = ((effective_base × combined_q8 + 128) >> 8).min(1023)
+            let amount = i16x8::from_i32x8_saturate(
+                (eb_v.mul_widen(combined_q8) + s128_i32) >> 8_i32
+            ).min(s1023);
+
+            // amount = ((amount × midtone_q8 + 128) >> 8).min(1023)
+            let midtone_q8 = midtone_gain_simd(y2);
+            let amount = i16x8::from_i32x8_saturate(
+                (amount.mul_widen(midtone_q8) + s128_i32) >> 8_i32
+            ).min(s1023);
+
+            // adj_a = (diff × nonlinear_gain + 128) >> 8
+            let adj_a = i16x8::from_i32x8_saturate(
+                (diff.mul_widen(nonlinear_gain) + s128_i32) >> 8_i32
+            );
+
+            // adj = (adj_a × amount + 128) >> 8
+            let adj = i16x8::from_i32x8_saturate(
+                (adj_a.mul_widen(amount) + s128_i32) >> 8_i32
+            );
+
+            // Accumulate |adj| for chroma saturation boost
+            let adj_arr = adj.to_array();
+            for &a in &adj_arr {
+                total_adj += a.unsigned_abs() as u64;
+            }
+
+            let enhanced = (y2 + adj).max(z).min(s255);
+
+            // Tone curve with XOR select for grad >= 16 bypass
+            let curve_val = tone_curve_simd(enhanced);
+            let grad_mask = grad.simd_ge(i16x8::splat(16));
+            // grad_mask: 0xFFFF for true, 0x0000 for false
+            let final_y = enhanced ^ (grad_mask & (enhanced ^ curve_val));
+
+            // Store 8 pixels
+            let f_arr = final_y.to_array();
+            for j in 0..8 {
+                let fv = f_arr[j] as u8;
+                y_plane[chunk + j] = fv;
+                prev[chunk + j] = fv;
+            }
+
+            chunk += 8;
+        }
+
+        // ── Scalar tail: remaining < 8 pixels in this row ──
+        for j in chunk..row_start + w {
+            let i = j;
+            let y = y_plane[i] as u32;
+            let b = blur_copy[i] as u32;
+            let raw_diff = (y as i32 - b as i32).unsigned_abs();
+
+            // ── Denoise ──
+            let w_d = ENHANCE_TABLES.denoise[raw_diff.min(255) as usize] as u32;
+            let y2 = (y * (256 - w_d) + b * w_d + 128) >> 8;
+
+            // ── Edge refine ──
+            let hgrad = (y2 as i32 - carry_y2 as i32).unsigned_abs();
+            let v_neighbor = if row > 0 { y_plane[i - w] as u32 } else { 0 };
+            let vgrad = (row > 0) as u32 * (y2 as i32 - v_neighbor as i32).unsigned_abs();
+            let grad = hgrad.max(vgrad);
+            carry_y2 = y2 as i16;
+
+            let weight = edge_refine_weight(grad, raw_diff);
+            let blended = (b * (256 - weight) + y2 * weight + 128) >> 8;
+            let boost = ENHANCE_TABLES.edge_boost[weight as usize] as u32;
+            let edge_diff = (y2 as i32 - blended as i32) as i32;
+            let boosted = (blended as i32 + ((edge_diff * boost as i32 + 16) >> 5))
+                .clamp(0, 255) as u8;
+
+            // ── USM ──
+            let diff = y2 as i32 - boosted as i32;
+            let abs_diff = diff.unsigned_abs();
+            let nonlinear_gain = ENHANCE_TABLES.nonlinear[abs_diff as usize] as i32;
+            let texture_q8 = texture_weight(carry_abs_diff as u32, abs_diff);
+            carry_abs_diff = abs_diff as i16;
+            let combined_q8 = (motion_factor * texture_q8 + 128) >> 8;
+            let amount = ((effective_base * combined_q8 + 128) >> 8).min(1023);
+            let midtone_q8 = ENHANCE_TABLES.midtone[y2 as usize] as u32;
+            let amount = ((amount * midtone_q8 + 128) >> 8).min(1023);
+            let adj = (((diff * nonlinear_gain + 128) >> 8) * amount as i32 + 128) >> 8;
+            total_adj += adj.unsigned_abs() as u64;
+            let enhanced = ((y2 as i32 + adj).clamp(0, 255)) as u8;
+
+            let curve_val = tone_curve_branchless(enhanced);
+            let mask = ((grad >= 16) as u8).wrapping_sub(1);
+            let final_y = enhanced ^ (mask & (enhanced ^ curve_val));
+
+            y_plane[i] = final_y;
+            prev[i] = final_y;
+        }
     }
-    // ── prev is updated in-loop above, no separate copy_from_slice needed ──
 
     // ── 4.  Chroma saturation boost (every 8 frames, tied to chroma_tick) ──
     // When USM enhances luma detail, chroma feels desaturated by comparison.
@@ -2438,6 +2805,30 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let yuv_tx_cap = yuv_tx.clone();
     let frame_size = (out_w * out_h * 3 / 2) as usize;
 
+    // I420 buffer pool: wraps a Vec<u8> and auto-returns to pool on Bytes drop.
+    // Used with Bytes::from_owner() for zero-copy capture→encode.
+    struct PooledBuf {
+        buf: Vec<u8>,
+        pool: Arc<crossbeam_queue::ArrayQueue<Vec<u8>>>,
+    }
+    impl AsRef<[u8]> for PooledBuf {
+        fn as_ref(&self) -> &[u8] { self.buf.as_ref() }
+    }
+    impl Drop for PooledBuf {
+        fn drop(&mut self) {
+            let mut buf = std::mem::take(&mut self.buf);
+            buf.clear();
+            self.pool.push(buf).ok();
+        }
+    }
+
+    // Pre-allocate 3 Vecs: channel depth 2 + 1 in-use guarantees the capture
+    // thread never blocks on allocation while the encoder is two frames ahead.
+    let pool: Arc<crossbeam_queue::ArrayQueue<Vec<u8>>> = Arc::new(crossbeam_queue::ArrayQueue::new(3));
+    for _ in 0..3 {
+        pool.push(Vec::with_capacity(frame_size)).ok();
+    }
+
     // ── Stage 1: Capture + Convert (spawn_blocking) ──
     tasks.spawn_blocking(move || {
         let mut last_raw: Option<Bytes> = None;
@@ -2449,13 +2840,16 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
             let frame_start = std::time::Instant::now();
 
-            // Allocate I420 buffer — Vec::with_capacity + set_len avoids unnecessary
-            // zero-initialization (capture_to_i420 fills every byte via libyuv).
-            // Bytes::from takes ownership zero-copy for downstream.
-            let mut i420 = Vec::with_capacity(frame_size);
-            // SAFETY: capture_to_i420 fills every byte through with_resize_uninit
-            // (clear → set_len → libyuv write). No byte is read before being written.
-            unsafe { i420.set_len(frame_size); }
+            // Pop a pre-allocated buffer from the pool; fall back to fresh
+            // allocation only if the pool is empty (should not happen at
+            // steady state).
+            let mut i420 = pool.pop().unwrap_or_else(|| Vec::with_capacity(frame_size));
+            // Pre-size the Vec so the prev-seed read below is valid.
+            // The pool Vec has len=0 (cleared before push); set_len makes the
+            // slice accessible. capture_to_i420 will re-size via with_resize_uninit.
+            if i420.len() < frame_size {
+                unsafe { i420.set_len(frame_size); }
+            }
 
             // Ensure tmp_argb is sized as [blur_copy | prev] for MAD fusion
             let y_size = (out_w * out_h) as usize;
@@ -2474,6 +2868,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 needs_scaling, blur_copy, prev) {
                 Err(e) => {
                     log::info!("[capture] error: {:#}, repeating last frame", e);
+                    // Return the failed buffer to pool (it was never filled)
+                    i420.clear();
+                    pool.push(i420).ok();
                     if let Some(ref last) = last_raw {
                         if let Err(e) = yuv_tx_cap.try_send(last.clone()) {
                             if matches!(e, block_mpsc::TrySendError::Disconnected(_)) {
@@ -2503,12 +2900,17 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                             mad_sum, tv_sum, luma_sum,
                         );
                     }
-                    // Zero-copy: Vec -> Bytes (takes ownership of Vec allocation)
-                    let frame = Bytes::from(i420);
-                    last_raw = Some(frame.clone());
+                    // Zero-copy: Bytes::from_owner wraps the pool Vec so that
+                    // when the encoder drops the last Bytes reference, the Vec
+                    // is automatically returned to the pool via PooledBuf::drop.
+                    let pool_clone = pool.clone();
+                    let frame = Bytes::from_owner(PooledBuf { buf: i420, pool: pool_clone });
+                    last_raw = Some(frame.clone());  // cheap Arc increment
                     if let Err(e) = yuv_tx_cap.try_send(frame) {
                         match e {
                             block_mpsc::TrySendError::Full(_) => {
+                                // frame dropped — Bytes::drop → PooledBuf::drop
+                                // will return the Vec to pool automatically
                                 log::trace!("[capture] dropping frame (channel full)");
                                 std::thread::sleep(std::time::Duration::from_millis(5));
                             }
