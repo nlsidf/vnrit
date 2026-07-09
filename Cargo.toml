@@ -1,6 +1,6 @@
 [package]
 name = "vnrit"
-version = "0.2.19"
+version = "0.2.20"
 edition = "2024"
 description = "Lightweight X11 desktop WebRTC streaming server (pure Rust, no GStreamer)"
 license = "Apache-2.0"  
@@ -29,11 +29,11 @@ x11rb = { version = "0.13", features = ["xtest", "allow-unsafe-code", "shm", "xi
 x11rb-protocol = "0.13"
 
 # WebRTC pure Rust stack
-webrtc = "0.20.0-rc.1"
-rtc = "0.20.0-rc.1"
-rtc-media = "0.20.0-rc.1"
+webrtc = "0.20.0-rc.2"
+rtc = "0.20.0-rc.2"
+rtc-media = "0.20.0-rc.2"
 # ICE network types for TCP-only mode
-ice = { package = "rtc-ice", version = "0.20.0-rc.1" }
+ice = { package = "rtc-ice", version = "0.20.0-rc.2" }
 
 # async-trait for PeerConnectionEventHandler
 async-trait = "0.1"
@@ -61,6 +61,12 @@ libc = "0.2"
 
 # Lock-free memory pool for pipeline buffers
 crossbeam-queue = "0.3"
+
+# Data-parallelism for row-independent scaling passes
+rayon = "1"
+
+# SIMD vector types for inner-loop acceleration (i32x4, f32x4, etc.)
+wide = "1"
 
 # WebSocket compression (deflate, application-level)
 flate2 = "1.0"

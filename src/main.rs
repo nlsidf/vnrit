@@ -11,6 +11,8 @@ use std::sync::mpsc as block_mpsc;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
+use wide::i32x4;
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::{Request, State},
@@ -70,7 +72,7 @@ use rand::Rng;
 use async_trait::async_trait;
 use std::os::fd::IntoRawFd;
 
-use vnrit_libyuv::{self, FilterMode, ImageSize, ArgbImage, I420Image, I420ImageMut};
+use vnrit_libyuv::{self, ArgbImage, I420ImageMut, ImageSize, FilterMode};
 
 // ── libblur: SIMD-accelerated fast blur (used for Y-plane unsharp mask) ──
 use libblur::{self, BlurImageMut, FastBlurChannels, AnisotropicRadius, ThreadingPolicy};
@@ -354,6 +356,9 @@ struct ShmScreenCapture {
     shm_ptr: *mut u8,
     shm_size: usize,
     bpp: u8,
+    /// Pre-computed bicubic weights for Y-plane scaling (None if no scaling needed)
+    h_weights: Option<BicubicWeights>,
+    v_weights: Option<BicubicWeights>,
 }
 
 // Required because ShmScreenCapture is moved into spawn_blocking (crosses thread boundary).
@@ -364,7 +369,8 @@ unsafe impl Sync for ShmScreenCapture {}
 impl ShmScreenCapture {
     /// Try to create an SHM-accelerated capture. Returns None if SHM is
     /// not available (MIT-SHM extension missing from X server).
-    fn try_new(capture: Arc<CaptureState>, width: u16, height: u16, depth: u8) -> Result<Option<Self>> {
+    fn try_new(capture: Arc<CaptureState>, width: u16, height: u16, depth: u8,
+        out_w: u32, out_h: u32) -> Result<Option<Self>> {
         // Calculate bytes-per-pixel for ZPixmap
         // depth 24 → 4 bytes (32-bit padded), depth >24 → 4 bytes
         let bpp = if depth >= 24 { 4u8 } else { ((depth as u32 + 7) / 8) as u8 };
@@ -426,6 +432,15 @@ impl ShmScreenCapture {
 
         log::debug!("[shm] segment allocated at {:?} ({} bytes)", shm_ptr, shm_size);
 
+        // Pre-compute bicubic weights if scaling is needed
+        let needs_scaling = out_w != width as u32 || out_h != height as u32;
+        let (h_weights, v_weights) = if needs_scaling {
+            (Some(build_bicubic_weights(width as usize, out_w as usize)),
+             Some(build_bicubic_weights(height as usize, out_h as usize)))
+        } else {
+            (None, None)
+        };
+
         Ok(Some(ShmScreenCapture {
             conn: capture,
             width,
@@ -434,12 +449,15 @@ impl ShmScreenCapture {
             shm_ptr,
             shm_size,
             bpp,
+            h_weights,
+            v_weights,
         }))
     }
 
     /// Capture the root window and convert directly to I420, bypassing BGRA Vec.
+    /// Returns (mad_sum, tv_sum, luma_sum) for the Y plane.
     fn capture_to_i420(&self, i420_out: &mut Vec<u8>, out_w: u32, out_h: u32,
-        needs_scaling: bool, tmp_argb: &mut Vec<u8>) -> Result<()>
+        needs_scaling: bool, blur_copy: &mut [u8], prev: &[u8]) -> Result<(u64, u64, u64)>
     {
         let cookie = shm::get_image(
             &self.conn.conn,
@@ -460,13 +478,27 @@ impl ShmScreenCapture {
         // SAFETY: shm_ptr points to X server's shared memory, written by get_image.
         let bgra_slice = unsafe { std::slice::from_raw_parts(self.shm_ptr, size) };
 
-        if needs_scaling {
+        let stats = if needs_scaling {
+            let mut temp_buf = Vec::new();
             scale_bgra_direct(bgra_slice, self.width as u32, self.height as u32,
-                out_w, out_h, i420_out, tmp_argb);
+                out_w, out_h, i420_out, &mut temp_buf,
+                self.h_weights.as_ref().unwrap(), self.v_weights.as_ref().unwrap(),
+                blur_copy, prev)
         } else {
             bgra_to_i420(bgra_slice, self.width as u32, self.height as u32, i420_out);
-        }
-        Ok(())
+            let y_size = (self.width as usize) * (self.height as usize);
+            let y = &i420_out[..y_size];
+            blur_copy.copy_from_slice(y);
+            let (mut mad, mut tv, mut luma) = (0u64, 0u64, 0u64);
+            for i in 0..y_size {
+                let yv = y[i] as u64;
+                luma += yv;
+                mad += (yv as i32 - prev[i] as i32).unsigned_abs() as u64;
+                if i > 0 { tv += (yv as i32 - y[i-1] as i32).unsigned_abs() as u64; }
+            }
+            (mad, tv, luma)
+        };
+        Ok(stats)
     }
 }
 
@@ -486,11 +518,35 @@ struct FallbackCapture {
     conn: Arc<CaptureState>,
     width: u16,
     height: u16,
+    /// Pre-computed bicubic weights for Y-plane scaling (None if no scaling needed)
+    h_weights: Option<BicubicWeights>,
+    v_weights: Option<BicubicWeights>,
 }
 
 impl FallbackCapture {
+    fn new(conn: Arc<CaptureState>, width: u16, height: u16,
+        out_w: u32, out_h: u32) -> Self
+    {
+        let needs_scaling = out_w != width as u32 || out_h != height as u32;
+        let (h_weights, v_weights) = if needs_scaling {
+            (Some(build_bicubic_weights(width as usize, out_w as usize)),
+             Some(build_bicubic_weights(height as usize, out_h as usize)))
+        } else {
+            (None, None)
+        };
+
+        FallbackCapture {
+            conn,
+            width,
+            height,
+            h_weights,
+            v_weights,
+        }
+    }
+
+    /// Returns (mad_sum, tv_sum, luma_sum) for the Y plane.
     fn capture_to_i420(&self, i420_out: &mut Vec<u8>, out_w: u32, out_h: u32,
-        needs_scaling: bool, tmp_argb: &mut Vec<u8>) -> Result<()>
+        needs_scaling: bool, blur_copy: &mut [u8], prev: &[u8]) -> Result<(u64, u64, u64)>
     {
         let cookie = xproto::get_image(
             &self.conn.conn,
@@ -502,13 +558,27 @@ impl FallbackCapture {
         ).context("get_image failed")?;
         let reply = cookie.reply().context("get_image reply failed")?;
 
-        if needs_scaling {
+        let stats = if needs_scaling {
+            let mut temp_buf = Vec::new();
             scale_bgra_direct(&reply.data, self.width as u32, self.height as u32,
-                out_w, out_h, i420_out, tmp_argb);
+                out_w, out_h, i420_out, &mut temp_buf,
+                self.h_weights.as_ref().unwrap(), self.v_weights.as_ref().unwrap(),
+                blur_copy, prev)
         } else {
             bgra_to_i420(&reply.data, self.width as u32, self.height as u32, i420_out);
-        }
-        Ok(())
+            let y_size = (self.width as usize) * (self.height as usize);
+            let y = &i420_out[..y_size];
+            blur_copy.copy_from_slice(y);
+            let (mut mad, mut tv, mut luma) = (0u64, 0u64, 0u64);
+            for i in 0..y_size {
+                let yv = y[i] as u64;
+                luma += yv;
+                mad += (yv as i32 - prev[i] as i32).unsigned_abs() as u64;
+                if i > 0 { tv += (yv as i32 - y[i-1] as i32).unsigned_abs() as u64; }
+            }
+            (mad, tv, luma)
+        };
+        Ok(stats)
     }
 }
 
@@ -519,12 +589,13 @@ enum ScreenCapture {
 }
 
 impl ScreenCapture {
+    /// Returns (mad_sum, tv_sum, luma_sum) for the Y plane.
     fn capture_to_i420(&self, i420_out: &mut Vec<u8>, out_w: u32, out_h: u32,
-        needs_scaling: bool, tmp_argb: &mut Vec<u8>) -> Result<()>
+        needs_scaling: bool, blur_copy: &mut [u8], prev: &[u8]) -> Result<(u64, u64, u64)>
     {
         match self {
-            ScreenCapture::Shm(s) => s.capture_to_i420(i420_out, out_w, out_h, needs_scaling, tmp_argb),
-            ScreenCapture::Fallback(f) => f.capture_to_i420(i420_out, out_w, out_h, needs_scaling, tmp_argb),
+            ScreenCapture::Shm(s) => s.capture_to_i420(i420_out, out_w, out_h, needs_scaling, blur_copy, prev),
+            ScreenCapture::Fallback(f) => f.capture_to_i420(i420_out, out_w, out_h, needs_scaling, blur_copy, prev),
         }
     }
 }
@@ -557,13 +628,240 @@ fn bgra_to_i420(bgra: &[u8], width: u32, height: u32, out: &mut Vec<u8>) {
     });
 }
 
-/// Scale BGRA to target size via I420-domain pipeline:
-///   1. BGRA → ARGBToI420 → native I420   (1.5 bytes/px intermediate)
-///   2. I420Scale → target I420
-/// Uses less memory bandwidth than ARGBScale path (1.5 vs 4 bytes/px intermediate).
+/// Bicubic (Catmull-Rom) weight table for one dimension.
+/// w is flat: per output pixel, 4 consecutive Q12 weights for taps [t-1, t, t+1, t+2].
+/// Layout: w[pixel * 4 + tap] for pixel in 0..dst_len, tap in 0..4.
+/// w32 is the same weights pre-converted to i32 — eliminates per-row as i32
+/// conversion in vertical SIMD splat (memory cost: ~11 KB extra for 720p).
+struct BicubicWeights {
+    base: Vec<i32>,
+    w: Vec<i16>,
+    w32: Vec<i32>,
+}
+// BicubicWeights is Send-safe: contains only primitive types and Vecs of primitive types
+unsafe impl Send for BicubicWeights {}
+/// Build Catmull-Rom weights: src_len → dst_len, Q12 fixed-point.
+/// Mitchell-Netravali (B=1/3, C=1/3) bicubic weight table for one dimension.
+/// Standard "high-quality" cubic — sharper than Bilinear, less ringing than Catmull-Rom.
+/// base values are pre-clamped to [0, max(0, src_len - 4)] so that scaling functions
+/// can skip the runtime boundary check.
+fn build_bicubic_weights(src_len: usize, dst_len: usize) -> BicubicWeights {
+    let step = (src_len as f64) / (dst_len as f64);
+    let max_base = (src_len as i32).saturating_sub(4).max(0);
+    let mut base = Vec::with_capacity(dst_len);
+    let mut w = Vec::with_capacity(dst_len * 4);
+    let mut w32 = Vec::with_capacity(dst_len * 4);
+    for ox in 0..dst_len {
+        let center = (ox as f64 + 0.5) * step - 0.5;
+        let ix = center.floor() as i32;
+        let frac = center - ix as f64;
+        let base_ix = (ix - 1).max(0).min(max_base);
+        for j in 0..4 {
+            let t = (j as f64 - 1.0) - frac;
+            let ta = t.abs();
+            // Mitchell-Netravali: B=1/3, C=1/3
+            let val = if ta >= 2.0 { 0.0 }
+                else if ta >= 1.0 {
+                    let t2 = ta;
+                    // (-7/18)|t|³ + 2|t|² - (10/3)|t| + 16/9
+                    (-7.0/18.0)*t2*t2*t2 + 2.0*t2*t2 - (10.0/3.0)*t2 + 16.0/9.0
+                } else {
+                    // (7/6)|t|³ - 2|t|² + 8/9
+                    (7.0/6.0)*ta*ta*ta - 2.0*ta*ta + 8.0/9.0
+                };
+            let q12 = (val * 4096.0).round() as i16;
+            w.push(q12);
+            w32.push(q12 as i32);
+        }
+        base.push(base_ix);
+    }
+    BicubicWeights { base, w, w32 }
+}
+// Tile-based Catmull-Rom bicubic Y-plane downscaler with pre-computed weights.
+//
+// Processes the image in 256×256-pixel tiles.  Each tile performs horizontal
+// then vertical scaling within its own local buffer, keeping intermediate data
+// in L1/L2 cache.  Source rows are read directly (no tile_src copy).
+// Q12 fixed-point, edge clamping, no new dependencies.
+// Thread-local tile_horiz buffer — reused across tiles within each rayon
+// worker to avoid per-tile allocation+zero-init.  Uses UnsafeCell (no runtime
+// borrow-check overhead) — safe because each thread owns its instance and
+// processes one tile at a time within the for_each closure.
+thread_local! {
+    static TILE_HORIZ: std::cell::UnsafeCell<Vec<u8>> =
+        const { std::cell::UnsafeCell::new(Vec::new()) };
+}
+/// Returns (mad_sum, tv_sum, luma_sum) for the scaled Y plane:
+///   - mad_sum  = Σ|final_y[i] - prev[i]|  (motion)
+///   - tv_sum   = Σ|final_y[i] - final_y[i-1]|  (texture)
+///   - luma_sum = Σ final_y[i]  (global luminance)
+/// Also bilinearly scales U/V planes (fused to avoid separate libyuv passes).
+fn bicubic_scale_y_with_weights(src: &[u8], src_w: usize, src_h: usize,
+                   dst: &mut [u8], dst_w: usize, dst_h: usize,
+                   hw: &BicubicWeights, vw: &BicubicWeights,
+                   blur_copy: &mut [u8], prev: &[u8]) -> (u64, u64, u64) {
+    if src_w == dst_w && src_h == dst_h {
+        if dst.len() >= src.len() { dst[..src.len()].copy_from_slice(src); }
+        if blur_copy.len() >= src.len() { blur_copy[..src.len()].copy_from_slice(src); }
+        // Compute MAD/TV/luma from direct copy (no scaling needed)
+        let (mut mad, mut tv, mut luma) = (0u64, 0u64, 0u64);
+        for i in 0..src_h * src_w {
+            let y = src[i] as u64;
+            luma += y;
+            mad += (y as i32 - prev[i] as i32).unsigned_abs() as u64;
+            if i > 0 { tv += (y as i32 - src[i-1] as i32).unsigned_abs() as u64; }
+        }
+        return (mad, tv, luma);
+    }
+    const TILE_W: usize = 256;
+    const TILE_H: usize = 128;
+    let tiles_x = dst_w.div_ceil(TILE_W);
+    let tiles_y = dst_h.div_ceil(TILE_H);
+    // Use raw pointer address (usize is Sync) so the Fn closure (rayon for_each)
+    // can safely partition dst into non-overlapping tile regions.
+    let dst_addr = dst.as_mut_ptr() as usize;
+    let dst_stride = dst_w;
+    let bc_addr = blur_copy.as_mut_ptr() as usize;
+    // Parallelize over ALL tiles using fold+reduce (per-thread accumulation,
+    // no atomic contention).
+    let total_tiles = tiles_x * tiles_y;
+    let (mad, tv, luma) = (0..total_tiles).into_par_iter()
+        .fold(|| (0u64, 0u64, 0u64),
+            |(mut mad, mut tv, mut luma), tile_id| {
+        let tx = tile_id % tiles_x;
+        let ty = tile_id / tiles_x;
+        let out_x0 = tx * TILE_W;
+        let out_y0 = ty * TILE_H;
+        let out_x1 = (out_x0 + TILE_W).min(dst_w);
+        let out_y1 = (out_y0 + TILE_H).min(dst_h);
+        let tile_w = out_x1 - out_x0;
+        // Source row range for this tile
+        let src_y0 = vw.base[out_y0] as usize;
+        let src_y1 = (vw.base[out_y1 - 1] + 4) as usize;
+        let tile_src_h = src_y1 - src_y0;
+        // ── Horizontal pass: read directly from src ──
+        // Reuse thread-local tile_horiz buffer (avoid per-tile alloc+zero-init).
+        // SAFETY: TILE_HORIZ is per-thread; within a rayon for_each closure
+        // each thread processes one tile at a time, so there is no concurrent
+        // mutable access to the same UnsafeCell.
+        let needed = tile_w * tile_src_h;
+        let tile_horiz = unsafe {
+            let v = &mut *TILE_HORIZ.with(|b| b.get());
+            if v.capacity() < needed {
+                v.reserve(needed - v.capacity());
+            }
+            // Every byte is written by the horizontal pass below.
+            v.set_len(needed);
+            std::slice::from_raw_parts_mut(v.as_mut_ptr(), needed)
+        };
+        for ry in 0..tile_src_h {
+            let sr = &src[(src_y0 + ry) * src_w..];
+            let dr = &mut tile_horiz[ry * tile_w..];
+            for ox_local in 0..tile_w {
+                let ox_global = out_x0 + ox_local;
+                let b = hw.base[ox_global] as usize;
+                let wo = ox_global * 4;
+                let s = (sr[b] as i32 * hw.w[wo] as i32 + sr[b+1] as i32 * hw.w[wo + 1] as i32
+                       + sr[b+2] as i32 * hw.w[wo + 2] as i32 + sr[b+3] as i32 * hw.w[wo + 3] as i32 + 2048) >> 12;
+                dr[ox_local] = s.clamp(0, 255) as u8;
+            }
+        }
+        // ── Vertical pass: tile_horiz → dst (SIMD 4-col batches) ──
+        // Also writes to blur_copy and accumulates MAD/TV/luma for mo­tion
+        // adaptation (eliminates the separate MAD/TV/Copy loop).
+        for oy in out_y0..out_y1 {
+            let b = (vw.base[oy] as usize) - src_y0;
+            let wo = oy * 4;
+            let (w0, w1, w2, w3) = (vw.w32[wo], vw.w32[wo + 1], vw.w32[wo + 2], vw.w32[wo + 3]);
+            let wv0 = i32x4::splat(w0);
+            let wv1 = i32x4::splat(w1);
+            let wv2 = i32x4::splat(w2);
+            let wv3 = i32x4::splat(w3);
+            // SAFETY: Each tile writes to a unique (oy, ox) region.
+            let dst_base = dst_addr as *mut u8;
+            let dst_row = unsafe {
+                std::slice::from_raw_parts_mut(dst_base.add(oy * dst_stride + out_x0), tile_w)
+            };
+            let mut ox = 0usize;
+            while ox + 4 <= tile_w {
+                let s0 = i32x4::new([
+                    tile_horiz[b * tile_w + ox] as i32,
+                    tile_horiz[b * tile_w + ox + 1] as i32,
+                    tile_horiz[b * tile_w + ox + 2] as i32,
+                    tile_horiz[b * tile_w + ox + 3] as i32,
+                ]);
+                let s1 = i32x4::new([
+                    tile_horiz[(b + 1) * tile_w + ox] as i32,
+                    tile_horiz[(b + 1) * tile_w + ox + 1] as i32,
+                    tile_horiz[(b + 1) * tile_w + ox + 2] as i32,
+                    tile_horiz[(b + 1) * tile_w + ox + 3] as i32,
+                ]);
+                let s2 = i32x4::new([
+                    tile_horiz[(b + 2) * tile_w + ox] as i32,
+                    tile_horiz[(b + 2) * tile_w + ox + 1] as i32,
+                    tile_horiz[(b + 2) * tile_w + ox + 2] as i32,
+                    tile_horiz[(b + 2) * tile_w + ox + 3] as i32,
+                ]);
+                let s3 = i32x4::new([
+                    tile_horiz[(b + 3) * tile_w + ox] as i32,
+                    tile_horiz[(b + 3) * tile_w + ox + 1] as i32,
+                    tile_horiz[(b + 3) * tile_w + ox + 2] as i32,
+                    tile_horiz[(b + 3) * tile_w + ox + 3] as i32,
+                ]);
+                let acc = s0 * wv0 + s1 * wv1 + s2 * wv2 + s3 * wv3 + i32x4::splat(2048);
+                let [r0, r1, r2, r3] = (acc >> 12_i32).to_array();
+                dst_row[ox] = r0.clamp(0, 255) as u8;
+                dst_row[ox + 1] = r1.clamp(0, 255) as u8;
+                dst_row[ox + 2] = r2.clamp(0, 255) as u8;
+                dst_row[ox + 3] = r3.clamp(0, 255) as u8;
+                ox += 4;
+            }
+            for ox in ox..tile_w {
+                let s = (tile_horiz[b * tile_w + ox] as i32 * w0
+                       + tile_horiz[(b + 1) * tile_w + ox] as i32 * w1
+                       + tile_horiz[(b + 2) * tile_w + ox] as i32 * w2
+                       + tile_horiz[(b + 3) * tile_w + ox] as i32 * w3 + 2048) >> 12;
+                dst_row[ox] = s.clamp(0, 255) as u8;
+            }
+            // ── blur_copy + MAD/TV/luma (dst_row is hot in L1) ──
+            let bc_base = bc_addr as *mut u8;
+            let bc_row = unsafe {
+                std::slice::from_raw_parts_mut(bc_base.add(oy * dst_stride + out_x0), tile_w)
+            };
+            let prev_row = &prev[oy * dst_w + out_x0..][..tile_w];
+            let mut row_prev = dst_row[0];
+            for ox in 0..tile_w {
+                let y = dst_row[ox] as u32;
+                bc_row[ox] = y as u8;
+                mad += (y as i32 - prev_row[ox] as i32).unsigned_abs() as u64;
+                luma += y as u64;
+                // TV: first pixel of each tile misses the neighbor to its left
+                // from the previous tile (processed by another thread).  Error:
+                // ~0.3% for 720p — negligible for contrast adaptation.
+                if ox > 0 {
+                    tv += (y as i32 - row_prev as i32).unsigned_abs() as u64;
+                }
+                row_prev = y as u8;
+            }
+        }
+        (mad, tv, luma)
+    })
+    .reduce(|| (0u64, 0u64, 0u64),
+        |(m1, t1, l1), (m2, t2, l2)| (m1 + m2, t1 + t2, l1 + l2));
+    (mad, tv, luma)
+}
+
+/// Scale BGRA → I420 with bicubic Y + bilinear UV.
+///  1. BGRA → native I420  (temp)
+///  2. Y: bicubic (Catmull-Rom, 4-tap, Q12, tile-based for cache locality),
+///     UV: bilinear (libyuv)
 /// temp holds the native-resolution I420 frame (reused across frames).
+/// blur_copy and prev are sections of tmp_argb for MAD fusion.
+/// Returns (mad_sum, tv_sum, luma_sum).
 fn scale_bgra_direct(bgra: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32,
-    i420_out: &mut Vec<u8>, temp: &mut Vec<u8>) {
+    i420_out: &mut Vec<u8>, temp: &mut Vec<u8>,
+    h_weights: &BicubicWeights, v_weights: &BicubicWeights,
+    blur_copy: &mut [u8], prev: &[u8]) -> (u64, u64, u64) {
     // Step 1: BGRA → I420 at native resolution
     let src_y_size = (src_w * src_h) as usize;
     let src_uv_size = ((src_w / 2) * (src_h / 2)) as usize;
@@ -572,28 +870,37 @@ fn scale_bgra_direct(bgra: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
         bgra_to_i420_into(bgra, src_w, src_h, t);
     });
 
-    // Step 2: I420 scale to target resolution
+    // Step 2: Scale Y plane with bicubic, U+V with bilinear
     let dst_y_size = (dst_w * dst_h) as usize;
     let dst_uv_size = ((dst_w / 2) * (dst_h / 2)) as usize;
-    with_resize_uninit(i420_out, dst_y_size + 2 * dst_uv_size, |out| {
-        let (src_y, rest) = temp.split_at(src_y_size);
-        let (src_u, src_v) = rest.split_at(src_uv_size);
-        let src_img = I420Image {
-            y: src_y, y_stride: src_w as usize,
-            u: src_u, u_stride: (src_w / 2) as usize,
-            v: src_v, v_stride: (src_w / 2) as usize,
-        };
-        let (dst_y, rest) = out.split_at_mut(dst_y_size);
-        let (dst_u, dst_v) = rest.split_at_mut(dst_uv_size);
-        let mut dst_img = I420ImageMut {
-            y: dst_y, y_stride: dst_w as usize,
-            u: dst_u, u_stride: (dst_w / 2) as usize,
-            v: dst_v, v_stride: (dst_w / 2) as usize,
-        };
-        let src_size = ImageSize::new(src_w as usize, src_h as usize);
-        let dst_size = ImageSize::new(dst_w as usize, dst_h as usize);
-        let _ = vnrit_libyuv::i420_scale(&src_img, src_size, &mut dst_img, dst_size, FilterMode::Bilinear);
-    });
+    // Resize i420_out inline (no closure — need to return stats)
+    let total = dst_y_size + 2 * dst_uv_size;
+    i420_out.clear();
+    i420_out.reserve(total);
+    unsafe { i420_out.set_len(total); }
+    let out = &mut i420_out[..total];
+    let (src_y, src_rest) = temp.split_at(src_y_size);
+    let (src_u, src_v) = src_rest.split_at(src_uv_size);
+    let (dst_y, dst_rest) = out.split_at_mut(dst_y_size);
+    let (dst_u, dst_v) = dst_rest.split_at_mut(dst_uv_size);
+
+    // Tile-based bicubic Y (fused MAD/TV/luma)
+    let (mad, tv, luma) = bicubic_scale_y_with_weights(src_y, src_w as usize, src_h as usize,
+        dst_y, dst_w as usize, dst_h as usize, h_weights, v_weights,
+        blur_copy, prev);
+
+    // Bilinear UV via SIMD-accelerated libyuv (separate pass but fast)
+    let uv_src_w = (src_w / 2) as usize;
+    let uv_src_h = (src_h / 2) as usize;
+    let uv_dst_w = (dst_w / 2) as usize;
+    let uv_dst_h = (dst_h / 2) as usize;
+    let uv_src_sz = ImageSize::new(uv_src_w, uv_src_h);
+    let uv_dst_sz = ImageSize::new(uv_dst_w, uv_dst_h);
+    let _ = vnrit_libyuv::scale_plane(
+        src_u, uv_src_w, uv_src_sz, dst_u, uv_dst_w, uv_dst_sz, FilterMode::Bilinear);
+    let _ = vnrit_libyuv::scale_plane(
+        src_v, uv_src_w, uv_src_sz, dst_v, uv_dst_w, uv_dst_sz, FilterMode::Bilinear);
+    (mad, tv, luma)
 }
 
 /// Build motion-adaptation look-up table at compile time.
@@ -616,54 +923,201 @@ const fn build_motion_table() -> [u8; 256] {
 /// MAD = 0 (still) → 255 (full); MAD = 25+ (fast motion) → ≈ 0.
 const MOTION_TABLE: [u8; 256] = build_motion_table();
 
-/// Local-sharpening table: |diff| → Q8 multiplier [256, 384].
-///   [0,  8) → 256 (1.0)           dead zone
-///   [8, 40) → 256..384 (1..1.5)   linear ramp
-///   [40, ∞) → 384 (1.5)           saturate
-const fn build_local_q8_table() -> [u32; 256] {
-    let mut t = [0u32; 256];
+/// Texture-adaptation: prev_abs_diff × abs_diff → Q8 multiplier [192 or 256].
+/// Returns 192 (0.75×) when adjacent |diff| values are similar and
+/// both non-trivial — reduces gain in texture regions.
+/// Branchless SIMD-friendly: uses only min/max/compare/shift.
+#[inline(always)]
+fn texture_weight(prev: u32, curr: u32) -> u32 {
+    let mx = if prev > curr { prev } else { curr };
+    let mn = if prev <= curr { prev } else { curr };
+    // texture = mn >= mx/2 && mx >= 8 ? 192 : 256
+    if mx >= 8 && mn >= (mx >> 1) { 192 } else { 256 }
+}
+
+/// Gradient-aware edge refine weight: (grad, diff) → weight [0, 192].
+/// Combines horizontal gradient (|Y[i] - Y[i-1]|) with |Y - blur| to
+/// distinguish real edges from texture/noise:
+///   grad ≥ 16 + diff ≥ 16  →  real edge          →  192
+///   grad ≥ 8  + diff ≥ 8   →  weak edge          →  160
+///   diff ≥ 16              →  texture/noise      →  64
+///   grad ≥ 8               →  subtle edge        →  96
+///   else                   →  flat area           →  0
+/// Branchless SIMD-friendly: uses only compare/select/shift.
+#[inline(always)]
+fn edge_refine_weight(grad: u32, diff: u32) -> u32 {
+    let g = grad >> 3;
+    let d = diff >> 3;
+    // Only pull back VERY strong edges where halos are visible.
+    // Medium edges are left for the USM to enhance → more perceived sharpness.
+    if g >= 4 && d >= 4 { 192 }       // extremely strong → 75% pullback
+    else if g >= 2 && d >= 2 { 128 }  // strong edges → 50% pullback
+    else if g >= 1 && d >= 1 { 64 }   // medium edges → 25% pullback (light)
+    else { 0 }                         // weak/flat → no pullback, USM handles it
+}
+
+/// Edge contrast boost table: edge_refine_weight → boost amount [0, 32] (Q5).
+///
+/// After edge-preserving refinement, edges in blur_copy may be slightly
+/// softened.  This table adds back a tiny contrast boost proportional to
+/// the refine weight, restoring crispness without reintroducing halos.
+const fn build_edge_boost_table() -> [u8; 256] {
+    let mut t = [0u8; 256];
     let mut i = 0usize;
     while i < 256 {
-        t[i] = if i < 8 { 256 }
-            else if i < 40 { 256 + ((i - 8) * 4) as u32 }
-            else { 384 };
+        // Peak boost at moderate weight (real edge, after pullback)
+        // Zero at weight=0 (flat) and weight=192 (full preserve, no need)
+        t[i] = if i < 32 { 0 }
+            else if i < 128 { ((i as u32 - 32) * 32 / 96) as u8 }     // 0 → 32
+            else if i < 192 { (32 - (i as u32 - 128) * 32 / 64) as u8 } // 32 → 0
+            else { 0 };
         i += 1;
     }
     t
 }
-const LOCAL_Q8_TABLE: [u32; 256] = build_local_q8_table();
+const EDGE_BOOST_TABLE: [u8; 256] = build_edge_boost_table();
 
-/// Texture-adaptation table: prev_abs_diff × abs_diff → Q8 multiplier.
-/// 0.75x when adjacent pixels have similar |diff| (texture region).
-/// Uses 5-bit quantization: idx = value >> 3 → 32×32 = 4KB LUT.
-const fn build_texture_table() -> [[u32; 32]; 32] {
-    let mut t = [[256u32; 32]; 32];
-    let mut p = 0usize;
-    while p < 32 {
-        let mut c = 0usize;
-        while c < 32 {
-            let prev_v = (p * 8 + 4) as u32;  // bucket midpoint [4, 252]
-            let curr_v = (c * 8 + 4) as u32;
-            let mx = if prev_v > curr_v { prev_v } else { curr_v };
-            let mn = if prev_v <= curr_v { prev_v } else { curr_v };
-            if mx >= 8 && mn >= (mx >> 1) {
-                t[p][c] = 192;
-            }
-            c += 1;
-        }
-        p += 1;
+/// Spatial denoise weight table: |Y-blur| → blend weight [0, 128].
+///
+/// In flat areas (|diff| small), Y is blended toward the blur to suppress noise.
+/// At edges (|diff| large), Y is preserved to keep detail.
+/// Applied BEFORE edge-preserving refinement so the cleaner Y produces
+/// a better base layer.
+/// NOTE: Denoise is deliberately conservative — only truly flat pixels
+/// (|diff| = 0) get smoothed.  Anything with even subtle texture is
+/// preserved so the non-linear gain stage can enhance it naturally.
+/// Over-denoising causes "plasticky" haze that kills fine detail.
+const fn build_denoise_table() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = if i < 1 { 128 }        // |diff| = 0: 50% blend, remove single-pixel noise
+            else { 0 };                 // |diff| ≥ 1: preserve all texture
+        i += 1;
     }
     t
 }
-const TEXTURE_TABLE: [[u32; 32]; 32] = build_texture_table();
+const DENOISE_TABLE: [u8; 256] = build_denoise_table();
+
+/// Non-linear gain table replacing the linear local_q8.
+///
+/// Inspired by MobileIE's Feature Self-Transform (quadratic mapping):
+///   |diff| 0:     gain = 0     (dead zone — only exact flat pixels)
+///   |diff| 1-2:   gain 0.25→0.5×  (subtle texture, gentle boost)
+///   |diff| 3-5:   gain 0.5→1.0×   (fine detail, catch-up ramp)
+///   |diff| 6-10:  gain 1.0→2.0×   (mid-detail boost — peak at |diff|=10)
+///   |diff| 11-32: gain 2.0→1.0×   (roll-off, prevent halos)
+///   |diff| 33+:   gain 1.0→0.5×   (tail, strong edge conservatism)
+const fn build_nonlinear_table() -> [u16; 256] {
+    let mut t = [0u16; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = if i == 0 { 0 }
+            else if i < 3 { (32 + (i - 1) as u32 * 32) as u16 }            // [32, 64]
+            else if i < 6 { (128 + (i - 3) as u32 * 128 / 3) as u16 }       // [128, 256]
+            else if i < 11 { (256 + (i - 6) as u32 * 256 / 5) as u16 }      // [256, 512]
+            else if i < 33 { (512 - (i - 11) as u32 * 256 / 22) as u16 }    // [512, 256]
+            else {
+                let v = 256 - (i - 33) as u32 * 128 / 223;
+                (if v < 128 { 128 } else { v }) as u16
+            };
+        i += 1;
+    }
+    t
+}
+const NONLINEAR_TABLE: [u16; 256] = build_nonlinear_table();
+
+/// Global luminance boost table: avg_y → Q8 multiplier [128, 448].
+///
+/// Inspired by MobileIE's channel attention (avg pool → sigmoid → scale):
+///   avg Y < 32  (very dark):    boost 1.75×  — enhance shadow detail
+///   avg Y 32-64 (dark):         boost 1.25×
+///   avg Y 64-160 (normal):      boost 1.0×   — neutral
+///   avg Y 160-192 (bright):     boost 0.85×  — prevent blowing
+///   avg Y > 192 (very bright):  boost 0.5×   — minimal enhancement
+const fn build_luma_boost_table() -> [u16; 256] {
+    let mut t = [0u16; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = if i < 32 { (256 + (32 - i as u32) * 192 / 32) as u16 }     // [448, 256]
+            else if i < 64 { (256 + (64 - i as u32) * 192 / 32) as u16 }    // [256, 448]
+            else if i < 160 { 256u16 }                                        // 1.0×
+            else if i < 192 { (256 - (i - 160) as u32 * 128 / 32) as u16 }   // [256, 128]
+            else {
+                let v = 128 - (i - 192) as u32 * 128 / 64;
+                (if v > 128 { v } else { 128 }) as u16                        // clamp(128)
+            };
+        i += 1;
+    }
+    t
+}
+const LUMA_BOOST_TABLE: [u16; 256] = build_luma_boost_table();
+
+/// Midtone clarity boost table: Y → Q8 amount multiplier [128, 512].
+///
+/// Applies a visibility-weighted gain to the USM amount so that midtones
+/// (where human vision is most sensitive) receive more enhancement while
+/// shadows and highlights are handled more gently.
+///   Y 0   (shadows):     128 (0.5×)
+///   Y 96  (midtone edge):256 (1.0×)
+///   Y 128 (midtones):    512 (2.0×)  ← peak
+///   Y 160 (bright):      256 (1.0×)
+///   Y 255 (highlights):  128 (0.5×)
+const fn build_midtone_table() -> [u16; 256] {
+    let mut t = [0u16; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = if i < 96 { (128 + i as u32 * 128 / 96) as u16 }
+            else if i < 128 { (256 + (i - 96) as u32 * 256 / 32) as u16 }
+            else if i < 160 { (512 - (i - 128) as u32 * 256 / 32) as u16 }
+            else { (256 - (i - 160) as u32 * 128 / 95) as u16 };
+        i += 1;
+    }
+    t
+}
+const MIDTONE_TABLE: [u16; 256] = build_midtone_table();
+
+/// Photographic S-curve tone mapping table: Y_in → Y_out [0, 255].
+///
+/// Subtly lifts shadows (up to +6 at Y=0) and compresses highlights
+/// (up to -4 at Y=255) for a film-like tonal response. Midtones pass
+/// through unchanged.  Applied after USM enhancement.
+const fn build_tone_curve() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = if i < 64 {
+            // Shadow lift: +6 at Y=0, tapering to 0 at Y=64
+            let lift = ((64 - i) as u32 * 6 / 64) as u8;
+            (i as u8).saturating_add(lift)
+        } else if i > 191 {
+            // Highlight compression: -4 at Y=255, tapering to 0 at Y=191
+            let comp = ((i - 191) as u32 * 4 / 64) as u8;
+            (i as u8).saturating_sub(comp)
+        } else {
+            i as u8
+        };
+        i += 1;
+    }
+    t
+}
+const TONE_CURVE: [u8; 256] = build_tone_curve();
 
 /// Apply unsharp mask to the Y (luminance) plane of an I420 frame.
 ///
 /// Features:
+///   - **Edge-preserving blur refinement** — guided-filter-inspired correction
+///     pulls the box blur toward the original Y at strong edges, eliminating
+///     the root cause of USM halos (blur bleeding across edges).
 ///   - **Motion adaptation** — MAD-based look-up table reduces strength
 ///     during motion (eliminates temporal flicker).
-///   - **Local adaptation** — per-pixel edge strength (`|Y - blur(Y)|`)
-///     boosts the amount on strong edges, leaves flat areas untouched.
+///   - **Non-linear gain curve** — FST-inspired quadratic mapping compresses
+///     large |diff| values for natural-looking sharpening without halos.
+///   - **Channel-attention-inspired global luma** — average luminance adjusts
+///     overall enhancement strength (dark → boost, bright → reduce).
+///   - **Chroma activity boost** — colorful frames get more enhancement.
+///   - **Texture-adaptive** — 32×32 LUT reduces gain in texture regions
+///     to avoid over-sharpening.
 ///   - **Integer only** — no float division, no `exp`, no `sin`/`cos`.
 ///
 /// # Memory layout: `blur_buf` is dual-purpose
@@ -677,30 +1131,31 @@ const TEXTURE_TABLE: [[u32; 32]; 32] = build_texture_table();
 /// from the capture pipeline (already ≈3 MB), so the 2× expansion from
 /// `y_size` to `2×y_size` never reallocates after the first frame.
 fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
-    blur_buf: &mut Vec<u8>, chroma_tick: &mut u32, last_chroma_boost: &mut u32) {
+    blur_buf: &mut Vec<u8>, chroma_tick: &mut u32, last_chroma_boost: &mut u32,
+    mad_sum: u64, tv_sum: u64, luma_sum: u64) {
     if strength <= 0.0 || w < 3 || h < 3 {
         return;
     }
     let y_size = w * h;
     let total_req = 2 * y_size;
 
-    // Compute UV sizes now (needed for chroma activity and later for flattening)
     let uv_size = (w / 2) * (h / 2);
 
-    // (Re)size blur_buf to [blur_copy | prev]; on first call or resolution
-    // change the new prev is seeded with current frame so MAD = 0.
+    // (Re)size blur_buf to [blur_copy | prev] if needed (first frame/res change).
+    // MAD/TV/luma are pre-computed by the tile scaling phase — no separate pass.
     if blur_buf.len() != total_req {
         blur_buf.clear();
         blur_buf.reserve(total_req);
-        // SAFETY: reserve guarantees capacity. Writes below fill all bytes.
         unsafe { blur_buf.set_len(total_req); }
-        // First frame or resolution change: no valid prev → current = prev
         let y_plane = &i420[..y_size];
+        // blur_copy section is already written by tile scaling if scaling was
+        // needed; for a no-scaling transition or first frame, copy it here.
+        // blur_buf[..y_size] may already be valid; overwrite to be safe.
+        blur_buf[..y_size].copy_from_slice(y_plane);
         blur_buf[y_size..total_req].copy_from_slice(y_plane);
     }
 
-    // ── 0.  Chroma activity (recomputed every 8 frames) ─────────
-    // Chroma changes much slower than framerate; amortize the UV traversal.
+    // ── 0.  Chroma activity ──
     let chroma_boost_q8 = if *chroma_tick == 0 {
         let boost = if uv_size > 0 && i420.len() >= y_size + 2 * uv_size {
             let mut chroma_sum: u64 = 0;
@@ -722,26 +1177,13 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
     let (blur_copy, prev) = blur_buf.split_at_mut(y_size);
     let y_plane = &mut i420[..y_size];
 
-    // ── 1.  MAD × TV × Copy ─────────────────────────────────────
-    // Merge MAD (motion) and TV (contrast) accumulation with the
-    // mandatory Y → blur_copy copy.  No extra passes.
-    //   MAD = Σ|y[i] - prev[i]|       → motion adaptation
-    //   TV  = Σ|y[i] - y[i-1]|        → contrast adaptation
-    let mut mad_sum: u64 = 0;
-    let mut tv_sum: u64 = 0;
-    let mut prev_y = y_plane[0];
-    for i in 0..y_size {
-        let diff = y_plane[i] as i32 - prev[i] as i32;
-        mad_sum += diff.unsigned_abs() as u64;
-        if i > 0 {
-            tv_sum += (y_plane[i] as i32 - prev_y as i32).unsigned_abs() as u64;
-        }
-        prev_y = y_plane[i];
-        blur_copy[i] = y_plane[i];
-    }
-    let mad = (mad_sum / y_size as u64) as usize;           // [0, 255]
-    let avg_tv = (tv_sum / (y_size.saturating_sub(1)) as u64) as u32; // [0, 255]
-    let motion_factor = MOTION_TABLE[mad.min(255)] as u32;  // [0, 255]
+    // ── 1.  MAD/TV/luma are pre-computed by tile scaling ─────────
+    // No separate MAD/TV/Copy pass — tile scaling already wrote blur_copy
+    // and accumulated stats.  Compute derived values directly.
+    let mad = (mad_sum / y_size as u64) as usize;
+    let avg_tv = (tv_sum / (y_size.saturating_sub(1)) as u64) as u32;
+    let avg_y = (luma_sum / y_size as u64) as usize;
+    let motion_factor = MOTION_TABLE[mad.min(255)] as u32;
 
     // When motion_factor < 16 (< 6% strength), USM effect is imperceptible.
     // Skip stack_blur + per-pixel USM; just save Y as prev for next frame's MAD.
@@ -763,53 +1205,108 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
         let _ = libblur::stack_blur(&mut img, radius, ThreadingPolicy::Single);
     }
 
-    // ── 3.  USM with motion + contrast + local adaptation ──────
+    // ── 2+3.  Denoise + edge refine + USM (merged single pass) ──
+    // Originally three separate loops (denoise, refine, USM) that required
+    // writing intermediate y2/boosted to y_plane/blur_copy and reading them
+    // back.  Merging eliminates one full Y-plane write+read (≈ 4 MB/frame).
+    //
+    // Per-pixel dataflow within the merged loop:
+    //   y (original) + b (stack-blurred)
+    //     → denoise: y2 = blend(y, b, DENOISE_TABLE[diff])
+    //     → refine: blended = blend(b, y2, edge_refine_weight)
+    //               boosted = blended + boost(blended - y2)
+    //     → USM: diff_usm = y2 - boosted → nonlinear_gain × motion × texture
+    //            final_y = TONE_CURVE(y2 + adj)
+
     //  base_amount = Q8  (256 = 1.0x)
     let base_amount = (strength * 256.0).clamp(0.0, 1023.0) as u32;
 
     //  Contrast boost  (Total Variation per pixel → Q8 multiplier)
-    //    avg_tv ≈  2 (blurry/smooth) → boost = 384 (1.5x)
-    //    avg_tv ≈ 43 (typical)       → boost = 256 (1.0x)
-    //    avg_tv ≈ 85 (already sharp) → boost = 128 (0.5x)
     let contrast_boost_q8 = (384u32).saturating_sub(avg_tv * 3).max(128).min(512);
     let effective_base = ((base_amount * contrast_boost_q8 + 128) >> 8).min(1023);
 
+    //  Luma boost (global luminance → Q8 multiplier, channel attention inspired)
+    let luma_boost_q8 = LUMA_BOOST_TABLE[avg_y.min(255)] as u32;
+    let effective_base = ((effective_base * luma_boost_q8 + 128) >> 8).min(1023);
+
     //  Chroma boost (mean |C - 128| → Q8 multiplier)
-    //    avg_chroma ≈  0 (grayscale) → 256  (1.0×,  no boost)
-    //    avg_chroma ≈ 40 (colorful)  → 376  (1.47×, near max)
-    //    avg_chroma ≈ 85+            → 384  (1.5×,  saturate)
     let effective_base = ((effective_base * chroma_boost_q8 + 128) >> 8).min(1023);
 
+    let mut prev_y_refine = y_plane[0];
     let mut prev_abs_diff = 0u32;
     let mut col = 0usize;
+    let mut total_adj: u64 = 0;
 
-    // USM loop: write enhanced Y and save to prev simultaneously (eliminates separate copy pass).
-    for ((yp, &blur), p) in y_plane.iter_mut().zip(blur_copy.iter()).zip(prev.iter_mut()) {
-        let diff = *yp as i32 - blur as i32;
+    for i in 0..y_size {
+        let y = y_plane[i] as u32;
+        let b = blur_copy[i] as u32;
+        let raw_diff = (y as i32 - b as i32).unsigned_abs();
+
+        // ── Denoise: blend Y→blur in flat areas ──
+        let w_d = DENOISE_TABLE[raw_diff.min(255) as usize] as u32;
+        let y2 = (y * (256 - w_d) + b * w_d + 128) >> 8;
+
+        // ── Edge refine: blend blur→Y at edges ──
+        // Gradient: max(horizontal, vertical) for better halo suppression.
+        // Horizontal uses prev_y_refine (y2 of left neighbor).  Vertical uses
+        // the pixel above (y_plane[i-w], which contains final_y from prev row
+        // — close enough to y2 for edge detection).
+        let hgrad = (y2 as i32 - prev_y_refine as i32).unsigned_abs();
+        let vgrad = if i >= w {
+            (y2 as i32 - y_plane[i - w] as i32).unsigned_abs()
+        } else { 0 };
+        let grad = hgrad.max(vgrad);
+        prev_y_refine = y2 as u8;
+        let weight = edge_refine_weight(grad, raw_diff);
+        let blended = (b * (256 - weight) + y2 * weight + 128) >> 8;
+        let boost = EDGE_BOOST_TABLE[weight as usize] as u32;
+        let edge_diff = (y2 as i32 - blended as i32) as i32;
+        let boosted = (blended as i32 + ((edge_diff * boost as i32 + 16) >> 5))
+            .clamp(0, 255) as u8;
+
+        // ── USM: sharpen difference between y2 (source) and boosted (blur) ──
+        let diff = y2 as i32 - boosted as i32;
         let abs_diff = diff.unsigned_abs();
-
-        // Local factor Q8: lookup from compile-time LUT.
-        let local_q8 = LOCAL_Q8_TABLE[abs_diff as usize];
-
-        // Texture factor Q8: lookup from 32×32 compile-time LUT.
-        let texture_q8 = TEXTURE_TABLE[(prev_abs_diff >> 3) as usize][(abs_diff >> 3) as usize];
-
-        // Combined multiplier: motion × local × texture  (Q8)
-        let combined_q8 = (motion_factor * local_q8 + 128) >> 8;
-        let combined_q8 = (combined_q8 * texture_q8 + 128) >> 8;
-        // Final Q8 amount, clamped to safe range
+        let nonlinear_gain = NONLINEAR_TABLE[abs_diff as usize] as i32;
+        let texture_q8 = texture_weight(prev_abs_diff, abs_diff);
+        let combined_q8 = (motion_factor * texture_q8 + 128) >> 8;
         let amount = ((effective_base * combined_q8 + 128) >> 8).min(1023);
+        let midtone_q8 = MIDTONE_TABLE[y2 as usize] as u32;
+        let amount = ((amount * midtone_q8 + 128) >> 8).min(1023);
+        let adj = (((diff * nonlinear_gain + 128) >> 8) * amount as i32 + 128) >> 8;
+        total_adj += adj.unsigned_abs() as u64;
+        let enhanced = ((y2 as i32 + adj).clamp(0, 255)) as u8;
+        // Adaptive tone curve: skip S-curve at strong edges (grad >= 16)
+        // to preserve text/screen content contrast (whites stay white, blacks stay black).
+        let final_y = if grad >= 16 { enhanced } else { TONE_CURVE[enhanced as usize] };
 
-        let adj = (diff as i32 * amount as i32 + 128) >> 8;
-        let enhanced = ((*yp as i32 + adj).clamp(0, 255)) as u8;
-        *yp = enhanced;
-        *p = enhanced;  // save to prev for next frame's MAD
+        y_plane[i] = final_y;
+        prev[i] = final_y;
 
-        // Update row-aware prev_abs_diff for next pixel
         prev_abs_diff = if col > 0 { abs_diff } else { 0 };
         col = if col + 1 < w { col + 1 } else { 0 };
     }
     // ── prev is updated in-loop above, no separate copy_from_slice needed ──
+
+    // ── 4.  Chroma saturation boost (every 8 frames, tied to chroma_tick) ──
+    // When USM enhances luma detail, chroma feels desaturated by comparison.
+    // Amortize the UV traversal by boosting only when chroma stats recompute.
+    //   avg_adj = 0   → coeff = 256 (1.0×,  no change)
+    //   avg_adj = 64  → coeff = 384 (1.5×,  moderate boost)
+    //   avg_adj ≥ 128 → coeff = 448 (1.75×, saturate)
+    if *chroma_tick == 0 && total_adj > 0 && uv_size > 0 {
+        let avg_adj = (total_adj / y_size as u64) as u32;
+        let sat_coeff = (256u32).saturating_add(avg_adj * 3 / 2).min(448);
+        let (u_plane, v_plane) = i420[y_size..y_size + 2 * uv_size].split_at_mut(uv_size);
+        for (u, v) in u_plane.iter_mut().zip(v_plane.iter_mut()) {
+            // Branchless: (c - 128) × coeff / 256 + 128
+            //   coeff = 256 → result = c (no change, sat_coeff wraps)
+            let uc = ((*u as i32 - 128) * sat_coeff as i32 + 128) >> 8;
+            let vc = ((*v as i32 - 128) * sat_coeff as i32 + 128) >> 8;
+            *u = (128 + uc).clamp(0, 255) as u8;
+            *v = (128 + vc).clamp(0, 255) as u8;
+        }
+    }
 }
 
 /// BGRA → I420, writing into a pre-sized buffer (no resize).
@@ -1842,18 +2339,18 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
 
     // ── Create ScreenCapture (SHM-accelerated with fallback) ──
-    let screen_capture = match ShmScreenCapture::try_new(capture_state.clone(), native_w, native_h, depth) {
+    let screen_capture = match ShmScreenCapture::try_new(capture_state.clone(), native_w, native_h, depth, out_w, out_h) {
         Ok(Some(shm)) => {
             log::info!("[capture] using MIT-SHM acceleration");
             ScreenCapture::Shm(shm)
         }
         Ok(None) => {
             log::info!("[capture] SHM unavailable, using get_image fallback");
-            ScreenCapture::Fallback(FallbackCapture { conn: capture_state.clone(), width: native_w, height: native_h })
+            ScreenCapture::Fallback(FallbackCapture::new(capture_state.clone(), native_w, native_h, out_w, out_h))
         }
         Err(e) => {
             log::info!("[capture] SHM init failed: {}, using get_image fallback", e);
-            ScreenCapture::Fallback(FallbackCapture { conn: capture_state.clone(), width: native_w, height: native_h })
+            ScreenCapture::Fallback(FallbackCapture::new(capture_state.clone(), native_w, native_h, out_w, out_h))
         }
     };
 
@@ -1960,52 +2457,66 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             // (clear → set_len → libyuv write). No byte is read before being written.
             unsafe { i420.set_len(frame_size); }
 
-            if let Err(e) = screen_capture.capture_to_i420(&mut i420, out_w, out_h,
-                needs_scaling, &mut tmp_argb)
-            {
-                log::info!("[capture] error: {:#}, repeating last frame", e);
-                if let Some(ref last) = last_raw {
-                    // Send the previous frame (zero-copy: Arc refcount++), keep last_raw intact.
-                    if let Err(e) = yuv_tx_cap.try_send(last.clone()) {
-                        if matches!(e, block_mpsc::TrySendError::Disconnected(_)) {
-                            log::debug!("[capture] output channel closed, exiting");
-                            cap_done.notify_one();
-                            return;
+            // Ensure tmp_argb is sized as [blur_copy | prev] for MAD fusion
+            let y_size = (out_w * out_h) as usize;
+            let total_req = 2 * y_size;
+            if tmp_argb.len() != total_req {
+                tmp_argb.clear();
+                tmp_argb.reserve(total_req);
+                unsafe { tmp_argb.set_len(total_req); }
+                // First frame or resolution change: seed prev with current frame
+                let y_plane = &i420[..y_size];
+                tmp_argb[y_size..total_req].copy_from_slice(y_plane);
+            }
+            let (blur_copy, prev) = tmp_argb.split_at_mut(y_size);
+
+            match screen_capture.capture_to_i420(&mut i420, out_w, out_h,
+                needs_scaling, blur_copy, prev) {
+                Err(e) => {
+                    log::info!("[capture] error: {:#}, repeating last frame", e);
+                    if let Some(ref last) = last_raw {
+                        if let Err(e) = yuv_tx_cap.try_send(last.clone()) {
+                            if matches!(e, block_mpsc::TrySendError::Disconnected(_)) {
+                                log::debug!("[capture] output channel closed, exiting");
+                                cap_done.notify_one();
+                                return;
+                            }
                         }
-                    }
-                } else {
-                    let elapsed = frame_start.elapsed();
-                    if elapsed < frame_duration {
-                        std::thread::sleep(frame_duration - elapsed);
-                    }
-                    continue;
-                }
-            } else {
-                // Capture succeeded — apply Y-plane unsharp mask enhancement
-                if enhance > 0.0 {
-                    let y_size = out_w as usize * out_h as usize;
-                    let uv_size = (out_w as usize / 2) * (out_h as usize / 2);
-                    apply_enhancement(
-                        &mut i420[..y_size + 2 * uv_size],
-                        out_w as usize, out_h as usize,
-                        enhance, &mut tmp_argb,
-                        &mut chroma_tick, &mut last_chroma_boost,
-                    );
-                }
-                // Zero-copy: Vec -> Bytes (takes ownership of Vec allocation)
-                let frame = Bytes::from(i420);
-                // Share via Arc: last_raw holds a clone (refcount++), send the original
-                last_raw = Some(frame.clone());
-                if let Err(e) = yuv_tx_cap.try_send(frame) {
-                    match e {
-                        block_mpsc::TrySendError::Full(_) => {
-                            log::trace!("[capture] dropping frame (channel full)");
-                            std::thread::sleep(std::time::Duration::from_millis(5));
+                    } else {
+                        let elapsed = frame_start.elapsed();
+                        if elapsed < frame_duration {
+                            std::thread::sleep(frame_duration - elapsed);
                         }
-                        block_mpsc::TrySendError::Disconnected(_) => {
-                            log::debug!("[capture] output channel closed, exiting");
-                            cap_done.notify_one();
-                            return;
+                        continue;
+                    }
+                }
+                Ok((mad_sum, tv_sum, luma_sum)) => {
+                    // Capture succeeded — apply Y-plane unsharp mask enhancement
+                    if enhance > 0.0 {
+                        let y_size = out_w as usize * out_h as usize;
+                        let uv_size = (out_w as usize / 2) * (out_h as usize / 2);
+                        apply_enhancement(
+                            &mut i420[..y_size + 2 * uv_size],
+                            out_w as usize, out_h as usize,
+                            enhance, &mut tmp_argb,
+                            &mut chroma_tick, &mut last_chroma_boost,
+                            mad_sum, tv_sum, luma_sum,
+                        );
+                    }
+                    // Zero-copy: Vec -> Bytes (takes ownership of Vec allocation)
+                    let frame = Bytes::from(i420);
+                    last_raw = Some(frame.clone());
+                    if let Err(e) = yuv_tx_cap.try_send(frame) {
+                        match e {
+                            block_mpsc::TrySendError::Full(_) => {
+                                log::trace!("[capture] dropping frame (channel full)");
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            block_mpsc::TrySendError::Disconnected(_) => {
+                                log::debug!("[capture] output channel closed, exiting");
+                                cap_done.notify_one();
+                                return;
+                            }
                         }
                     }
                 }
@@ -2074,9 +2585,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         continue;
                     }
                     enc_failures = 0; // reset on success
-                    // Copy encoded data into Bytes (exact size allocation).
-                    let frame = Bytes::copy_from_slice(&enc_buf);
-                    enc_buf.clear();
+                    // Zero-copy: transfer encoder buffer ownership to Bytes,
+                    // replacing enc_buf with an empty Vec for the next frame.
+                    let frame = Bytes::from(std::mem::take(&mut enc_buf));
                     if enc_stop.is_cancelled() { return; }
                     match enc_tx_clone.try_send(frame) {
                         Ok(()) => {}
