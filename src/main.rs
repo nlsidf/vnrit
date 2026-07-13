@@ -6,78 +6,80 @@ unsafe extern "C" {
     fn mi_collect(force: bool) -> ();
 }
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as block_mpsc;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rayon::prelude::*;
-use wide::i16x8;
-use wide::i32x4;
-use wide::i32x8;
-use wide::u8x16;use axum::{
+use axum::{
+    Router,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::get,
-    Router,
 };
 use clap::Parser;
+use futures_util::StreamExt;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
-use futures_util::StreamExt;
-use std::os::unix::net::UnixStream;
+use wide::i16x8;
+use wide::i32x4;
+use wide::i32x8;
+use wide::u8x16;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{self, Window};
-use x11rb::protocol::shm::{self, Seg};
-use x11rb::protocol::xtest;
-use x11rb::protocol::xinput::{self, XIEventMask, EventMask};
 use x11rb::protocol::Event;
+use x11rb::protocol::shm::{self, Seg};
+use x11rb::protocol::xinput::{self, EventMask, XIEventMask};
+use x11rb::protocol::xproto::{self, Window};
+use x11rb::protocol::xtest;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 use x11rb_protocol::xauth::get_auth;
-use std::os::unix::io::AsRawFd;
 
 // ── webrtc-rs types ──
-use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
-    RTCConfigurationBuilder, RTCIceServer, RTCPeerConnectionIceEvent,
-    RTCSessionDescription, RTCIceGatheringState, RTCPeerConnectionState,
-    RTCIceCandidateInit, MediaEngine, register_default_interceptors, Registry,
-    SettingEngine,
-};
-use webrtc::data_channel::{DataChannel, DataChannelEvent};
-use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
-use webrtc::media_stream::track_local::TrackLocal;
-use webrtc::media_stream::{MediaStreamTrack, Track};
-use webrtc::runtime;
-use rtc_media::Sample;
-use rtc::rtp_transceiver::rtp_sender::{
-    RtpCodecKind, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
-    RTCRtpEncodingParameters,
-};
 use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS};
+use rtc::rtp_transceiver::rtp_sender::{
+    RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
+    RtpCodecKind,
+};
 use rtc::statistics::StatsSelector;
+use rtc_media::Sample;
+use webrtc::data_channel::{DataChannel, DataChannelEvent};
+use webrtc::media_stream::track_local::TrackLocal;
+use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
+use webrtc::media_stream::{MediaStreamTrack, Track};
+use webrtc::peer_connection::{
+    MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+    RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceGatheringState, RTCIceServer,
+    RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription, Registry,
+    SettingEngine, register_default_interceptors,
+};
+use webrtc::runtime;
 
 // ── openh264 ──
-use openh264::encoder::{Encoder, EncoderConfig, BitRate, FrameRate, UsageType, RateControlMode, IntraFramePeriod, Profile, Complexity};
-use openh264::formats::YUVSlices;
 use openh264::OpenH264API;
+use openh264::encoder::{
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile,
+    RateControlMode, UsageType,
+};
+use openh264::formats::YUVSlices;
 use openh264_sys2::ENCODER_OPTION_BITRATE;
 
-
+use async_trait::async_trait;
 use bytes::Bytes;
 use ice::network_type::NetworkType;
 use rand::Rng;
-use async_trait::async_trait;
 use std::os::fd::IntoRawFd;
 
-use vnrit_libyuv::{self, ArgbImage, I420ImageMut, ImageSize, FilterMode};
+use vnrit_libyuv::{self, ArgbImage, FilterMode, I420ImageMut, ImageSize};
 
 // ── libblur: SIMD-accelerated fast blur (used for Y-plane unsharp mask) ──
-use libblur::{self, BlurImageMut, FastBlurChannels, AnisotropicRadius, ThreadingPolicy};
+use libblur::{self, AnisotropicRadius, BlurImageMut, FastBlurChannels, ThreadingPolicy};
 
 /// Resize `buf` to `size` without zero-initialization, then call `write` with the mutable slice.
 /// The write closure must write all `size` bytes before returning — reading uninit bytes is UB.
@@ -86,7 +88,9 @@ fn with_resize_uninit(buf: &mut Vec<u8>, size: usize, write: impl FnOnce(&mut [u
     buf.clear();
     buf.reserve(size);
     // SAFETY: reserve guarantees capacity >= size. write() fills all bytes.
-    unsafe { buf.set_len(size); }
+    unsafe {
+        buf.set_len(size);
+    }
     write(&mut buf[..size]);
 }
 
@@ -219,15 +223,11 @@ at /data/data/com.termux/files/usr/tmp/.X11-unix/X<number>."
         long,
         short = 'p',
         default_value = "8080",
-        help = "HTTP/WebSocket listen port",
+        help = "HTTP/WebSocket listen port"
     )]
     port: u16,
 
-    #[arg(
-        long,
-        default_value = "24",
-        help = "Capture framerate in fps",
-    )]
+    #[arg(long, default_value = "24", help = "Capture framerate in fps")]
     framerate: i32,
 
     #[arg(
@@ -237,11 +237,7 @@ at /data/data/com.termux/files/usr/tmp/.X11-unix/X<number>."
     )]
     stun: String,
 
-    #[arg(
-        long,
-        default_value = "1000",
-        help = "Target bitrate in kbps",
-    )]
+    #[arg(long, default_value = "1000", help = "Target bitrate in kbps")]
     bitrate: i32,
 
     #[arg(
@@ -265,21 +261,21 @@ authentication so subsequent requests (including the WebSocket upgrade) can reus
     #[arg(
         long,
         default_value = "info",
-        help = "Log level (off, error, warn, info, debug, trace)",
+        help = "Log level (off, error, warn, info, debug, trace)"
     )]
     log_level: String,
 
     #[arg(
         long,
         default_value = "false",
-        help = "Use TCP-only ICE (disable UDP, useful when UDP is blocked)",
+        help = "Use TCP-only ICE (disable UDP, useful when UDP is blocked)"
     )]
     tcp_only: bool,
 
     #[arg(
         long,
         default_value = "false",
-        help = "Enable adaptive bitrate based on WebRTC bandwidth estimation",
+        help = "Enable adaptive bitrate based on WebRTC bandwidth estimation"
     )]
     adaptive_bitrate: bool,
 
@@ -304,7 +300,10 @@ enum SignalingMessage {
     #[serde(rename = "answer")]
     Answer { sdp: String },
     #[serde(rename = "ice")]
-    Ice { candidate: String, sdp_mline_index: u32 },
+    Ice {
+        candidate: String,
+        sdp_mline_index: u32,
+    },
     #[serde(rename = "ready")]
     Ready,
 }
@@ -371,11 +370,21 @@ unsafe impl Sync for ShmScreenCapture {}
 impl ShmScreenCapture {
     /// Try to create an SHM-accelerated capture. Returns None if SHM is
     /// not available (MIT-SHM extension missing from X server).
-    fn try_new(capture: Arc<CaptureState>, width: u16, height: u16, depth: u8,
-        out_w: u32, out_h: u32) -> Result<Option<Self>> {
+    fn try_new(
+        capture: Arc<CaptureState>,
+        width: u16,
+        height: u16,
+        depth: u8,
+        out_w: u32,
+        out_h: u32,
+    ) -> Result<Option<Self>> {
         // Calculate bytes-per-pixel for ZPixmap
         // depth 24 → 4 bytes (32-bit padded), depth >24 → 4 bytes
-        let bpp = if depth >= 24 { 4u8 } else { ((depth as u32 + 7) / 8) as u8 };
+        let bpp = if depth >= 24 {
+            4u8
+        } else {
+            ((depth as u32 + 7) / 8) as u8
+        };
         let shm_size = (width as usize) * (height as usize) * (bpp as usize);
 
         // Query MIT-SHM version to verify availability
@@ -383,12 +392,18 @@ impl ShmScreenCapture {
             Ok(cookie) => match cookie.reply() {
                 Ok(reply) => reply,
                 Err(e) => {
-                    log::debug!("[shm] MIT-SHM reply error: {:?}, falling back to get_image", e);
+                    log::debug!(
+                        "[shm] MIT-SHM reply error: {:?}, falling back to get_image",
+                        e
+                    );
                     return Ok(None);
                 }
             },
             Err(e) => {
-                log::debug!("[shm] MIT-SHM query failed: {}, falling back to get_image", e);
+                log::debug!(
+                    "[shm] MIT-SHM query failed: {}, falling back to get_image",
+                    e
+                );
                 return Ok(None);
             }
         };
@@ -398,17 +413,25 @@ impl ShmScreenCapture {
             return Ok(None);
         }
 
-        log::debug!("[shm] MIT-SHM v{}.{}, allocating {} bytes ({}x{}x{})",
-            ver.major_version, ver.minor_version, shm_size, width, height, depth);
+        log::debug!(
+            "[shm] MIT-SHM v{}.{}, allocating {} bytes ({}x{}x{})",
+            ver.major_version,
+            ver.minor_version,
+            shm_size,
+            width,
+            height,
+            depth
+        );
 
-        let shmseg = capture.conn.generate_id()
+        let shmseg = capture
+            .conn
+            .generate_id()
             .context("failed to generate SHM seg ID")?;
 
         // Ask the X server to allocate shared memory and return a file descriptor
         let cookie = shm::create_segment(&capture.conn, shmseg, shm_size as u32, false)
             .context("SHM create_segment failed")?;
-        let reply = cookie.reply()
-            .context("SHM create_segment reply failed")?;
+        let reply = cookie.reply().context("SHM create_segment reply failed")?;
 
         let raw_fd = reply.shm_fd.into_raw_fd();
 
@@ -424,21 +447,32 @@ impl ShmScreenCapture {
             );
             if ptr == libc::MAP_FAILED {
                 libc::close(raw_fd);
-                return Err(anyhow::anyhow!("mmap failed for SHM segment: size={}", shm_size));
+                return Err(anyhow::anyhow!(
+                    "mmap failed for SHM segment: size={}",
+                    shm_size
+                ));
             }
             ptr as *mut u8
         };
 
         // Close fd — mmap keeps a reference to the underlying file
-        unsafe { libc::close(raw_fd); }
+        unsafe {
+            libc::close(raw_fd);
+        }
 
-        log::debug!("[shm] segment allocated at {:?} ({} bytes)", shm_ptr, shm_size);
+        log::debug!(
+            "[shm] segment allocated at {:?} ({} bytes)",
+            shm_ptr,
+            shm_size
+        );
 
         // Pre-compute bicubic weights if scaling is needed
         let needs_scaling = out_w != width as u32 || out_h != height as u32;
         let (h_weights, v_weights) = if needs_scaling {
-            (Some(build_bicubic_weights(width as usize, out_w as usize)),
-             Some(build_bicubic_weights(height as usize, out_h as usize)))
+            (
+                Some(build_bicubic_weights(width as usize, out_w as usize)),
+                Some(build_bicubic_weights(height as usize, out_h as usize)),
+            )
         } else {
             (None, None)
         };
@@ -458,21 +492,28 @@ impl ShmScreenCapture {
 
     /// Capture the root window and convert directly to I420, bypassing BGRA Vec.
     /// Returns (mad_sum, tv_sum, luma_sum) for the Y plane.
-    fn capture_to_i420(&self, i420_out: &mut Vec<u8>, out_w: u32, out_h: u32,
-        needs_scaling: bool, blur_copy: &mut [u8], prev: &[u8]) -> Result<(u64, u64, u64)>
-    {
+    fn capture_to_i420(
+        &self,
+        i420_out: &mut Vec<u8>,
+        out_w: u32,
+        out_h: u32,
+        needs_scaling: bool,
+        blur_copy: &mut [u8],
+        prev: &[u8],
+    ) -> Result<(u64, u64, u64)> {
         let cookie = shm::get_image(
             &self.conn.conn,
             self.conn.root, // drawable
-            0,        // x offset
-            0,        // y offset
+            0,              // x offset
+            0,              // y offset
             self.width,
             self.height,
-            !0,       // plane_mask = all planes
-            2,        // format = ZPixmap
+            !0, // plane_mask = all planes
+            2,  // format = ZPixmap
             self.shmseg,
-            0,        // offset in shared memory
-        ).context("SHM get_image failed")?;
+            0, // offset in shared memory
+        )
+        .context("SHM get_image failed")?;
         let _reply = cookie.reply().context("SHM get_image reply failed")?;
 
         // Read BGRA directly from shared memory and convert to I420 in one step.
@@ -482,10 +523,19 @@ impl ShmScreenCapture {
 
         let stats = if needs_scaling {
             let mut temp_buf = Vec::new();
-            scale_bgra_direct(bgra_slice, self.width as u32, self.height as u32,
-                out_w, out_h, i420_out, &mut temp_buf,
-                self.h_weights.as_ref().unwrap(), self.v_weights.as_ref().unwrap(),
-                blur_copy, prev)
+            scale_bgra_direct(
+                bgra_slice,
+                self.width as u32,
+                self.height as u32,
+                out_w,
+                out_h,
+                i420_out,
+                &mut temp_buf,
+                self.h_weights.as_ref().unwrap(),
+                self.v_weights.as_ref().unwrap(),
+                blur_copy,
+                prev,
+            )
         } else {
             bgra_to_i420(bgra_slice, self.width as u32, self.height as u32, i420_out);
             let y_size = (self.width as usize) * (self.height as usize);
@@ -496,7 +546,9 @@ impl ShmScreenCapture {
                 let yv = y[i] as u64;
                 luma += yv;
                 mad += (yv as i32 - prev[i] as i32).unsigned_abs() as u64;
-                if i > 0 { tv += (yv as i32 - y[i-1] as i32).unsigned_abs() as u64; }
+                if i > 0 {
+                    tv += (yv as i32 - y[i - 1] as i32).unsigned_abs() as u64;
+                }
             }
             (mad, tv, luma)
         };
@@ -526,13 +578,13 @@ struct FallbackCapture {
 }
 
 impl FallbackCapture {
-    fn new(conn: Arc<CaptureState>, width: u16, height: u16,
-        out_w: u32, out_h: u32) -> Self
-    {
+    fn new(conn: Arc<CaptureState>, width: u16, height: u16, out_w: u32, out_h: u32) -> Self {
         let needs_scaling = out_w != width as u32 || out_h != height as u32;
         let (h_weights, v_weights) = if needs_scaling {
-            (Some(build_bicubic_weights(width as usize, out_w as usize)),
-             Some(build_bicubic_weights(height as usize, out_h as usize)))
+            (
+                Some(build_bicubic_weights(width as usize, out_w as usize)),
+                Some(build_bicubic_weights(height as usize, out_h as usize)),
+            )
         } else {
             (None, None)
         };
@@ -547,25 +599,43 @@ impl FallbackCapture {
     }
 
     /// Returns (mad_sum, tv_sum, luma_sum) for the Y plane.
-    fn capture_to_i420(&self, i420_out: &mut Vec<u8>, out_w: u32, out_h: u32,
-        needs_scaling: bool, blur_copy: &mut [u8], prev: &[u8]) -> Result<(u64, u64, u64)>
-    {
+    fn capture_to_i420(
+        &self,
+        i420_out: &mut Vec<u8>,
+        out_w: u32,
+        out_h: u32,
+        needs_scaling: bool,
+        blur_copy: &mut [u8],
+        prev: &[u8],
+    ) -> Result<(u64, u64, u64)> {
         let cookie = xproto::get_image(
             &self.conn.conn,
             xproto::ImageFormat::Z_PIXMAP,
             self.conn.root,
-            0, 0,
-            self.width, self.height,
+            0,
+            0,
+            self.width,
+            self.height,
             !0, // plane_mask = all planes
-        ).context("get_image failed")?;
+        )
+        .context("get_image failed")?;
         let reply = cookie.reply().context("get_image reply failed")?;
 
         let stats = if needs_scaling {
             let mut temp_buf = Vec::new();
-            scale_bgra_direct(&reply.data, self.width as u32, self.height as u32,
-                out_w, out_h, i420_out, &mut temp_buf,
-                self.h_weights.as_ref().unwrap(), self.v_weights.as_ref().unwrap(),
-                blur_copy, prev)
+            scale_bgra_direct(
+                &reply.data,
+                self.width as u32,
+                self.height as u32,
+                out_w,
+                out_h,
+                i420_out,
+                &mut temp_buf,
+                self.h_weights.as_ref().unwrap(),
+                self.v_weights.as_ref().unwrap(),
+                blur_copy,
+                prev,
+            )
         } else {
             bgra_to_i420(&reply.data, self.width as u32, self.height as u32, i420_out);
             let y_size = (self.width as usize) * (self.height as usize);
@@ -576,7 +646,9 @@ impl FallbackCapture {
                 let yv = y[i] as u64;
                 luma += yv;
                 mad += (yv as i32 - prev[i] as i32).unsigned_abs() as u64;
-                if i > 0 { tv += (yv as i32 - y[i-1] as i32).unsigned_abs() as u64; }
+                if i > 0 {
+                    tv += (yv as i32 - y[i - 1] as i32).unsigned_abs() as u64;
+                }
             }
             (mad, tv, luma)
         };
@@ -592,12 +664,22 @@ enum ScreenCapture {
 
 impl ScreenCapture {
     /// Returns (mad_sum, tv_sum, luma_sum) for the Y plane.
-    fn capture_to_i420(&self, i420_out: &mut Vec<u8>, out_w: u32, out_h: u32,
-        needs_scaling: bool, blur_copy: &mut [u8], prev: &[u8]) -> Result<(u64, u64, u64)>
-    {
+    fn capture_to_i420(
+        &self,
+        i420_out: &mut Vec<u8>,
+        out_w: u32,
+        out_h: u32,
+        needs_scaling: bool,
+        blur_copy: &mut [u8],
+        prev: &[u8],
+    ) -> Result<(u64, u64, u64)> {
         match self {
-            ScreenCapture::Shm(s) => s.capture_to_i420(i420_out, out_w, out_h, needs_scaling, blur_copy, prev),
-            ScreenCapture::Fallback(f) => f.capture_to_i420(i420_out, out_w, out_h, needs_scaling, blur_copy, prev),
+            ScreenCapture::Shm(s) => {
+                s.capture_to_i420(i420_out, out_w, out_h, needs_scaling, blur_copy, prev)
+            }
+            ScreenCapture::Fallback(f) => {
+                f.capture_to_i420(i420_out, out_w, out_h, needs_scaling, blur_copy, prev)
+            }
         }
     }
 }
@@ -617,13 +699,19 @@ fn bgra_to_i420(bgra: &[u8], width: u32, height: u32, out: &mut Vec<u8>) {
     let uv_size = (w / 2) * (h / 2);
     let total = y_size + 2 * uv_size;
     with_resize_uninit(out, total, |buf| {
-        let src = ArgbImage { data: bgra, stride: (width * 4) as usize };
+        let src = ArgbImage {
+            data: bgra,
+            stride: (width * 4) as usize,
+        };
         let (y_plane, rest) = buf.split_at_mut(y_size);
         let (u_plane, v_plane) = rest.split_at_mut(uv_size);
         let mut dst = I420ImageMut {
-            y: y_plane, y_stride: width as usize,
-            u: u_plane, u_stride: (width / 2) as usize,
-            v: v_plane, v_stride: (width / 2) as usize,
+            y: y_plane,
+            y_stride: width as usize,
+            u: u_plane,
+            u_stride: (width / 2) as usize,
+            v: v_plane,
+            v_stride: (width / 2) as usize,
         };
         let size = ImageSize::new(width as usize, height as usize);
         let _ = vnrit_libyuv::argb_to_i420(&src, &mut dst, size);
@@ -662,15 +750,16 @@ fn build_bicubic_weights(src_len: usize, dst_len: usize) -> BicubicWeights {
             let t = (j as f64 - 1.0) - frac;
             let ta = t.abs();
             // Mitchell-Netravali: B=1/3, C=1/3
-            let val = if ta >= 2.0 { 0.0 }
-                else if ta >= 1.0 {
-                    let t2 = ta;
-                    // (-7/18)|t|³ + 2|t|² - (10/3)|t| + 16/9
-                    (-7.0/18.0)*t2*t2*t2 + 2.0*t2*t2 - (10.0/3.0)*t2 + 16.0/9.0
-                } else {
-                    // (7/6)|t|³ - 2|t|² + 8/9
-                    (7.0/6.0)*ta*ta*ta - 2.0*ta*ta + 8.0/9.0
-                };
+            let val = if ta >= 2.0 {
+                0.0
+            } else if ta >= 1.0 {
+                let t2 = ta;
+                // (-7/18)|t|³ + 2|t|² - (10/3)|t| + 16/9
+                (-7.0 / 18.0) * t2 * t2 * t2 + 2.0 * t2 * t2 - (10.0 / 3.0) * t2 + 16.0 / 9.0
+            } else {
+                // (7/6)|t|³ - 2|t|² + 8/9
+                (7.0 / 6.0) * ta * ta * ta - 2.0 * ta * ta + 8.0 / 9.0
+            };
             let q12 = (val * 4096.0).round() as i16;
             w.push(q12);
             w32.push(q12 as i32);
@@ -698,20 +787,34 @@ thread_local! {
 ///   - tv_sum   = Σ|final_y[i] - final_y[i-1]|  (texture)
 ///   - luma_sum = Σ final_y[i]  (global luminance)
 /// Also bilinearly scales U/V planes (fused to avoid separate libyuv passes).
-fn bicubic_scale_y_with_weights(src: &[u8], src_w: usize, src_h: usize,
-                   dst: &mut [u8], dst_w: usize, dst_h: usize,
-                   hw: &BicubicWeights, vw: &BicubicWeights,
-                   blur_copy: &mut [u8], prev: &[u8]) -> (u64, u64, u64) {
+fn bicubic_scale_y_with_weights(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst: &mut [u8],
+    dst_w: usize,
+    dst_h: usize,
+    hw: &BicubicWeights,
+    vw: &BicubicWeights,
+    blur_copy: &mut [u8],
+    prev: &[u8],
+) -> (u64, u64, u64) {
     if src_w == dst_w && src_h == dst_h {
-        if dst.len() >= src.len() { dst[..src.len()].copy_from_slice(src); }
-        if blur_copy.len() >= src.len() { blur_copy[..src.len()].copy_from_slice(src); }
+        if dst.len() >= src.len() {
+            dst[..src.len()].copy_from_slice(src);
+        }
+        if blur_copy.len() >= src.len() {
+            blur_copy[..src.len()].copy_from_slice(src);
+        }
         // Compute MAD/TV/luma from direct copy (no scaling needed)
         let (mut mad, mut tv, mut luma) = (0u64, 0u64, 0u64);
         for i in 0..src_h * src_w {
             let y = src[i] as u64;
             luma += y;
             mad += (y as i32 - prev[i] as i32).unsigned_abs() as u64;
-            if i > 0 { tv += (y as i32 - src[i-1] as i32).unsigned_abs() as u64; }
+            if i > 0 {
+                tv += (y as i32 - src[i - 1] as i32).unsigned_abs() as u64;
+            }
         }
         return (mad, tv, luma);
     }
@@ -727,186 +830,221 @@ fn bicubic_scale_y_with_weights(src: &[u8], src_w: usize, src_h: usize,
     // Parallelize over ALL tiles using fold+reduce (per-thread accumulation,
     // no atomic contention).
     let total_tiles = tiles_x * tiles_y;
-    let (mad, tv, luma) = (0..total_tiles).into_par_iter()
-        .fold(|| (0u64, 0u64, 0u64),
+    let (mad, tv, luma) = (0..total_tiles)
+        .into_par_iter()
+        .fold(
+            || (0u64, 0u64, 0u64),
             |(mut mad, mut tv, mut luma), tile_id| {
-        let tx = tile_id % tiles_x;
-        let ty = tile_id / tiles_x;
-        let out_x0 = tx * TILE_W;
-        let out_y0 = ty * TILE_H;
-        let out_x1 = (out_x0 + TILE_W).min(dst_w);
-        let out_y1 = (out_y0 + TILE_H).min(dst_h);
-        let tile_w = out_x1 - out_x0;
-        // Source row range for this tile
-        let src_y0 = vw.base[out_y0] as usize;
-        let src_y1 = (vw.base[out_y1 - 1] + 4) as usize;
-        let tile_src_h = src_y1 - src_y0;
-        // ── Horizontal pass: read directly from src ──
-        // Reuse thread-local tile_horiz buffer (avoid per-tile alloc+zero-init).
-        // SAFETY: TILE_HORIZ is per-thread; within a rayon for_each closure
-        // each thread processes one tile at a time, so there is no concurrent
-        // mutable access to the same UnsafeCell.
-        let needed = tile_w * tile_src_h;
-        let tile_horiz = unsafe {
-            let v = &mut *TILE_HORIZ.with(|b| b.get());
-            if v.capacity() < needed {
-                v.reserve(needed - v.capacity());
-            }
-            // Every byte is written by the horizontal pass below.
-            v.set_len(needed);
-            std::slice::from_raw_parts_mut(v.as_mut_ptr(), needed)
-        };
-        for ry in 0..tile_src_h {
-            let sr = &src[(src_y0 + ry) * src_w..];
-            let dr = &mut tile_horiz[ry * tile_w..];
-            // ── Horizontal pass: SIMD i32x4 (4 pixels/batch) ──
-            // Each pixel uses its own base index and 4 tap weights.
-            // Weights are in hw.w at stride-4 offsets: pixel j uses w[wo+j*4..wo+j*4+4].
-            let mut ox_local = 0usize;
-            while ox_local + 4 <= tile_w {
-                let ox_global = out_x0 + ox_local;
-                let wo = ox_global * 4;
-                let b0 = hw.base[ox_global] as usize;
-                let b1 = hw.base[ox_global + 1] as usize;
-                let b2 = hw.base[ox_global + 2] as usize;
-                let b3 = hw.base[ox_global + 3] as usize;
-                // Tap 0: w[wo..wo+12:4], sr[base_j + 0]
-                let s0 = i32x4::new([
-                    sr[b0] as i32, sr[b1] as i32, sr[b2] as i32, sr[b3] as i32,
-                ]);
-                let w0 = i32x4::new([
-                    hw.w[wo] as i32, hw.w[wo + 4] as i32,
-                    hw.w[wo + 8] as i32, hw.w[wo + 12] as i32,
-                ]);
-                let mut acc = s0 * w0;
-                // Tap 1: w[wo+1..wo+13:4], sr[base_j + 1]
-                let s1 = i32x4::new([
-                    sr[b0 + 1] as i32, sr[b1 + 1] as i32,
-                    sr[b2 + 1] as i32, sr[b3 + 1] as i32,
-                ]);
-                let w1 = i32x4::new([
-                    hw.w[wo + 1] as i32, hw.w[wo + 5] as i32,
-                    hw.w[wo + 9] as i32, hw.w[wo + 13] as i32,
-                ]);
-                acc = acc + s1 * w1;
-                // Tap 2: w[wo+2..wo+14:4], sr[base_j + 2]
-                let s2 = i32x4::new([
-                    sr[b0 + 2] as i32, sr[b1 + 2] as i32,
-                    sr[b2 + 2] as i32, sr[b3 + 2] as i32,
-                ]);
-                let w2 = i32x4::new([
-                    hw.w[wo + 2] as i32, hw.w[wo + 6] as i32,
-                    hw.w[wo + 10] as i32, hw.w[wo + 14] as i32,
-                ]);
-                acc = acc + s2 * w2;
-                // Tap 3: w[wo+3..wo+15:4], sr[base_j + 3]
-                let s3 = i32x4::new([
-                    sr[b0 + 3] as i32, sr[b1 + 3] as i32,
-                    sr[b2 + 3] as i32, sr[b3 + 3] as i32,
-                ]);
-                let w3 = i32x4::new([
-                    hw.w[wo + 3] as i32, hw.w[wo + 7] as i32,
-                    hw.w[wo + 11] as i32, hw.w[wo + 15] as i32,
-                ]);
-                acc = acc + s3 * w3 + i32x4::splat(2048);
-                let [r0, r1, r2, r3] = (acc >> 12_i32).to_array();
-                dr[ox_local] = r0.clamp(0, 255) as u8;
-                dr[ox_local + 1] = r1.clamp(0, 255) as u8;
-                dr[ox_local + 2] = r2.clamp(0, 255) as u8;
-                dr[ox_local + 3] = r3.clamp(0, 255) as u8;
-                ox_local += 4;
-            }
-            for ox_local in ox_local..tile_w {
-                let ox_global = out_x0 + ox_local;
-                let b = hw.base[ox_global] as usize;
-                let wo = ox_global * 4;
-                let s = (sr[b] as i32 * hw.w[wo] as i32 + sr[b+1] as i32 * hw.w[wo + 1] as i32
-                       + sr[b+2] as i32 * hw.w[wo + 2] as i32 + sr[b+3] as i32 * hw.w[wo + 3] as i32 + 2048) >> 12;
-                dr[ox_local] = s.clamp(0, 255) as u8;
-            }
-        }
-        // ── Vertical pass: tile_horiz → dst (SIMD 4-col batches) ──
-        // Also writes to blur_copy and accumulates MAD/TV/luma for mo­tion
-        // adaptation (eliminates the separate MAD/TV/Copy loop).
-        for oy in out_y0..out_y1 {
-            let b = (vw.base[oy] as usize) - src_y0;
-            let wo = oy * 4;
-            let (w0, w1, w2, w3) = (vw.w32[wo], vw.w32[wo + 1], vw.w32[wo + 2], vw.w32[wo + 3]);
-            let wv0 = i32x4::splat(w0);
-            let wv1 = i32x4::splat(w1);
-            let wv2 = i32x4::splat(w2);
-            let wv3 = i32x4::splat(w3);
-            // SAFETY: Each tile writes to a unique (oy, ox) region.
-            let dst_base = dst_addr as *mut u8;
-            let dst_row = unsafe {
-                std::slice::from_raw_parts_mut(dst_base.add(oy * dst_stride + out_x0), tile_w)
-            };
-            let mut ox = 0usize;
-            while ox + 4 <= tile_w {
-                let s0 = i32x4::new([
-                    tile_horiz[b * tile_w + ox] as i32,
-                    tile_horiz[b * tile_w + ox + 1] as i32,
-                    tile_horiz[b * tile_w + ox + 2] as i32,
-                    tile_horiz[b * tile_w + ox + 3] as i32,
-                ]);
-                let s1 = i32x4::new([
-                    tile_horiz[(b + 1) * tile_w + ox] as i32,
-                    tile_horiz[(b + 1) * tile_w + ox + 1] as i32,
-                    tile_horiz[(b + 1) * tile_w + ox + 2] as i32,
-                    tile_horiz[(b + 1) * tile_w + ox + 3] as i32,
-                ]);
-                let s2 = i32x4::new([
-                    tile_horiz[(b + 2) * tile_w + ox] as i32,
-                    tile_horiz[(b + 2) * tile_w + ox + 1] as i32,
-                    tile_horiz[(b + 2) * tile_w + ox + 2] as i32,
-                    tile_horiz[(b + 2) * tile_w + ox + 3] as i32,
-                ]);
-                let s3 = i32x4::new([
-                    tile_horiz[(b + 3) * tile_w + ox] as i32,
-                    tile_horiz[(b + 3) * tile_w + ox + 1] as i32,
-                    tile_horiz[(b + 3) * tile_w + ox + 2] as i32,
-                    tile_horiz[(b + 3) * tile_w + ox + 3] as i32,
-                ]);
-                let acc = s0 * wv0 + s1 * wv1 + s2 * wv2 + s3 * wv3 + i32x4::splat(2048);
-                let [r0, r1, r2, r3] = (acc >> 12_i32).to_array();
-                dst_row[ox] = r0.clamp(0, 255) as u8;
-                dst_row[ox + 1] = r1.clamp(0, 255) as u8;
-                dst_row[ox + 2] = r2.clamp(0, 255) as u8;
-                dst_row[ox + 3] = r3.clamp(0, 255) as u8;
-                ox += 4;
-            }
-            for ox in ox..tile_w {
-                let s = (tile_horiz[b * tile_w + ox] as i32 * w0
-                       + tile_horiz[(b + 1) * tile_w + ox] as i32 * w1
-                       + tile_horiz[(b + 2) * tile_w + ox] as i32 * w2
-                       + tile_horiz[(b + 3) * tile_w + ox] as i32 * w3 + 2048) >> 12;
-                dst_row[ox] = s.clamp(0, 255) as u8;
-            }
-            // ── blur_copy + MAD/TV/luma (dst_row is hot in L1) ──
-            let bc_base = bc_addr as *mut u8;
-            let bc_row = unsafe {
-                std::slice::from_raw_parts_mut(bc_base.add(oy * dst_stride + out_x0), tile_w)
-            };
-            let prev_row = &prev[oy * dst_w + out_x0..][..tile_w];
-            let mut row_prev = dst_row[0];
-            for ox in 0..tile_w {
-                let y = dst_row[ox] as u32;
-                bc_row[ox] = y as u8;
-                mad += (y as i32 - prev_row[ox] as i32).unsigned_abs() as u64;
-                luma += y as u64;
-                // TV: first pixel of each tile misses the neighbor to its left
-                // from the previous tile (processed by another thread).  Error:
-                // ~0.3% for 720p — negligible for contrast adaptation.
-                if ox > 0 {
-                    tv += (y as i32 - row_prev as i32).unsigned_abs() as u64;
+                let tx = tile_id % tiles_x;
+                let ty = tile_id / tiles_x;
+                let out_x0 = tx * TILE_W;
+                let out_y0 = ty * TILE_H;
+                let out_x1 = (out_x0 + TILE_W).min(dst_w);
+                let out_y1 = (out_y0 + TILE_H).min(dst_h);
+                let tile_w = out_x1 - out_x0;
+                // Source row range for this tile
+                let src_y0 = vw.base[out_y0] as usize;
+                let src_y1 = (vw.base[out_y1 - 1] + 4) as usize;
+                let tile_src_h = src_y1 - src_y0;
+                // ── Horizontal pass: read directly from src ──
+                // Reuse thread-local tile_horiz buffer (avoid per-tile alloc+zero-init).
+                // SAFETY: TILE_HORIZ is per-thread; within a rayon for_each closure
+                // each thread processes one tile at a time, so there is no concurrent
+                // mutable access to the same UnsafeCell.
+                let needed = tile_w * tile_src_h;
+                let tile_horiz = unsafe {
+                    let v = &mut *TILE_HORIZ.with(|b| b.get());
+                    if v.capacity() < needed {
+                        v.reserve(needed - v.capacity());
+                    }
+                    // Every byte is written by the horizontal pass below.
+                    v.set_len(needed);
+                    std::slice::from_raw_parts_mut(v.as_mut_ptr(), needed)
+                };
+                for ry in 0..tile_src_h {
+                    let sr = &src[(src_y0 + ry) * src_w..];
+                    let dr = &mut tile_horiz[ry * tile_w..];
+                    // ── Horizontal pass: SIMD i32x4 (4 pixels/batch) ──
+                    // Each pixel uses its own base index and 4 tap weights.
+                    // Weights are in hw.w at stride-4 offsets: pixel j uses w[wo+j*4..wo+j*4+4].
+                    let mut ox_local = 0usize;
+                    while ox_local + 4 <= tile_w {
+                        let ox_global = out_x0 + ox_local;
+                        let wo = ox_global * 4;
+                        let b0 = hw.base[ox_global] as usize;
+                        let b1 = hw.base[ox_global + 1] as usize;
+                        let b2 = hw.base[ox_global + 2] as usize;
+                        let b3 = hw.base[ox_global + 3] as usize;
+                        // Tap 0: w[wo..wo+12:4], sr[base_j + 0]
+                        let s0 = i32x4::new([
+                            sr[b0] as i32,
+                            sr[b1] as i32,
+                            sr[b2] as i32,
+                            sr[b3] as i32,
+                        ]);
+                        let w0 = i32x4::new([
+                            hw.w[wo] as i32,
+                            hw.w[wo + 4] as i32,
+                            hw.w[wo + 8] as i32,
+                            hw.w[wo + 12] as i32,
+                        ]);
+                        let mut acc = s0 * w0;
+                        // Tap 1: w[wo+1..wo+13:4], sr[base_j + 1]
+                        let s1 = i32x4::new([
+                            sr[b0 + 1] as i32,
+                            sr[b1 + 1] as i32,
+                            sr[b2 + 1] as i32,
+                            sr[b3 + 1] as i32,
+                        ]);
+                        let w1 = i32x4::new([
+                            hw.w[wo + 1] as i32,
+                            hw.w[wo + 5] as i32,
+                            hw.w[wo + 9] as i32,
+                            hw.w[wo + 13] as i32,
+                        ]);
+                        acc = acc + s1 * w1;
+                        // Tap 2: w[wo+2..wo+14:4], sr[base_j + 2]
+                        let s2 = i32x4::new([
+                            sr[b0 + 2] as i32,
+                            sr[b1 + 2] as i32,
+                            sr[b2 + 2] as i32,
+                            sr[b3 + 2] as i32,
+                        ]);
+                        let w2 = i32x4::new([
+                            hw.w[wo + 2] as i32,
+                            hw.w[wo + 6] as i32,
+                            hw.w[wo + 10] as i32,
+                            hw.w[wo + 14] as i32,
+                        ]);
+                        acc = acc + s2 * w2;
+                        // Tap 3: w[wo+3..wo+15:4], sr[base_j + 3]
+                        let s3 = i32x4::new([
+                            sr[b0 + 3] as i32,
+                            sr[b1 + 3] as i32,
+                            sr[b2 + 3] as i32,
+                            sr[b3 + 3] as i32,
+                        ]);
+                        let w3 = i32x4::new([
+                            hw.w[wo + 3] as i32,
+                            hw.w[wo + 7] as i32,
+                            hw.w[wo + 11] as i32,
+                            hw.w[wo + 15] as i32,
+                        ]);
+                        acc = acc + s3 * w3 + i32x4::splat(2048);
+                        let [r0, r1, r2, r3] = (acc >> 12_i32).to_array();
+                        dr[ox_local] = r0.clamp(0, 255) as u8;
+                        dr[ox_local + 1] = r1.clamp(0, 255) as u8;
+                        dr[ox_local + 2] = r2.clamp(0, 255) as u8;
+                        dr[ox_local + 3] = r3.clamp(0, 255) as u8;
+                        ox_local += 4;
+                    }
+                    for ox_local in ox_local..tile_w {
+                        let ox_global = out_x0 + ox_local;
+                        let b = hw.base[ox_global] as usize;
+                        let wo = ox_global * 4;
+                        let s = (sr[b] as i32 * hw.w[wo] as i32
+                            + sr[b + 1] as i32 * hw.w[wo + 1] as i32
+                            + sr[b + 2] as i32 * hw.w[wo + 2] as i32
+                            + sr[b + 3] as i32 * hw.w[wo + 3] as i32
+                            + 2048)
+                            >> 12;
+                        dr[ox_local] = s.clamp(0, 255) as u8;
+                    }
                 }
-                row_prev = y as u8;
-            }
-        }
-        (mad, tv, luma)
-    })
-    .reduce(|| (0u64, 0u64, 0u64),
-        |(m1, t1, l1), (m2, t2, l2)| (m1 + m2, t1 + t2, l1 + l2));
+                // ── Vertical pass: tile_horiz → dst (SIMD 4-col batches) ──
+                // Also writes to blur_copy and accumulates MAD/TV/luma for mo­tion
+                // adaptation (eliminates the separate MAD/TV/Copy loop).
+                for oy in out_y0..out_y1 {
+                    let b = (vw.base[oy] as usize) - src_y0;
+                    let wo = oy * 4;
+                    let (w0, w1, w2, w3) =
+                        (vw.w32[wo], vw.w32[wo + 1], vw.w32[wo + 2], vw.w32[wo + 3]);
+                    let wv0 = i32x4::splat(w0);
+                    let wv1 = i32x4::splat(w1);
+                    let wv2 = i32x4::splat(w2);
+                    let wv3 = i32x4::splat(w3);
+                    // SAFETY: Each tile writes to a unique (oy, ox) region.
+                    let dst_base = dst_addr as *mut u8;
+                    let dst_row = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            dst_base.add(oy * dst_stride + out_x0),
+                            tile_w,
+                        )
+                    };
+                    let mut ox = 0usize;
+                    while ox + 4 <= tile_w {
+                        let s0 = i32x4::new([
+                            tile_horiz[b * tile_w + ox] as i32,
+                            tile_horiz[b * tile_w + ox + 1] as i32,
+                            tile_horiz[b * tile_w + ox + 2] as i32,
+                            tile_horiz[b * tile_w + ox + 3] as i32,
+                        ]);
+                        let s1 = i32x4::new([
+                            tile_horiz[(b + 1) * tile_w + ox] as i32,
+                            tile_horiz[(b + 1) * tile_w + ox + 1] as i32,
+                            tile_horiz[(b + 1) * tile_w + ox + 2] as i32,
+                            tile_horiz[(b + 1) * tile_w + ox + 3] as i32,
+                        ]);
+                        let s2 = i32x4::new([
+                            tile_horiz[(b + 2) * tile_w + ox] as i32,
+                            tile_horiz[(b + 2) * tile_w + ox + 1] as i32,
+                            tile_horiz[(b + 2) * tile_w + ox + 2] as i32,
+                            tile_horiz[(b + 2) * tile_w + ox + 3] as i32,
+                        ]);
+                        let s3 = i32x4::new([
+                            tile_horiz[(b + 3) * tile_w + ox] as i32,
+                            tile_horiz[(b + 3) * tile_w + ox + 1] as i32,
+                            tile_horiz[(b + 3) * tile_w + ox + 2] as i32,
+                            tile_horiz[(b + 3) * tile_w + ox + 3] as i32,
+                        ]);
+                        let acc = s0 * wv0 + s1 * wv1 + s2 * wv2 + s3 * wv3 + i32x4::splat(2048);
+                        let [r0, r1, r2, r3] = (acc >> 12_i32).to_array();
+                        dst_row[ox] = r0.clamp(0, 255) as u8;
+                        dst_row[ox + 1] = r1.clamp(0, 255) as u8;
+                        dst_row[ox + 2] = r2.clamp(0, 255) as u8;
+                        dst_row[ox + 3] = r3.clamp(0, 255) as u8;
+                        ox += 4;
+                    }
+                    for ox in ox..tile_w {
+                        let s = (tile_horiz[b * tile_w + ox] as i32 * w0
+                            + tile_horiz[(b + 1) * tile_w + ox] as i32 * w1
+                            + tile_horiz[(b + 2) * tile_w + ox] as i32 * w2
+                            + tile_horiz[(b + 3) * tile_w + ox] as i32 * w3
+                            + 2048)
+                            >> 12;
+                        dst_row[ox] = s.clamp(0, 255) as u8;
+                    }
+                    // ── blur_copy + MAD/TV/luma (dst_row is hot in L1) ──
+                    let bc_base = bc_addr as *mut u8;
+                    let bc_row = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            bc_base.add(oy * dst_stride + out_x0),
+                            tile_w,
+                        )
+                    };
+                    let prev_row = &prev[oy * dst_w + out_x0..][..tile_w];
+                    let mut row_prev = dst_row[0];
+                    for ox in 0..tile_w {
+                        let y = dst_row[ox] as u32;
+                        bc_row[ox] = y as u8;
+                        mad += (y as i32 - prev_row[ox] as i32).unsigned_abs() as u64;
+                        luma += y as u64;
+                        // TV: first pixel of each tile misses the neighbor to its left
+                        // from the previous tile (processed by another thread).  Error:
+                        // ~0.3% for 720p — negligible for contrast adaptation.
+                        if ox > 0 {
+                            tv += (y as i32 - row_prev as i32).unsigned_abs() as u64;
+                        }
+                        row_prev = y as u8;
+                    }
+                }
+                (mad, tv, luma)
+            },
+        )
+        .reduce(
+            || (0u64, 0u64, 0u64),
+            |(m1, t1, l1), (m2, t2, l2)| (m1 + m2, t1 + t2, l1 + l2),
+        );
     (mad, tv, luma)
 }
 
@@ -917,10 +1055,19 @@ fn bicubic_scale_y_with_weights(src: &[u8], src_w: usize, src_h: usize,
 /// temp holds the native-resolution I420 frame (reused across frames).
 /// blur_copy and prev are sections of tmp_argb for MAD fusion.
 /// Returns (mad_sum, tv_sum, luma_sum).
-fn scale_bgra_direct(bgra: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32,
-    i420_out: &mut Vec<u8>, temp: &mut Vec<u8>,
-    h_weights: &BicubicWeights, v_weights: &BicubicWeights,
-    blur_copy: &mut [u8], prev: &[u8]) -> (u64, u64, u64) {
+fn scale_bgra_direct(
+    bgra: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    i420_out: &mut Vec<u8>,
+    temp: &mut Vec<u8>,
+    h_weights: &BicubicWeights,
+    v_weights: &BicubicWeights,
+    blur_copy: &mut [u8],
+    prev: &[u8],
+) -> (u64, u64, u64) {
     // Step 1: BGRA → I420 at native resolution
     let src_y_size = (src_w * src_h) as usize;
     let src_uv_size = ((src_w / 2) * (src_h / 2)) as usize;
@@ -936,7 +1083,9 @@ fn scale_bgra_direct(bgra: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
     let total = dst_y_size + 2 * dst_uv_size;
     i420_out.clear();
     i420_out.reserve(total);
-    unsafe { i420_out.set_len(total); }
+    unsafe {
+        i420_out.set_len(total);
+    }
     let out = &mut i420_out[..total];
     let (src_y, src_rest) = temp.split_at(src_y_size);
     let (src_u, src_v) = src_rest.split_at(src_uv_size);
@@ -944,9 +1093,18 @@ fn scale_bgra_direct(bgra: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
     let (dst_u, dst_v) = dst_rest.split_at_mut(dst_uv_size);
 
     // Tile-based bicubic Y (fused MAD/TV/luma)
-    let (mad, tv, luma) = bicubic_scale_y_with_weights(src_y, src_w as usize, src_h as usize,
-        dst_y, dst_w as usize, dst_h as usize, h_weights, v_weights,
-        blur_copy, prev);
+    let (mad, tv, luma) = bicubic_scale_y_with_weights(
+        src_y,
+        src_w as usize,
+        src_h as usize,
+        dst_y,
+        dst_w as usize,
+        dst_h as usize,
+        h_weights,
+        v_weights,
+        blur_copy,
+        prev,
+    );
 
     // Bilinear UV via SIMD-accelerated libyuv (separate pass but fast)
     let uv_src_w = (src_w / 2) as usize;
@@ -956,9 +1114,23 @@ fn scale_bgra_direct(bgra: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
     let uv_src_sz = ImageSize::new(uv_src_w, uv_src_h);
     let uv_dst_sz = ImageSize::new(uv_dst_w, uv_dst_h);
     let _ = vnrit_libyuv::scale_plane(
-        src_u, uv_src_w, uv_src_sz, dst_u, uv_dst_w, uv_dst_sz, FilterMode::Bilinear);
+        src_u,
+        uv_src_w,
+        uv_src_sz,
+        dst_u,
+        uv_dst_w,
+        uv_dst_sz,
+        FilterMode::Bilinear,
+    );
     let _ = vnrit_libyuv::scale_plane(
-        src_v, uv_src_w, uv_src_sz, dst_v, uv_dst_w, uv_dst_sz, FilterMode::Bilinear);
+        src_v,
+        uv_src_w,
+        uv_src_sz,
+        dst_v,
+        uv_dst_w,
+        uv_dst_sz,
+        FilterMode::Bilinear,
+    );
     (mad, tv, luma)
 }
 
@@ -1019,15 +1191,15 @@ fn edge_refine_weight(grad: u32, diff: u32) -> u32 {
 #[repr(C)]
 struct EnhanceTables {
     /// |Y-blur| → blend weight [0, 128]. Flat areas smoothed toward blur.
-    denoise:      [u8;  256],
+    denoise: [u8; 256],
     /// edge_refine_weight → contrast boost [0, 32] (Q5).
-    edge_boost:   [u8;  256],
+    edge_boost: [u8; 256],
     /// |diff| → non-linear gain (Q8). Feature Self-Transform quadratic mapping.
-    nonlinear:    [u16; 256],
+    nonlinear: [u16; 256],
     /// Y → Q8 amount multiplier [128, 512]. Midtones peak at 2.0×.
-    midtone:      [u16; 256],
+    midtone: [u16; 256],
     /// Y_in → Y_out S-curve (fallback kept for validation; branchless path preferred).
-    tone_curve:   [u8;  256],
+    tone_curve: [u8; 256],
 }
 
 /// Branchless S-curve tone mapping: arithmetic computation, no table lookup.
@@ -1036,8 +1208,8 @@ struct EnhanceTables {
 #[inline(always)]
 fn tone_curve_branchless(v: u8) -> u8 {
     let v = v as u32;
-    let lift = (64u32.saturating_sub(v)) * 6 / 64;   // +6 at v=0, 0 at v>=64
-    let comp = v.saturating_sub(191) * 4 / 64;        // 0 at v<=191, -4 at v=255
+    let lift = (64u32.saturating_sub(v)) * 6 / 64; // +6 at v=0, 0 at v>=64
+    let comp = v.saturating_sub(191) * 4 / 64; // 0 at v<=191, -4 at v=255
     (v + lift - comp) as u8
 }
 
@@ -1052,10 +1224,19 @@ const fn build_edge_boost_table() -> [u8; 256] {
     while i < 256 {
         // Peak boost at moderate weight (real edge, after pullback)
         // Zero at weight=0 (flat) and weight=192 (full preserve, no need)
-        t[i] = if i < 32 { 0 }
-            else if i < 128 { ((i as u32 - 32) * 32 / 96) as u8 }     // 0 → 32
-            else if i < 192 { (32 - (i as u32 - 128) * 32 / 64) as u8 } // 32 → 0
-            else { 0 };
+        t[i] = if i < 32 {
+            0
+        } else if i < 128 {
+            ((i as u32 - 32) * 32 / 96) as u8
+        }
+        // 0 → 32
+        else if i < 192 {
+            (32 - (i as u32 - 128) * 32 / 64) as u8
+        }
+        // 32 → 0
+        else {
+            0
+        };
         i += 1;
     }
     t
@@ -1076,7 +1257,7 @@ const fn build_denoise_table() -> [u8; 256] {
     let mut i = 0usize;
     while i < 256 {
         t[i] = if i < 1 { 128 }        // |diff| = 0: 50% blend, remove single-pixel noise
-            else { 0 };                 // |diff| ≥ 1: preserve all texture
+            else { 0 }; // |diff| ≥ 1: preserve all texture
         i += 1;
     }
     t
@@ -1095,15 +1276,28 @@ const fn build_nonlinear_table() -> [u16; 256] {
     let mut t = [0u16; 256];
     let mut i = 0usize;
     while i < 256 {
-        t[i] = if i == 0 { 0 }
-            else if i < 3 { (32 + (i - 1) as u32 * 32) as u16 }            // [32, 64]
-            else if i < 6 { (128 + (i - 3) as u32 * 128 / 3) as u16 }       // [128, 256]
-            else if i < 11 { (256 + (i - 6) as u32 * 256 / 5) as u16 }      // [256, 512]
-            else if i < 33 { (512 - (i - 11) as u32 * 256 / 22) as u16 }    // [512, 256]
-            else {
-                let v = 256 - (i - 33) as u32 * 128 / 223;
-                (if v < 128 { 128 } else { v }) as u16
-            };
+        t[i] = if i == 0 {
+            0
+        } else if i < 3 {
+            (32 + (i - 1) as u32 * 32) as u16
+        }
+        // [32, 64]
+        else if i < 6 {
+            (128 + (i - 3) as u32 * 128 / 3) as u16
+        }
+        // [128, 256]
+        else if i < 11 {
+            (256 + (i - 6) as u32 * 256 / 5) as u16
+        }
+        // [256, 512]
+        else if i < 33 {
+            (512 - (i - 11) as u32 * 256 / 22) as u16
+        }
+        // [512, 256]
+        else {
+            let v = 256 - (i - 33) as u32 * 128 / 223;
+            (if v < 128 { 128 } else { v }) as u16
+        };
         i += 1;
     }
     t
@@ -1121,14 +1315,26 @@ const fn build_luma_boost_table() -> [u16; 256] {
     let mut t = [0u16; 256];
     let mut i = 0usize;
     while i < 256 {
-        t[i] = if i < 32 { (256 + (32 - i as u32) * 192 / 32) as u16 }     // [448, 256]
-            else if i < 64 { (256 + (64 - i as u32) * 192 / 32) as u16 }    // [256, 448]
-            else if i < 160 { 256u16 }                                        // 1.0×
-            else if i < 192 { (256 - (i - 160) as u32 * 128 / 32) as u16 }   // [256, 128]
-            else {
-                let v = 128 - (i - 192) as u32 * 128 / 64;
-                (if v > 128 { v } else { 128 }) as u16                        // clamp(128)
-            };
+        t[i] = if i < 32 {
+            (256 + (32 - i as u32) * 192 / 32) as u16
+        }
+        // [448, 256]
+        else if i < 64 {
+            (256 + (64 - i as u32) * 192 / 32) as u16
+        }
+        // [256, 448]
+        else if i < 160 {
+            256u16
+        }
+        // 1.0×
+        else if i < 192 {
+            (256 - (i - 160) as u32 * 128 / 32) as u16
+        }
+        // [256, 128]
+        else {
+            let v = 128 - (i - 192) as u32 * 128 / 64;
+            (if v > 128 { v } else { 128 }) as u16 // clamp(128)
+        };
         i += 1;
     }
     t
@@ -1149,10 +1355,15 @@ const fn build_midtone_table() -> [u16; 256] {
     let mut t = [0u16; 256];
     let mut i = 0usize;
     while i < 256 {
-        t[i] = if i < 96 { (128 + i as u32 * 128 / 96) as u16 }
-            else if i < 128 { (256 + (i - 96) as u32 * 256 / 32) as u16 }
-            else if i < 160 { (512 - (i - 128) as u32 * 256 / 32) as u16 }
-            else { (256 - (i - 160) as u32 * 128 / 95) as u16 };
+        t[i] = if i < 96 {
+            (128 + i as u32 * 128 / 96) as u16
+        } else if i < 128 {
+            (256 + (i - 96) as u32 * 256 / 32) as u16
+        } else if i < 160 {
+            (512 - (i - 128) as u32 * 256 / 32) as u16
+        } else {
+            (256 - (i - 160) as u32 * 128 / 95) as u16
+        };
         i += 1;
     }
     t
@@ -1184,10 +1395,10 @@ const fn build_tone_curve() -> [u8; 256] {
 }
 
 const ENHANCE_TABLES: EnhanceTables = EnhanceTables {
-    denoise:    build_denoise_table(),
+    denoise: build_denoise_table(),
     edge_boost: build_edge_boost_table(),
-    nonlinear:  build_nonlinear_table(),
-    midtone:    build_midtone_table(),
+    nonlinear: build_nonlinear_table(),
+    midtone: build_midtone_table(),
     tone_curve: build_tone_curve(),
 };
 
@@ -1206,9 +1417,7 @@ fn edge_refine_weight_simd(grad: i16x8, raw_diff: i16x8) -> i16x8 {
     let c1 = g.simd_ge(s1) & d.simd_ge(s1);
     let nc3 = !c3;
     let nc2 = !c2;
-    (c3 & i16x8::splat(192))
-        | (nc3 & c2 & i16x8::splat(128))
-        | (nc3 & nc2 & c1 & i16x8::splat(64))
+    (c3 & i16x8::splat(192)) | (nc3 & c2 & i16x8::splat(128)) | (nc3 & nc2 & c1 & i16x8::splat(64))
 }
 
 /// SIMD texture adaptation: (prev_abs_diff, abs_diff) → Q8 multiplier {192, 256}.
@@ -1242,8 +1451,8 @@ fn nonlinear_gain_simd(d: i16x8) -> i16x8 {
     let s3_val = i16x8::splat(128) + (d - i16x8::splat(3)) * i16x8::splat(43);
     // Segment 4: d ∈ [6, 10] → gain = 256 + (d-6)×51, clamp 512
     let s4_pred = d.simd_ge(i16x8::splat(6)) & d.simd_le(i16x8::splat(10));
-    let s4_val = (i16x8::splat(256) + (d - i16x8::splat(6)) * i16x8::splat(51))
-        .min(i16x8::splat(512));
+    let s4_val =
+        (i16x8::splat(256) + (d - i16x8::splat(6)) * i16x8::splat(51)).min(i16x8::splat(512));
     // Segment 5: d ∈ [11, 32] → gain = 512 - (d-11)×12
     let s5_pred = d.simd_ge(i16x8::splat(11)) & d.simd_le(i16x8::splat(32));
     let s5_val = i16x8::splat(512) - (d - i16x8::splat(11)) * i16x8::splat(12);
@@ -1251,18 +1460,14 @@ fn nonlinear_gain_simd(d: i16x8) -> i16x8 {
     let s6_pred = d.simd_gt(i16x8::splat(32));
     let s6_val = (i16x8::splat(256)
         - (d - i16x8::splat(33)) * i16x8::splat(128) / i16x8::splat(223))
-        .max(i16x8::splat(128));
+    .max(i16x8::splat(128));
     // Blend: start with 0, layer each segment (non-overlapping by design)
     let m2 = s2_pred;
     let m3 = s3_pred;
     let m4 = s4_pred;
     let m5 = s5_pred;
     let m6 = s6_pred;
-    (z & !m2) | (s2_val & m2)
-        | (s3_val & m3)
-        | (s4_val & m4)
-        | (s5_val & m5)
-        | (s6_val & m6)
+    (z & !m2) | (s2_val & m2) | (s3_val & m3) | (s4_val & m4) | (s5_val & m5) | (s6_val & m6)
 }
 
 /// SIMD midtone clarity boost: Y → Q8 multiplier [128, 512].
@@ -1321,9 +1526,18 @@ fn tone_curve_simd(v: i16x8) -> i16x8 {
 /// This avoids a separate `prev` allocation.  `blur_buf` is `tmp_argb`
 /// from the capture pipeline (already ≈3 MB), so the 2× expansion from
 /// `y_size` to `2×y_size` never reallocates after the first frame.
-fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
-    blur_buf: &mut Vec<u8>, chroma_tick: &mut u32, last_chroma_boost: &mut u32,
-    mad_sum: u64, tv_sum: u64, luma_sum: u64) {
+fn apply_enhancement(
+    i420: &mut [u8],
+    w: usize,
+    h: usize,
+    strength: f32,
+    blur_buf: &mut Vec<u8>,
+    chroma_tick: &mut u32,
+    last_chroma_boost: &mut u32,
+    mad_sum: u64,
+    tv_sum: u64,
+    luma_sum: u64,
+) {
     if strength <= 0.0 || w < 3 || h < 3 {
         return;
     }
@@ -1337,7 +1551,9 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
     if blur_buf.len() != total_req {
         blur_buf.clear();
         blur_buf.reserve(total_req);
-        unsafe { blur_buf.set_len(total_req); }
+        unsafe {
+            blur_buf.set_len(total_req);
+        }
         let y_plane = &i420[..y_size];
         // blur_copy section is already written by tile scaling if scaling was
         // needed; for a no-scaling transition or first frame, copy it here.
@@ -1387,11 +1603,7 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
     // Resolution-adaptive radius: 640px→2, 1280px→3, 1920px→4
     let blur_radius = ((w + 320) / 640).clamp(2, 4);
     {
-        let mut img = BlurImageMut::borrow(
-            blur_copy,
-            w as u32, h as u32,
-            FastBlurChannels::Plane,
-        );
+        let mut img = BlurImageMut::borrow(blur_copy, w as u32, h as u32, FastBlurChannels::Plane);
         let radius = AnisotropicRadius::new(blur_radius as u32);
         let _ = libblur::stack_blur(&mut img, radius, ThreadingPolicy::Single);
     }
@@ -1453,7 +1665,7 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
             y_plane[row_start - 1] as i16
         };
         let mut carry_y2 = carry_in;
-        let mut carry_abs_diff: i16 = 0;  // resets at row start
+        let mut carry_abs_diff: i16 = 0; // resets at row start
 
         // ── SIMD: process 8-pixel chunks ──
         // ═══════════════════════════════════════════════════════════════════
@@ -1502,23 +1714,23 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
                 u8_buf[..8].copy_from_slice(&y_plane[chunk - w..chunk - w + 8]);
                 i16x8::from_u8x16_low(u8x16::new(u8_buf))
             } else {
-                z  // first row: vgrad = 0
+                z // first row: vgrad = 0
             };
 
             // raw_diff = |y - b|
-            let raw_diff = (y_v - b_v).abs();            // ── Denoise: blend Y→blur in flat areas ──
+            let raw_diff = (y_v - b_v).abs(); // ── Denoise: blend Y→blur in flat areas ──
             let raw_dc = raw_diff.min(o);
             let w_d = (o - raw_dc) * s128;
             let y2 = i16x8::from_i32x8_saturate(
-                (y_v.mul_widen(s256 - w_d) + b_v.mul_widen(w_d) + s128_i32) >> 8_i32
+                (y_v.mul_widen(s256 - w_d) + b_v.mul_widen(w_d) + s128_i32) >> 8_i32,
             );
 
             // ── Edge refine ──
             let y2_arr = y2.to_array();
             // Shifted-lane trick: hgrad[j] = |y2_j - y2_{j-1}|
             let shifted_y2 = i16x8::new([
-                carry_y2, y2_arr[0], y2_arr[1], y2_arr[2],
-                y2_arr[3], y2_arr[4], y2_arr[5], y2_arr[6],
+                carry_y2, y2_arr[0], y2_arr[1], y2_arr[2], y2_arr[3], y2_arr[4], y2_arr[5],
+                y2_arr[6],
             ]);
             carry_y2 = y2_arr[7];
             let hgrad = (y2 - shifted_y2).abs();
@@ -1531,7 +1743,7 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
 
             // blended = blend(b, y2, weight) — safe via i32x8 widen
             let blended = i16x8::from_i32x8_saturate(
-                (b_v.mul_widen(s256 - weight) + y2.mul_widen(weight) + s128_i32) >> 8_i32
+                (b_v.mul_widen(s256 - weight) + y2.mul_widen(weight) + s128_i32) >> 8_i32,
             );
 
             // Edge boost
@@ -1549,38 +1761,40 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
             // Texture weight: shifted-lane for prev_abs_diff
             let ad_arr = abs_diff.to_array();
             let shifted_ad = i16x8::new([
-                carry_abs_diff, ad_arr[0], ad_arr[1], ad_arr[2],
-                ad_arr[3], ad_arr[4], ad_arr[5], ad_arr[6],
+                carry_abs_diff,
+                ad_arr[0],
+                ad_arr[1],
+                ad_arr[2],
+                ad_arr[3],
+                ad_arr[4],
+                ad_arr[5],
+                ad_arr[6],
             ]);
             carry_abs_diff = ad_arr[7];
             let texture_q8 = texture_weight_simd(shifted_ad, abs_diff);
 
             // ── Overflow-safe multiplications via i32x8 widening ──
             // combined_q8 = (motion_factor × texture_q8 + 128) >> 8
-            let combined_q8 = i16x8::from_i32x8_saturate(
-                (mf_v.mul_widen(texture_q8) + s128_i32) >> 8_i32
-            );
+            let combined_q8 =
+                i16x8::from_i32x8_saturate((mf_v.mul_widen(texture_q8) + s128_i32) >> 8_i32);
 
             // amount = ((effective_base × combined_q8 + 128) >> 8).min(1023)
-            let amount = i16x8::from_i32x8_saturate(
-                (eb_v.mul_widen(combined_q8) + s128_i32) >> 8_i32
-            ).min(s1023);
+            let amount =
+                i16x8::from_i32x8_saturate((eb_v.mul_widen(combined_q8) + s128_i32) >> 8_i32)
+                    .min(s1023);
 
             // amount = ((amount × midtone_q8 + 128) >> 8).min(1023)
             let midtone_q8 = midtone_gain_simd(y2);
-            let amount = i16x8::from_i32x8_saturate(
-                (amount.mul_widen(midtone_q8) + s128_i32) >> 8_i32
-            ).min(s1023);
+            let amount =
+                i16x8::from_i32x8_saturate((amount.mul_widen(midtone_q8) + s128_i32) >> 8_i32)
+                    .min(s1023);
 
             // adj_a = (diff × nonlinear_gain + 128) >> 8
-            let adj_a = i16x8::from_i32x8_saturate(
-                (diff.mul_widen(nonlinear_gain) + s128_i32) >> 8_i32
-            );
+            let adj_a =
+                i16x8::from_i32x8_saturate((diff.mul_widen(nonlinear_gain) + s128_i32) >> 8_i32);
 
             // adj = (adj_a × amount + 128) >> 8
-            let adj = i16x8::from_i32x8_saturate(
-                (adj_a.mul_widen(amount) + s128_i32) >> 8_i32
-            );
+            let adj = i16x8::from_i32x8_saturate((adj_a.mul_widen(amount) + s128_i32) >> 8_i32);
 
             // Accumulate |adj| for chroma saturation boost
             let adj_arr = adj.to_array();
@@ -1629,8 +1843,8 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
             let blended = (b * (256 - weight) + y2 * weight + 128) >> 8;
             let boost = ENHANCE_TABLES.edge_boost[weight as usize] as u32;
             let edge_diff = (y2 as i32 - blended as i32) as i32;
-            let boosted = (blended as i32 + ((edge_diff * boost as i32 + 16) >> 5))
-                .clamp(0, 255) as u8;
+            let boosted =
+                (blended as i32 + ((edge_diff * boost as i32 + 16) >> 5)).clamp(0, 255) as u8;
 
             // ── USM ──
             let diff = y2 as i32 - boosted as i32;
@@ -1679,15 +1893,21 @@ fn apply_enhancement(i420: &mut [u8], w: usize, h: usize, strength: f32,
 /// BGRA → I420, writing into a pre-sized buffer (no resize).
 /// Buffer must have capacity >= width * height * 3 / 2.
 fn bgra_to_i420_into(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
-    let src = ArgbImage { data: bgra, stride: (width * 4) as usize };
+    let src = ArgbImage {
+        data: bgra,
+        stride: (width * 4) as usize,
+    };
     let y_size = (width * height) as usize;
     let uv_size = ((width / 2) * (height / 2)) as usize;
     let (y_plane, rest) = out.split_at_mut(y_size);
     let (u_plane, v_plane) = rest.split_at_mut(uv_size);
     let mut dst = I420ImageMut {
-        y: y_plane, y_stride: width as usize,
-        u: u_plane, u_stride: (width / 2) as usize,
-        v: v_plane, v_stride: (width / 2) as usize,
+        y: y_plane,
+        y_stride: width as usize,
+        u: u_plane,
+        u_stride: (width / 2) as usize,
+        v: v_plane,
+        v_stride: (width / 2) as usize,
     };
     let size = ImageSize::new(width as usize, height as usize);
     let _ = vnrit_libyuv::argb_to_i420(&src, &mut dst, size);
@@ -1738,18 +1958,21 @@ impl VideoEncoder {
     /// Returns true if bitrate was actually changed.
     fn set_bitrate(&mut self, new_bps: u32) -> bool {
         const MIN_GAP: std::time::Duration = std::time::Duration::from_secs(5);
-        if self.last_adjust.elapsed() < MIN_GAP { return false; }
-        if (new_bps as i32 - self.last_bitrate_bps as i32).abs() < 50000 { return false; }
+        if self.last_adjust.elapsed() < MIN_GAP {
+            return false;
+        }
+        if (new_bps as i32 - self.last_bitrate_bps as i32).abs() < 50000 {
+            return false;
+        }
         let clamped = new_bps.clamp(100_000, 10_000_000);
         let mut val: i32 = clamped as i32;
         // SAFETY: set_option with ENCODER_OPTION_BITRATE is a well-defined
         // operation in openh264's public C API — the encoder handles mid-stream
         // bitrate changes safely without requiring re-initialization.
         unsafe {
-            self.inner.raw_api().set_option(
-                ENCODER_OPTION_BITRATE,
-                std::ptr::addr_of_mut!(val).cast(),
-            );
+            self.inner
+                .raw_api()
+                .set_option(ENCODER_OPTION_BITRATE, std::ptr::addr_of_mut!(val).cast());
         }
         let old_bps = self.last_bitrate_bps;
         self.last_bitrate_bps = clamped;
@@ -1759,7 +1982,11 @@ impl VideoEncoder {
         // the encoder's internal rate control.
         if clamped < old_bps && (old_bps - clamped) > old_bps * 30 / 100 {
             self.inner.force_intra_frame();
-            log::info!("[encoder] {}→{}kbps (IDR forced)", old_bps / 1000, clamped / 1000);
+            log::info!(
+                "[encoder] {}→{}kbps (IDR forced)",
+                old_bps / 1000,
+                clamped / 1000
+            );
         } else {
             log::info!("[encoder] {}→{}kbps", old_bps / 1000, clamped / 1000);
         }
@@ -1772,11 +1999,16 @@ impl VideoEncoder {
         let y_size = w * h;
         let uv_size = (w / 2) * (h / 2);
         let slices = YUVSlices::new(
-            (&i420[..y_size], &i420[y_size..y_size + uv_size], &i420[y_size + uv_size..]),
+            (
+                &i420[..y_size],
+                &i420[y_size..y_size + uv_size],
+                &i420[y_size + uv_size..],
+            ),
             (w, h),
             (w, w / 2, w / 2),
         );
-        let bitstream = self.inner
+        let bitstream = self
+            .inner
             .encode(&slices)
             .context("openh264 encode failed")?;
         out.clear();
@@ -1813,13 +2045,19 @@ impl PeerConnectionEventHandler for WebrtcHandler {
             candidate.address = self.lan_ip.clone();
         }
 
-        log::debug!("[ice] candidate: {} {}:{} ...", candidate.typ, candidate.address, candidate.port);
+        log::debug!(
+            "[ice] candidate: {} {}:{} ...",
+            candidate.typ,
+            candidate.address,
+            candidate.port
+        );
 
         if let Ok(init) = candidate.to_json() {
             let msg = serde_json::to_string(&SignalingMessage::Ice {
                 candidate: init.candidate,
                 sdp_mline_index: init.sdp_mline_index.unwrap_or(0) as u32,
-            }).ok();
+            })
+            .ok();
             if let Some(msg) = msg {
                 if let Err(e) = self.ice_tx.try_send(msg) {
                     log::warn!("[ice] candidate send failed: {:?}", e);
@@ -1868,7 +2106,8 @@ impl PeerConnectionEventHandler for WebrtcHandler {
 /// Get all non-loopback LAN IPs + loopback fallback for local testing.
 fn get_local_ips() -> Vec<String> {
     let mut ips: Vec<String> = match if_addrs::get_if_addrs() {
-        Ok(ifaces) => ifaces.into_iter()
+        Ok(ifaces) => ifaces
+            .into_iter()
             .filter(|iface| !iface.is_loopback())
             .map(|iface| iface.ip().to_string())
             .collect(),
@@ -1904,97 +2143,106 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(async {
-    let args = Args::parse();
+        let args = Args::parse();
 
-    // Init logging from --log-level arg (falls back to RUST_LOG env var).
-    // Suppress noisy third-party library warnings (expected behavior, not actionable).
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(&args.log_level)
-    )
-    .filter(Some("rtc_ice"), log::LevelFilter::Error)
-    .filter(Some("rtc::peer_connection"), log::LevelFilter::Error)
-    .filter(Some("webrtc::peer_connection::driver"), log::LevelFilter::Off)
-    .filter(Some("rtc_dtls"), log::LevelFilter::Error)
-    .filter(Some("openh264"), log::LevelFilter::Error)
-    .format_timestamp(None)
-    .init();
+        // Init logging from --log-level arg (falls back to RUST_LOG env var).
+        // Suppress noisy third-party library warnings (expected behavior, not actionable).
+        env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or(&args.log_level),
+        )
+        .filter(Some("rtc_ice"), log::LevelFilter::Error)
+        .filter(Some("rtc::peer_connection"), log::LevelFilter::Error)
+        .filter(
+            Some("webrtc::peer_connection::driver"),
+            log::LevelFilter::Off,
+        )
+        .filter(Some("rtc_dtls"), log::LevelFilter::Error)
+        .filter(Some("openh264"), log::LevelFilter::Error)
+        .format_timestamp(None)
+        .init();
 
-    let token = args.token.clone();
-    // Pre-render HTML once at startup (avoids template substitution on every request).
-    let index_html = include_str!("index.html")
-        .replace("{{STUN_SERVER}}", &args.stun)
-        .replace("{{PAKO_JS}}", include_str!("pako_inflate.min.js"));
-    let state = ServerState {
-        args: Arc::new(args),
-        token,
-        index_html: Arc::new(index_html),
-        keycode_cache: std::sync::OnceLock::new(),
-    };
+        let token = args.token.clone();
+        // Pre-render HTML once at startup (avoids template substitution on every request).
+        let index_html = include_str!("index.html")
+            .replace("{{STUN_SERVER}}", &args.stun)
+            .replace("{{PAKO_JS}}", include_str!("pako_inflate.min.js"));
+        let state = ServerState {
+            args: Arc::new(args),
+            token,
+            index_html: Arc::new(index_html),
+            keycode_cache: std::sync::OnceLock::new(),
+        };
 
-    // ── Signal handler: release stuck XTest keys before exit ──
-    // When streaming vnrit's own display (e.g. `:1`), pressing Ctrl+C in the
-    // browser injects Ctrl+C via XTest into the terminal, which sends SIGINT
-    // to vnrit. Without cleanup the X server keeps the keys held, causing
-    // keyboard repeat to flood the terminal with ^C after exit.
-    // Covers SIGINT/Ctrl+C, SIGTERM/kill, SIGQUIT/Ctrl+\ and SIGHUP/hangup.
-    use tokio::signal::unix::{signal, SignalKind};
-    let display = state.args.display.clone();
-    tokio::spawn(async move {
-        let mut sigint = signal(SignalKind::interrupt()).unwrap();
-        let mut sigterm = signal(SignalKind::terminate()).unwrap();
-        let mut sigquit = signal(SignalKind::quit()).unwrap();
-        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        // ── Signal handler: release stuck XTest keys before exit ──
+        // When streaming vnrit's own display (e.g. `:1`), pressing Ctrl+C in the
+        // browser injects Ctrl+C via XTest into the terminal, which sends SIGINT
+        // to vnrit. Without cleanup the X server keeps the keys held, causing
+        // keyboard repeat to flood the terminal with ^C after exit.
+        // Covers SIGINT/Ctrl+C, SIGTERM/kill, SIGQUIT/Ctrl+\ and SIGHUP/hangup.
+        use tokio::signal::unix::{SignalKind, signal};
+        let display = state.args.display.clone();
+        tokio::spawn(async move {
+            let mut sigint = signal(SignalKind::interrupt()).unwrap();
+            let mut sigterm = signal(SignalKind::terminate()).unwrap();
+            let mut sigquit = signal(SignalKind::quit()).unwrap();
+            let mut sighup = signal(SignalKind::hangup()).unwrap();
 
-        tokio::select! {
-            _ = sigint.recv() => log::info!("[signal] SIGINT received"),
-            _ = sigterm.recv() => log::info!("[signal] SIGTERM received"),
-            _ = sigquit.recv() => log::info!("[signal] SIGQUIT received"),
-            _ = sighup.recv() => log::info!("[signal] SIGHUP received"),
+            tokio::select! {
+                _ = sigint.recv() => log::info!("[signal] SIGINT received"),
+                _ = sigterm.recv() => log::info!("[signal] SIGTERM received"),
+                _ = sigquit.recv() => log::info!("[signal] SIGQUIT received"),
+                _ = sighup.recv() => log::info!("[signal] SIGHUP received"),
+            }
+
+            log::info!("[signal] releasing stuck XTest keys...");
+            let _ = tokio::task::spawn_blocking(move || {
+                let Ok((conn, _)) = connect_to_display(&display) else {
+                    return;
+                };
+                // Release all possible keycodes (unpressed ones are silently ignored)
+                for kc in 8..=255u8 {
+                    let _ = xtest::fake_input(&conn, X11_KEY_RELEASE, kc, 0, 0, 0, 0, 0);
+                }
+                let _ = conn.flush();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            })
+            .await;
+            log::info!("[signal] keys released, exiting");
+            std::process::exit(0);
+        });
+
+        let addr = format!("0.0.0.0:{}", state.args.port);
+        println!("vnrit listening on http://{}", addr);
+        println!("  Display: {}", state.args.display);
+        println!("  FPS    : {}", state.args.framerate);
+        println!("  Bitrate: {} kbps", state.args.bitrate);
+        if state.args.height > 0 {
+            println!("  Scale  : {}p", state.args.height);
+        } else {
+            println!("  Scale  : native (no scaling)");
+        }
+        if state.args.stun.is_empty() {
+            println!("  STUN   : disabled");
+        } else {
+            println!("  STUN   : {}", state.args.stun);
+        }
+        match &state.token {
+            Some(t) => println!("  Auth token: {} (required)", t),
+            None => println!("  Auth token: none (open access)"),
         }
 
-        log::info!("[signal] releasing stuck XTest keys...");
-        let _ = tokio::task::spawn_blocking(move || {
-            let Ok((conn, _)) = connect_to_display(&display) else { return };
-            // Release all possible keycodes (unpressed ones are silently ignored)
-            for kc in 8..=255u8 {
-                let _ = xtest::fake_input(&conn, X11_KEY_RELEASE, kc, 0, 0, 0, 0, 0);
-            }
-            let _ = conn.flush();
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }).await;
-        log::info!("[signal] keys released, exiting");
-        std::process::exit(0);
-    });
+        let app = Router::new()
+            .route("/", get(root_handler))
+            .route("/ws", get(ws_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
 
-    let addr = format!("0.0.0.0:{}", state.args.port);
-    println!("vnrit listening on http://{}", addr);
-    println!("  Display: {}", state.args.display);
-    println!("  FPS    : {}", state.args.framerate);
-    println!("  Bitrate: {} kbps", state.args.bitrate);
-    if state.args.height > 0 {
-        println!("  Scale  : {}p", state.args.height);
-    } else {
-        println!("  Scale  : native (no scaling)");
-    }
-    if state.args.stun.is_empty() {
-        println!("  STUN   : disabled");
-    } else {
-        println!("  STUN   : {}", state.args.stun);
-    }
-    match &state.token {
-        Some(t) => println!("  Auth token: {} (required)", t),
-        None => println!("  Auth token: none (open access)"),
-    }
-
-    let app = Router::new()
-        .route("/", get(root_handler))
-        .route("/ws", get(ws_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        axum::serve(listener, app).await?;
+        Ok(())
     })
 }
 
@@ -2064,7 +2312,9 @@ async fn auth_middleware(
             expected_token
         );
         if let Ok(hv) = cookie.parse() {
-            response.headers_mut().insert(axum::http::header::SET_COOKIE, hv);
+            response
+                .headers_mut()
+                .insert(axum::http::header::SET_COOKIE, hv);
         }
     }
 
@@ -2080,7 +2330,10 @@ fn connect_to_display(display: &str) -> Result<(RustConnection, usize)> {
     // Always construct the connection manually so we can set SO_RCVTIMEO
     // on the socket.  The X server is always on a local Unix socket or
     // Termux path — there is no remote display scenario.
-    let display_num: u16 = display.trim_start_matches(':').split('.').next()
+    let display_num: u16 = display
+        .trim_start_matches(':')
+        .split('.')
+        .next()
         .and_then(|s| s.parse().ok())
         .context("invalid display format")?;
 
@@ -2090,41 +2343,58 @@ fn connect_to_display(display: &str) -> Result<(RustConnection, usize)> {
         Ok(s) => s,
         Err(_) => {
             let termux_sock = format!(
-                "/data/data/com.termux/files/usr/tmp/.X11-unix/X{}", display_num
+                "/data/data/com.termux/files/usr/tmp/.X11-unix/X{}",
+                display_num
             );
             log::info!("[x11] connecting via Termux socket path: {}", termux_sock);
-            UnixStream::connect(&termux_sock)
-                .context("cannot connect to Termux X11 socket")?
+            UnixStream::connect(&termux_sock).context("cannot connect to Termux X11 socket")?
         }
     };
 
     // Set 5-second receive timeout on all X11 sockets so that blocking
     // reply() calls (e.g. mit-shm get_image) don't hang forever.
     let fd = unix_stream.as_raw_fd();
-    let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
+    let tv = libc::timeval {
+        tv_sec: 5,
+        tv_usec: 0,
+    };
     unsafe {
         libc::setsockopt(
-            fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
             &tv as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::timeval>() as libc::socklen_t,
         );
     }
     log::info!("[x11] SO_RCVTIMEO=5s set on display {}", display);
 
-    let (stream, (family, address)) = DefaultStream::from_unix_stream(unix_stream)
-        .context("from_unix_stream failed")?;
+    let (stream, (family, address)) =
+        DefaultStream::from_unix_stream(unix_stream).context("from_unix_stream failed")?;
     let (auth_name, auth_data) = get_auth(family, &address, display_num)
         .unwrap_or(None)
         .unwrap_or_else(|| (Vec::new(), Vec::new()));
-    let conn = RustConnection::connect_to_stream_with_auth_info(
-        stream, 0, auth_name, auth_data,
-    ).context("connect_to_stream failed")?;
+    let conn = RustConnection::connect_to_stream_with_auth_info(stream, 0, auth_name, auth_data)
+        .context("connect_to_stream failed")?;
     log::info!("[x11] connected");
     Ok((conn, 0usize))
 }
 
-fn setup_x11_connections(display: &str, keycode_cache: std::sync::Arc<std::collections::HashMap<u32, u8>>) -> Result<(Arc<CaptureState>, Arc<InputState>, u16, u16, u8, RustConnection)> {
-    log::info!("[x11] connecting to display {} (capture connection)", display);
+fn setup_x11_connections(
+    display: &str,
+    keycode_cache: std::sync::Arc<std::collections::HashMap<u32, u8>>,
+) -> Result<(
+    Arc<CaptureState>,
+    Arc<InputState>,
+    u16,
+    u16,
+    u8,
+    RustConnection,
+)> {
+    log::info!(
+        "[x11] connecting to display {} (capture connection)",
+        display
+    );
 
     let (cap_conn, screen_num) = connect_to_display(display)?;
     let screen = &cap_conn.setup().roots[screen_num];
@@ -2138,8 +2408,7 @@ fn setup_x11_connections(display: &str, keycode_cache: std::sync::Arc<std::colle
     let (inp_conn, _) = connect_to_display(display)?;
 
     // Verify XTest extension on input connection
-    let xtest_cookie = xtest::get_version(&inp_conn, 2, 2)
-        .context("XTest not available")?;
+    let xtest_cookie = xtest::get_version(&inp_conn, 2, 2).context("XTest not available")?;
     xtest_cookie.reply().context("XTest query failed")?;
 
     // Get current pointer position on input connection
@@ -2152,13 +2421,20 @@ fn setup_x11_connections(display: &str, keycode_cache: std::sync::Arc<std::colle
 
     log::info!(
         "[x11] connected, root=0x{:x}, pointer=({},{}), dims={}x{}, keycodes={}-{}",
-        root, ptr.root_x, ptr.root_y,
-        screen_width, screen_height,
-        setup.min_keycode, setup.max_keycode
+        root,
+        ptr.root_x,
+        ptr.root_y,
+        screen_width,
+        screen_height,
+        setup.min_keycode,
+        setup.max_keycode
     );
 
     // Third connection for event-driven cursor tracking via XI2
-    log::info!("[x11] connecting to display {} (xi2 event connection)", display);
+    log::info!(
+        "[x11] connecting to display {} (xi2 event connection)",
+        display
+    );
     let (evt_conn, _) = connect_to_display(display)?;
 
     // Query XI2 version
@@ -2166,13 +2442,22 @@ fn setup_x11_connections(display: &str, keycode_cache: std::sync::Arc<std::colle
         .context("XI2 query_version failed")?
         .reply()
         .context("XI2 query_version reply failed")?;
-    log::info!("[x11] XI2 version: {}.{}", xi_ver.major_version, xi_ver.minor_version);
+    log::info!(
+        "[x11] XI2 version: {}.{}",
+        xi_ver.major_version,
+        xi_ver.minor_version
+    );
 
     // Select XI_Motion events on root window for all master devices
-    xinput::xi_select_events(&evt_conn, root, &[EventMask {
-        deviceid: 1, // XIAllMasterDevices
-        mask: vec![XIEventMask::MOTION],
-    }]).context("XI2 select_events failed")?;
+    xinput::xi_select_events(
+        &evt_conn,
+        root,
+        &[EventMask {
+            deviceid: 1, // XIAllMasterDevices
+            mask: vec![XIEventMask::MOTION],
+        }],
+    )
+    .context("XI2 select_events failed")?;
     evt_conn.flush()?;
 
     let capture_state = Arc::new(CaptureState {
@@ -2192,7 +2477,14 @@ fn setup_x11_connections(display: &str, keycode_cache: std::sync::Arc<std::colle
         pressed_keys: std::sync::Mutex::new(std::collections::HashSet::new()),
     });
 
-    Ok((capture_state, input_state, screen_width, screen_height, screen_depth, evt_conn))
+    Ok((
+        capture_state,
+        input_state,
+        screen_width,
+        screen_height,
+        screen_depth,
+        evt_conn,
+    ))
 }
 
 /// Try to auto-detect the default PulseAudio sink's monitor source for system audio capture.
@@ -2210,14 +2502,19 @@ fn find_default_monitor() -> Option<String> {
         let _ = tx.send(());
     })));
 
-    if ctx.connect(None, pulse::context::FlagSet::NOFLAGS, None).is_err() {
+    if ctx
+        .connect(None, pulse::context::FlagSet::NOFLAGS, None)
+        .is_err()
+    {
         log::info!("[audio] PA connect failed");
         return None;
     }
 
     // Run mainloop until ready or timeout (~2s)
     for _ in 0..200 {
-        if mainloop.iterate(false).is_error() { break; }
+        if mainloop.iterate(false).is_error() {
+            break;
+        }
         if rx.try_recv().is_ok() && ctx.get_state() == pulse::context::State::Ready {
             break;
         }
@@ -2233,17 +2530,25 @@ fn find_default_monitor() -> Option<String> {
     // Query server info to get default sink name
     let (info_tx, info_rx) = block_mpsc::channel();
     let introspect = ctx.introspect();
-    introspect.get_server_info(Box::new(move |info: &pulse::context::introspect::ServerInfo| {
-        if let Some(ref name) = info.default_sink_name {
-            let _ = info_tx.send(name.to_string());
-        }
-    }));
+    introspect.get_server_info(Box::new(
+        move |info: &pulse::context::introspect::ServerInfo| {
+            if let Some(ref name) = info.default_sink_name {
+                let _ = info_tx.send(name.to_string());
+            }
+        },
+    ));
 
     for _ in 0..50 {
-        if mainloop.iterate(false).is_error() { break; }
+        if mainloop.iterate(false).is_error() {
+            break;
+        }
         if let Ok(name) = info_rx.try_recv() {
             let monitor = format!("{}.monitor", name);
-            log::info!("[audio] detected default sink '{}', monitor '{}'", name, monitor);
+            log::info!(
+                "[audio] detected default sink '{}', monitor '{}'",
+                name,
+                monitor
+            );
             return Some(monitor);
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -2300,7 +2605,8 @@ async fn run_signaling(
         payload_type: 102,
         ..Default::default()
     };
-    media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)
+    media_engine
+        .register_codec(video_codec.clone(), RtpCodecKind::Video)
         .context("register H264 codec")?;
 
     // ── Register Opus audio codec ──
@@ -2315,7 +2621,8 @@ async fn run_signaling(
         payload_type: 111,
         ..Default::default()
     };
-    media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)
+    media_engine
+        .register_codec(audio_codec.clone(), RtpCodecKind::Audio)
         .context("register Opus codec")?;
 
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)
@@ -2337,9 +2644,9 @@ async fn run_signaling(
     // ── SettingEngine: relax ICE timeouts for mobile/unstable networks ──
     let mut settings = SettingEngine::default();
     settings.set_ice_timeouts(
-        Some(std::time::Duration::from_secs(15)),  // disconnected (default 5s)
-        Some(std::time::Duration::from_secs(60)),  // failed (default 25s)
-        Some(std::time::Duration::from_secs(5)),   // keepalive (default 2s)
+        Some(std::time::Duration::from_secs(15)), // disconnected (default 5s)
+        Some(std::time::Duration::from_secs(60)), // failed (default 25s)
+        Some(std::time::Duration::from_secs(5)),  // keepalive (default 2s)
     );
     if state.args.tcp_only {
         settings.set_network_types(vec![NetworkType::Tcp4, NetworkType::Tcp6]);
@@ -2364,21 +2671,22 @@ async fn run_signaling(
         lan_ip,
     });
 
-    let rt = runtime::default_runtime()
-        .context("no webrtc runtime available")?;
+    let rt = runtime::default_runtime().context("no webrtc runtime available")?;
 
-    let pc = Box::new(PeerConnectionBuilder::new()
-        .with_configuration(config)
-        .with_setting_engine(settings)
-        .with_media_engine(media_engine)
-        .with_interceptor_registry(registry)
-        .with_handler(handler.clone())
-        .with_runtime(rt)
-        .with_udp_addrs(udp_addrs)
-        .with_tcp_addrs(tcp_addrs)
-        .build()
-        .await
-        .context("build PeerConnection")?);
+    let pc = Box::new(
+        PeerConnectionBuilder::new()
+            .with_configuration(config)
+            .with_setting_engine(settings)
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
+            .with_handler(handler.clone())
+            .with_runtime(rt)
+            .with_udp_addrs(udp_addrs)
+            .with_tcp_addrs(tcp_addrs)
+            .build()
+            .await
+            .context("build PeerConnection")?,
+    );
     log::info!("[pc] PeerConnection created");
 
     // ── Post-pc operations (tracks, offer/answer) — close pc on error ──
@@ -2400,11 +2708,11 @@ async fn run_signaling(
                 codec: rtp_codec.clone(),
                 ..Default::default()
             }],
-        )).context("create video track")?;
+        ))
+        .context("create video track")?;
         let track = Arc::new(track);
         let track_local: Arc<dyn TrackLocal> = track.clone();
-        pc.add_track(track_local).await
-            .context("add video track")?;
+        pc.add_track(track_local).await.context("add video track")?;
         log::info!("[pc] video track added");
 
         // ── Create audio track ──
@@ -2423,10 +2731,12 @@ async fn run_signaling(
                 codec: audio_rtp_codec,
                 ..Default::default()
             }],
-        )).context("create audio track")?;
+        ))
+        .context("create audio track")?;
         let audio_track = Arc::new(audio_track);
         let audio_track_local: Arc<dyn TrackLocal> = audio_track.clone();
-        pc.add_track(audio_track_local).await
+        pc.add_track(audio_track_local)
+            .await
             .context("add audio track")?;
         log::info!("[pc] audio track added, creating offer...");
 
@@ -2446,18 +2756,22 @@ async fn run_signaling(
         };
 
         // ── Create offer and send to browser ──
-        let offer = pc.create_offer(None).await
-            .context("create_offer")?;
-        pc.set_local_description(offer).await
+        let offer = pc.create_offer(None).await.context("create_offer")?;
+        pc.set_local_description(offer)
+            .await
             .context("set_local_description")?;
 
-        let local = pc.local_description().await
+        let local = pc
+            .local_description()
+            .await
             .context("local_description returned None")?;
         let offer_msg = serde_json::to_string(&SignalingMessage::Offer {
             sdp: local.sdp.clone(),
-        }).context("serialize offer")?;
+        })
+        .context("serialize offer")?;
         log::info!("[sdp] sending offer ({} bytes)", local.sdp.len());
-        out_tx.try_send(Message::Text(offer_msg.into()))
+        out_tx
+            .try_send(Message::Text(offer_msg.into()))
             .context("send offer to WebSocket")?;
 
         // ── Receive browser's answer ──
@@ -2477,14 +2791,16 @@ async fn run_signaling(
         };
 
         // ── Set remote description from answer ──
-        let answer = RTCSessionDescription::answer(answer_sdp)
-            .context("invalid answer SDP")?;
-        pc.set_remote_description(answer).await
+        let answer = RTCSessionDescription::answer(answer_sdp).context("invalid answer SDP")?;
+        pc.set_remote_description(answer)
+            .await
             .context("set_remote_description")?;
         log::info!("[sdp] remote description set");
 
         anyhow::Ok((track, audio_track, audio_ssrc, input_dc))
-    }.await {
+    }
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
             let _ = pc.close().await;
@@ -2522,7 +2838,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // Force mimalloc to flush cached segments before this session allocates.
     // Without this, freed memory from the previous session sits in mimalloc
     // pools and the new session allocates on top of it, inflating RSS.
-    unsafe { mi_collect(false); }
+    unsafe {
+        mi_collect(false);
+    }
 
     // ── X11 connection setup (triple connections: capture + input + event) ──
     // Build or reuse the shared keycode cache (keysym→keycode mapping)
@@ -2569,13 +2887,14 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             cache
         }
     };
-    let (capture_state, input_state, native_w, native_h, depth, evt_conn) = match setup_x11_connections(&state.args.display, keycode_cache) {
-        Ok(v) => v,
-        Err(e) => {
-            log::error!("[x11] FATAL: failed to connect: {:#}", e);
-            return;
-        }
-    };
+    let (capture_state, input_state, native_w, native_h, depth, evt_conn) =
+        match setup_x11_connections(&state.args.display, keycode_cache) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("[x11] FATAL: failed to connect: {:#}", e);
+                return;
+            }
+        };
 
     // ── Determine output dimensions ──
     let (out_w, out_h) = if state.args.height > 0 {
@@ -2587,8 +2906,14 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     };
     let needs_scaling = out_w != native_w as u32 || out_h != native_h as u32;
 
-    log::info!("[capture] native={}x{} output={}x{} scaling={}",
-        native_w, native_h, out_w, out_h, needs_scaling);
+    log::info!(
+        "[capture] native={}x{} output={}x{} scaling={}",
+        native_w,
+        native_h,
+        out_w,
+        out_h,
+        needs_scaling
+    );
 
     // ── Spawn I/O task for WebSocket ──
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
@@ -2671,15 +2996,15 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let udp_addrs = if state.args.tcp_only {
         Vec::<String>::new()
     } else {
-        all_ips.iter()
+        all_ips
+            .iter()
             .filter(|ip| *ip != "127.0.0.1" && *ip != "::1")
             .map(|ip| fmt_bind_addr(ip, 0))
             .collect()
     };
 
-    let sig = match run_signaling(
-        &mut in_rx, &out_tx, &state, &all_ips, tcp_addrs, udp_addrs,
-    ).await {
+    let sig = match run_signaling(&mut in_rx, &out_tx, &state, &all_ips, tcp_addrs, udp_addrs).await
+    {
         Ok(s) => s,
         Err(e) => {
             log::info!("[ws] signaling failed: {:#}", e);
@@ -2706,18 +3031,37 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
 
     // ── Create ScreenCapture (SHM-accelerated with fallback) ──
-    let screen_capture = match ShmScreenCapture::try_new(capture_state.clone(), native_w, native_h, depth, out_w, out_h) {
+    let screen_capture = match ShmScreenCapture::try_new(
+        capture_state.clone(),
+        native_w,
+        native_h,
+        depth,
+        out_w,
+        out_h,
+    ) {
         Ok(Some(shm)) => {
             log::info!("[capture] using MIT-SHM acceleration");
             ScreenCapture::Shm(shm)
         }
         Ok(None) => {
             log::info!("[capture] SHM unavailable, using get_image fallback");
-            ScreenCapture::Fallback(FallbackCapture::new(capture_state.clone(), native_w, native_h, out_w, out_h))
+            ScreenCapture::Fallback(FallbackCapture::new(
+                capture_state.clone(),
+                native_w,
+                native_h,
+                out_w,
+                out_h,
+            ))
         }
         Err(e) => {
             log::info!("[capture] SHM init failed: {}, using get_image fallback", e);
-            ScreenCapture::Fallback(FallbackCapture::new(capture_state.clone(), native_w, native_h, out_w, out_h))
+            ScreenCapture::Fallback(FallbackCapture::new(
+                capture_state.clone(),
+                native_w,
+                native_h,
+                out_w,
+                out_h,
+            ))
         }
     };
 
@@ -2731,14 +3075,23 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             return;
         }
     };
-    log::info!("[encoder] created ({}x{}, {}kbps, {}fps)",
-        out_w, out_h, state.args.bitrate, state.args.framerate);
+    log::info!(
+        "[encoder] created ({}x{}, {}kbps, {}fps)",
+        out_w,
+        out_h,
+        state.args.bitrate,
+        state.args.framerate
+    );
 
     // ── Forward ICE candidates ──
     let ice_out_tx = out_tx.clone();
     tasks.spawn(async move {
         while let Some(candidate_msg) = ice_rx.recv().await {
-            if ice_out_tx.send(Message::Text(candidate_msg.into())).await.is_err() {
+            if ice_out_tx
+                .send(Message::Text(candidate_msg.into()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -2774,7 +3127,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     log::info!("[pc] connection established!");
 
     // ── Pipeline: 3-stage capture → encode → send ──
-    let frame_duration = std::time::Duration::from_nanos(1_000_000_000 / state.args.framerate as u64);
+    let frame_duration =
+        std::time::Duration::from_nanos(1_000_000_000 / state.args.framerate as u64);
     let track_ssrc = *track.ssrcs().await.first().unwrap_or(&0);
     if track_ssrc == 0 {
         log::info!("[pc] ERROR: no SSRC available for video track");
@@ -2786,9 +3140,15 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     }
 
     // When --height is active, auto-enable enhancement at 0.8 unless user explicitly set --enhance.
-    let enhance = state.args.enhance
+    let enhance = state
+        .args
+        .enhance
         .unwrap_or_else(|| if needs_scaling { 0.8 } else { 0.0 });
-    log::info!("[pipeline] starting 3-stage pipeline (cap→enc→send), {} fps, enhance={}", state.args.framerate, enhance);
+    log::info!(
+        "[pipeline] starting 3-stage pipeline (cap→enc→send), {} fps, enhance={}",
+        state.args.framerate,
+        enhance
+    );
 
     // Capture flag before it's moved into the encoder task
     let adaptive_bitrate = state.args.adaptive_bitrate;
@@ -2812,7 +3172,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         pool: Arc<crossbeam_queue::ArrayQueue<Vec<u8>>>,
     }
     impl AsRef<[u8]> for PooledBuf {
-        fn as_ref(&self) -> &[u8] { self.buf.as_ref() }
+        fn as_ref(&self) -> &[u8] {
+            self.buf.as_ref()
+        }
     }
     impl Drop for PooledBuf {
         fn drop(&mut self) {
@@ -2824,7 +3186,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
     // Pre-allocate 3 Vecs: channel depth 2 + 1 in-use guarantees the capture
     // thread never blocks on allocation while the encoder is two frames ahead.
-    let pool: Arc<crossbeam_queue::ArrayQueue<Vec<u8>>> = Arc::new(crossbeam_queue::ArrayQueue::new(3));
+    let pool: Arc<crossbeam_queue::ArrayQueue<Vec<u8>>> =
+        Arc::new(crossbeam_queue::ArrayQueue::new(3));
     for _ in 0..3 {
         pool.push(Vec::with_capacity(frame_size)).ok();
     }
@@ -2836,7 +3199,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         let mut chroma_tick = 0u32;
         let mut last_chroma_boost = 256u32;
         loop {
-            if cap_stop.is_cancelled() { break; }
+            if cap_stop.is_cancelled() {
+                break;
+            }
 
             let frame_start = std::time::Instant::now();
 
@@ -2848,7 +3213,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             // The pool Vec has len=0 (cleared before push); set_len makes the
             // slice accessible. capture_to_i420 will re-size via with_resize_uninit.
             if i420.len() < frame_size {
-                unsafe { i420.set_len(frame_size); }
+                unsafe {
+                    i420.set_len(frame_size);
+                }
             }
 
             // Ensure tmp_argb is sized as [blur_copy | prev] for MAD fusion
@@ -2857,15 +3224,23 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             if tmp_argb.len() != total_req {
                 tmp_argb.clear();
                 tmp_argb.reserve(total_req);
-                unsafe { tmp_argb.set_len(total_req); }
+                unsafe {
+                    tmp_argb.set_len(total_req);
+                }
                 // First frame or resolution change: seed prev with current frame
                 let y_plane = &i420[..y_size];
                 tmp_argb[y_size..total_req].copy_from_slice(y_plane);
             }
             let (blur_copy, prev) = tmp_argb.split_at_mut(y_size);
 
-            match screen_capture.capture_to_i420(&mut i420, out_w, out_h,
-                needs_scaling, blur_copy, prev) {
+            match screen_capture.capture_to_i420(
+                &mut i420,
+                out_w,
+                out_h,
+                needs_scaling,
+                blur_copy,
+                prev,
+            ) {
                 Err(e) => {
                     log::info!("[capture] error: {:#}, repeating last frame", e);
                     // Return the failed buffer to pool (it was never filled)
@@ -2894,18 +3269,26 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         let uv_size = (out_w as usize / 2) * (out_h as usize / 2);
                         apply_enhancement(
                             &mut i420[..y_size + 2 * uv_size],
-                            out_w as usize, out_h as usize,
-                            enhance, &mut tmp_argb,
-                            &mut chroma_tick, &mut last_chroma_boost,
-                            mad_sum, tv_sum, luma_sum,
+                            out_w as usize,
+                            out_h as usize,
+                            enhance,
+                            &mut tmp_argb,
+                            &mut chroma_tick,
+                            &mut last_chroma_boost,
+                            mad_sum,
+                            tv_sum,
+                            luma_sum,
                         );
                     }
                     // Zero-copy: Bytes::from_owner wraps the pool Vec so that
                     // when the encoder drops the last Bytes reference, the Vec
                     // is automatically returned to the pool via PooledBuf::drop.
                     let pool_clone = pool.clone();
-                    let frame = Bytes::from_owner(PooledBuf { buf: i420, pool: pool_clone });
-                    last_raw = Some(frame.clone());  // cheap Arc increment
+                    let frame = Bytes::from_owner(PooledBuf {
+                        buf: i420,
+                        pool: pool_clone,
+                    });
+                    last_raw = Some(frame.clone()); // cheap Arc increment
                     if let Err(e) = yuv_tx_cap.try_send(frame) {
                         match e {
                             block_mpsc::TrySendError::Full(_) => {
@@ -2923,7 +3306,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     }
                 }
             }
-            if cap_stop.is_cancelled() { return; }
+            if cap_stop.is_cancelled() {
+                return;
+            }
 
             let elapsed = frame_start.elapsed();
             if elapsed < frame_duration {
@@ -2950,7 +3335,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         const ENC_HARD_LIMIT: u32 = 3;
         const IDR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
         loop {
-            if enc_stop.is_cancelled() { break; }
+            if enc_stop.is_cancelled() {
+                break;
+            }
             // Check for adaptive bitrate update
             let desired = enc_bps.load(Ordering::Relaxed);
             encoder.set_bitrate(desired);
@@ -2960,8 +3347,14 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     if let Err(e) = encoder.encode(yuv.as_ref(), &mut enc_buf) {
                         enc_failures += 1;
                         hard_failures += 1;
-                        log::error!("[encoder] error #{}/{} (hard={}/{}): {:#}",
-                            enc_failures, ENC_MAX_FAILURES, hard_failures, ENC_HARD_LIMIT, e);
+                        log::error!(
+                            "[encoder] error #{}/{} (hard={}/{}): {:#}",
+                            enc_failures,
+                            ENC_MAX_FAILURES,
+                            hard_failures,
+                            ENC_HARD_LIMIT,
+                            e
+                        );
                         // Hard limit: if encoder keeps failing after multiple resets, give up
                         if hard_failures >= ENC_HARD_LIMIT {
                             log::error!("[encoder] hard limit reached, disconnecting");
@@ -2972,10 +3365,14 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                             log::error!("[encoder] too many failures, resetting encoder");
                             // Give the encoder some breathing room, then recreate it
                             std::thread::sleep(std::time::Duration::from_millis(
-                                enc_failures as u64 * 100));
+                                enc_failures as u64 * 100,
+                            ));
                             encoder = match VideoEncoder::new(&enc_args, enc_w, enc_h) {
                                 Ok(e) => e,
-                                Err(_) => { enc_done.notify_one(); break; }
+                                Err(_) => {
+                                    enc_done.notify_one();
+                                    break;
+                                }
                             };
                             enc_failures = 0;
                             continue;
@@ -2983,14 +3380,17 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         encoder.force_keyframe();
                         // Exponential backoff before retry
                         std::thread::sleep(std::time::Duration::from_millis(
-                            enc_failures.min(10) as u64 * 100));
+                            enc_failures.min(10) as u64 * 100,
+                        ));
                         continue;
                     }
                     enc_failures = 0; // reset on success
                     // Zero-copy: transfer encoder buffer ownership to Bytes,
                     // replacing enc_buf with an empty Vec for the next frame.
                     let frame = Bytes::from(std::mem::take(&mut enc_buf));
-                    if enc_stop.is_cancelled() { return; }
+                    if enc_stop.is_cancelled() {
+                        return;
+                    }
                     match enc_tx_clone.try_send(frame) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -3025,7 +3425,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             tokio::select! {
                 Some(h264) = enc_rx.recv() => {
                     if h264.is_empty() { continue; }
-                    if let Err(e) = track.sample_writer(track_ssrc).write_sample(&Sample {
+                    if let Err(e) = track.sample_writer(track_ssrc, 102).write_sample(&Sample {
                         data: h264,
                         duration: frame_duration,
                         ..Default::default()
@@ -3048,7 +3448,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     use libpulse_binding as pulse;
 
     // Auto-detect default sink monitor source for system audio capture
-    let audio_source = tokio::task::spawn_blocking(find_default_monitor).await.unwrap_or(None);
+    let audio_source = tokio::task::spawn_blocking(find_default_monitor)
+        .await
+        .unwrap_or(None);
     if let Some(ref src) = audio_source {
         log::info!("[audio] using monitor source: {}", src);
     } else {
@@ -3102,7 +3504,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
         let mut mainloop = match pulse::mainloop::standard::Mainloop::new() {
             Some(m) => m,
-            None => { log::error!("[audio] PA mainloop init failed"); return; }
+            None => {
+                log::error!("[audio] PA mainloop init failed");
+                return;
+            }
         };
 
         // Store pointer for external wakeup (called from cleanup on any thread).
@@ -3110,18 +3515,28 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
 
         let mut ctx = match pulse::context::Context::new(&mainloop, "vnrit") {
             Some(c) => c,
-            None => { log::error!("[audio] PA context init failed"); return; }
+            None => {
+                log::error!("[audio] PA context init failed");
+                return;
+            }
         };
 
         // Connect and wait for context to be ready
-        if ctx.connect(None, pulse::context::FlagSet::NOFLAGS, None).is_err() {
+        if ctx
+            .connect(None, pulse::context::FlagSet::NOFLAGS, None)
+            .is_err()
+        {
             log::error!("[audio] PA connect failed");
             return;
         }
         for _ in 0..200 {
-            if audio_cancelled_clone.load(std::sync::atomic::Ordering::Relaxed) { return; }
+            if audio_cancelled_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
             let _ = mainloop.iterate(false);
-            if ctx.get_state() == pulse::context::State::Ready { break; }
+            if ctx.get_state() == pulse::context::State::Ready {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         if ctx.get_state() != pulse::context::State::Ready {
@@ -3142,7 +3557,10 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         };
 
         // Connect for recording
-        if stream.connect_record(dev, None, pulse::stream::FlagSet::NOFLAGS).is_err() {
+        if stream
+            .connect_record(dev, None, pulse::stream::FlagSet::NOFLAGS)
+            .is_err()
+        {
             log::error!("[audio] PA connect_record failed");
             return;
         }
@@ -3204,36 +3622,50 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let audio_opus_tx = opus_tx.clone();
     let pcm_pool_enc = pcm_pool.clone();
     tasks.spawn_blocking(move || {
-        let mut encoder = match opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::Audio) {
-            Ok(e) => e,
-            Err(e) => {
-                log::info!("[audio] Opus encoder init failed: {}", e);
-                return;
-            }
-        };
+        let mut encoder =
+            match opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::Audio) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::info!("[audio] Opus encoder init failed: {}", e);
+                    return;
+                }
+            };
         let mut opus_out = Vec::with_capacity(4096);
         loop {
-            if audio_enc_stop.is_cancelled() { break; }
+            if audio_enc_stop.is_cancelled() {
+                break;
+            }
             match pcm_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                 Ok(pcm) => {
                     // Safety: pcm comes from PulseAudio which always returns multiples of frame size
                     // (3840 bytes = 1920 i16 samples @ 20ms stereo 48kHz). Assert to prevent UB.
-                    assert_eq!(pcm.len() % 2, 0, "PCM buffer length must be even for i16 samples");
+                    assert_eq!(
+                        pcm.len() % 2,
+                        0,
+                        "PCM buffer length must be even for i16 samples"
+                    );
                     let samples = unsafe {
                         std::slice::from_raw_parts(pcm.as_ptr() as *const i16, pcm.len() / 2)
                     };
                     opus_out.clear();
                     opus_out.reserve(4096);
                     // SAFETY: encoder.encode 写入前 n 字节，不读 buf，truncate 丢弃未写部分
-                    unsafe { opus_out.set_len(4096); }
+                    unsafe {
+                        opus_out.set_len(4096);
+                    }
                     match encoder.encode(samples, &mut opus_out) {
                         Ok(n) => {
                             opus_out.truncate(n);
                             // Return PCM buffer to pool for reuse
                             let _ = pcm_pool_enc.push(pcm);
                             // Zero-copy: send Opus Vec directly
-                            if audio_enc_stop.is_cancelled() { return; }
-                            if audio_opus_tx.try_send(std::mem::take(&mut opus_out)).is_err() {
+                            if audio_enc_stop.is_cancelled() {
+                                return;
+                            }
+                            if audio_opus_tx
+                                .try_send(std::mem::take(&mut opus_out))
+                                .is_err()
+                            {
                                 log::trace!("[audio] dropping Opus packet (channel full)");
                             }
                         }
@@ -3263,7 +3695,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     if opus_packet.is_empty() { continue; }
                     // Zero-copy Vec→Bytes (moves heap allocation, no copy)
                     let data = Bytes::from(opus_packet);
-                    if let Err(e) = audio_track.sample_writer(audio_ssrc).write_sample(&Sample {
+                    if let Err(e) = audio_track.sample_writer(audio_ssrc, 111).write_sample(&Sample {
                         data,
                         duration: audio_frame_duration,
                         ..Default::default()
@@ -3283,8 +3715,8 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // AsyncFd wraps the X11 connection fd for tokio select readiness.
     // When the fd becomes readable we poll for XI2 Motion events and
     // update the cursor position without any X11 RPC overhead.
-    use tokio::io::unix::AsyncFd;
     use std::os::unix::io::FromRawFd;
+    use tokio::io::unix::AsyncFd;
     // Dup the fd so AsyncFd can own it independently of evt_conn
     let fd = evt_conn.stream().as_raw_fd();
     let dup_fd = unsafe { libc::dup(fd) };
@@ -3296,19 +3728,26 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         {
             let mut guard = pa_mainloop_ptr.0.lock().unwrap();
             if let Some(ptr) = *guard {
-                unsafe { (&mut *ptr).wakeup(); }
+                unsafe {
+                    (&mut *ptr).wakeup();
+                }
                 *guard = None;
             }
         }
         cancel.cancel();
         // Drop channels before waiting for tasks — makes blocking recv exit
-        drop(yuv_tx); drop(enc_tx); drop(pcm_tx); drop(opus_tx);
+        drop(yuv_tx);
+        drop(enc_tx);
+        drop(pcm_tx);
+        drop(opus_tx);
         // Wait for tasks to exit before releasing WebRTC resources
         tasks.shutdown().await;
         let _ = pc.close().await;
         drop(pc);
         drop(handler);
-        unsafe { mi_collect(false); }
+        unsafe {
+            mi_collect(false);
+        }
         return;
     }
     let evt_fd = match unsafe { AsyncFd::new(std::os::unix::io::OwnedFd::from_raw_fd(dup_fd)) } {
@@ -3319,19 +3758,26 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             {
                 let mut guard = pa_mainloop_ptr.0.lock().unwrap();
                 if let Some(ptr) = *guard {
-                    unsafe { (&mut *ptr).wakeup(); }
+                    unsafe {
+                        (&mut *ptr).wakeup();
+                    }
                     *guard = None;
                 }
             }
             cancel.cancel();
             // Drop channels before waiting for tasks — makes blocking recv exit
-            drop(yuv_tx); drop(enc_tx); drop(pcm_tx); drop(opus_tx);
+            drop(yuv_tx);
+            drop(enc_tx);
+            drop(pcm_tx);
+            drop(opus_tx);
             // Wait for tasks to exit before releasing WebRTC resources
             tasks.shutdown().await;
             let _ = pc.close().await;
             drop(pc);
             drop(handler);
-            unsafe { mi_collect(false); }
+            unsafe {
+                mi_collect(false);
+            }
             return;
         }
     };
@@ -3552,8 +3998,16 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     {
         let keys = input_state.pressed_keys.lock().unwrap();
         for &kc in keys.iter() {
-            let _ = xtest::fake_input(&input_state.conn, X11_KEY_RELEASE,
-                kc, 0, input_state.root, 0, 0, 0);
+            let _ = xtest::fake_input(
+                &input_state.conn,
+                X11_KEY_RELEASE,
+                kc,
+                0,
+                input_state.root,
+                0,
+                0,
+                0,
+            );
         }
         if !keys.is_empty() {
             let _ = input_state.conn.flush();
@@ -3570,7 +4024,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     {
         let mut guard = pa_mainloop_ptr.0.lock().unwrap();
         if let Some(ptr) = *guard {
-            unsafe { (&mut *ptr).wakeup(); }
+            unsafe {
+                (&mut *ptr).wakeup();
+            }
             // Clear the pointer so wakeup() is never called again on a dangling ptr
             *guard = None;
         }
@@ -3618,7 +4074,9 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     // Per-session allocations (openh264 ref frames ~1.4MB, X11 buffers, audio)
     // are freed but mimalloc retains them in thread-local heaps. Without
     // explicit collection this manifests as a ~1.5MB/heap RSS increment.
-    unsafe { mi_collect(false); }
+    unsafe {
+        mi_collect(false);
+    }
 
     log::info!("[ws] cleanup complete");
 }
@@ -3638,27 +4096,63 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
 
     match cmd {
         "mr" => {
-            let dx: i32 = match fields.next().and_then(|s| s.parse().ok()) { Some(v) => v, None => return };
-            let dy: i32 = match fields.next().and_then(|s| s.parse().ok()) { Some(v) => v, None => return };
+            let dx: i32 = match fields.next().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => return,
+            };
+            let dy: i32 = match fields.next().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => return,
+            };
             let max_x = state.screen_w as i32 - 1;
             let max_y = state.screen_h as i32 - 1;
-            let new_x = state.cursor_x.load(Ordering::Relaxed).saturating_add(dx).clamp(0, max_x);
-            let new_y = state.cursor_y.load(Ordering::Relaxed).saturating_add(dy).clamp(0, max_y);
+            let new_x = state
+                .cursor_x
+                .load(Ordering::Relaxed)
+                .saturating_add(dx)
+                .clamp(0, max_x);
+            let new_y = state
+                .cursor_y
+                .load(Ordering::Relaxed)
+                .saturating_add(dy)
+                .clamp(0, max_y);
             state.cursor_x.store(new_x, Ordering::Relaxed);
             state.cursor_y.store(new_y, Ordering::Relaxed);
-            let _ = xtest::fake_input(&state.conn, X11_MOTION_NOTIFY,
-                0, 0, state.root, new_x as i16, new_y as i16, 0);
+            let _ = xtest::fake_input(
+                &state.conn,
+                X11_MOTION_NOTIFY,
+                0,
+                0,
+                state.root,
+                new_x as i16,
+                new_y as i16,
+                0,
+            );
             let _ = state.conn.flush();
         }
         "ma" => {
-            let raw_x: i32 = match fields.next().and_then(|s| s.parse().ok()) { Some(v) => v, None => return };
-            let raw_y: i32 = match fields.next().and_then(|s| s.parse().ok()) { Some(v) => v, None => return };
+            let raw_x: i32 = match fields.next().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => return,
+            };
+            let raw_y: i32 = match fields.next().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => return,
+            };
             let new_x = ((raw_x as f64 * scale_x) as i32).clamp(0, state.screen_w as i32 - 1);
             let new_y = ((raw_y as f64 * scale_y) as i32).clamp(0, state.screen_h as i32 - 1);
             state.cursor_x.store(new_x, Ordering::Relaxed);
             state.cursor_y.store(new_y, Ordering::Relaxed);
-            let _ = xtest::fake_input(&state.conn, X11_MOTION_NOTIFY,
-                0, 0, state.root, new_x as i16, new_y as i16, 0);
+            let _ = xtest::fake_input(
+                &state.conn,
+                X11_MOTION_NOTIFY,
+                0,
+                0,
+                state.root,
+                new_x as i16,
+                new_y as i16,
+                0,
+            );
             let _ = state.conn.flush();
         }
         "md" => {
@@ -3669,8 +4163,7 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
             };
             let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
             let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
-            let _ = xtest::fake_input(&state.conn, X11_BUTTON_PRESS,
-                btn, 0, state.root, cx, cy, 0);
+            let _ = xtest::fake_input(&state.conn, X11_BUTTON_PRESS, btn, 0, state.root, cx, cy, 0);
             let _ = state.conn.flush();
         }
         "mu" => {
@@ -3681,21 +4174,40 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
             };
             let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
             let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
-            let _ = xtest::fake_input(&state.conn, X11_BUTTON_RELEASE,
-                btn, 0, state.root, cx, cy, 0);
+            let _ = xtest::fake_input(
+                &state.conn,
+                X11_BUTTON_RELEASE,
+                btn,
+                0,
+                state.root,
+                cx,
+                cy,
+                0,
+            );
             let _ = state.conn.flush();
         }
         "ms" => {
-            let delta: f64 = match fields.next().and_then(|s| s.parse().ok()) { Some(v) => v, None => return };
+            let delta: f64 = match fields.next().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => return,
+            };
             let steps = (delta.abs() / 40.0).round().clamp(1.0, 20.0) as u32;
             let btn = if delta > 0.0 { 5_u8 } else { 4_u8 };
             let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
             let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
             for _ in 0..steps {
-                let _ = xtest::fake_input(&state.conn, X11_BUTTON_PRESS,
-                    btn, 0, state.root, cx, cy, 0);
-                let _ = xtest::fake_input(&state.conn, X11_BUTTON_RELEASE,
-                    btn, 0, state.root, cx, cy, 0);
+                let _ =
+                    xtest::fake_input(&state.conn, X11_BUTTON_PRESS, btn, 0, state.root, cx, cy, 0);
+                let _ = xtest::fake_input(
+                    &state.conn,
+                    X11_BUTTON_RELEASE,
+                    btn,
+                    0,
+                    state.root,
+                    cx,
+                    cy,
+                    0,
+                );
             }
             let _ = state.conn.flush();
         }
@@ -3710,8 +4222,8 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
                     state.pressed_keys.lock().unwrap().insert(kc);
                     let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
                     let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
-                    let _ = xtest::fake_input(&state.conn, X11_KEY_PRESS,
-                        kc, 0, state.root, cx, cy, 0);
+                    let _ =
+                        xtest::fake_input(&state.conn, X11_KEY_PRESS, kc, 0, state.root, cx, cy, 0);
                     let _ = state.conn.flush();
                 }
             }
@@ -3727,8 +4239,16 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
                     state.pressed_keys.lock().unwrap().remove(&kc);
                     let cx = state.cursor_x.load(Ordering::Relaxed) as i16;
                     let cy = state.cursor_y.load(Ordering::Relaxed) as i16;
-                    let _ = xtest::fake_input(&state.conn, X11_KEY_RELEASE,
-                        kc, 0, state.root, cx, cy, 0);
+                    let _ = xtest::fake_input(
+                        &state.conn,
+                        X11_KEY_RELEASE,
+                        kc,
+                        0,
+                        state.root,
+                        cx,
+                        cy,
+                        0,
+                    );
                     let _ = state.conn.flush();
                 }
             }
@@ -3740,9 +4260,14 @@ fn handle_input_message(raw: &str, state: &InputState, scale_x: f64, scale_y: f6
 /// Send current cursor position to browser — reads from the in-memory
 /// cursor_x/cursor_y (set by browser input or X11 sync).  Does NOT query
 /// X11 itself; use sync_cursor_position for periodic X11 reads.
-fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &InputState,
-    native_w: u16, native_h: u16, out_w: u32, out_h: u32)
-{
+fn send_cursor_position(
+    out_tx: &mpsc::Sender<Message>,
+    state: &InputState,
+    native_w: u16,
+    native_h: u16,
+    out_w: u32,
+    out_h: u32,
+) {
     let x = state.cursor_x.load(Ordering::Relaxed);
     let y = state.cursor_y.load(Ordering::Relaxed);
     let packed = (x as u64) | ((y as u64) << 32);
@@ -3752,8 +4277,16 @@ fn send_cursor_position(out_tx: &mpsc::Sender<Message>, state: &InputState,
         return;
     }
     // Scale from native X11 coordinates to encoded video coordinates
-    let sx = if native_w > 0 { x as u64 * out_w as u64 / native_w as u64 } else { x as u64 };
-    let sy = if native_h > 0 { y as u64 * out_h as u64 / native_h as u64 } else { y as u64 };
+    let sx = if native_w > 0 {
+        x as u64 * out_w as u64 / native_w as u64
+    } else {
+        x as u64
+    };
+    let sy = if native_h > 0 {
+        y as u64 * out_h as u64 / native_h as u64
+    } else {
+        y as u64
+    };
     // Format cursor JSON directly without serde_json::Value allocation
     let msg = format!(r#"{{"type":"cursor","x":{},"y":{}}}"#, sx, sy);
     let _ = out_tx.try_send(Message::Text(msg.into()));
@@ -3874,8 +4407,8 @@ fn is_signaling_message(text: &str) -> bool {
 
 /// Compress a text string with deflate and wrap as Binary with prefix byte 0x01.
 fn compress_text(text: &str) -> Message {
-    use flate2::write::DeflateEncoder;
     use flate2::Compression;
+    use flate2::write::DeflateEncoder;
     use std::io::Write;
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
     if encoder.write_all(text.as_bytes()).is_ok() {
