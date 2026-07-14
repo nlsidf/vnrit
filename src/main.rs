@@ -47,8 +47,8 @@ use x11rb_protocol::xauth::get_auth;
 use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS};
 use rtc::peer_connection::configuration::RTCOfferOptions;
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
-    RtpCodecKind,
+    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
+    RTCRtpEncodingParameters, RtpCodecKind,
 };
 use rtc::statistics::StatsSelector;
 use rtc_media::Sample;
@@ -2663,7 +2663,24 @@ async fn run_signaling(
             channels: 0,
             sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
                 .into(),
-            rtcp_feedback: vec![],
+            rtcp_feedback: vec![
+                RTCPFeedback {
+                    typ: "nack".into(),
+                    parameter: "".into(),
+                },
+                RTCPFeedback {
+                    typ: "nack".into(),
+                    parameter: "pli".into(),
+                },
+                RTCPFeedback {
+                    typ: "ccm".into(),
+                    parameter: "fir".into(),
+                },
+                RTCPFeedback {
+                    typ: "goog-remb".into(),
+                    parameter: "".into(),
+                },
+            ],
         },
         payload_type: 102,
         ..Default::default()
@@ -2679,7 +2696,16 @@ async fn run_signaling(
             clock_rate: 48000,
             channels: 2,
             sdp_fmtp_line: "minptime=10;useinbandfec=1".into(),
-            rtcp_feedback: vec![],
+            rtcp_feedback: vec![
+                RTCPFeedback {
+                    typ: "nack".into(),
+                    parameter: "".into(),
+                },
+                RTCPFeedback {
+                    typ: "transport-cc".into(),
+                    parameter: "".into(),
+                },
+            ],
         },
         payload_type: 111,
         ..Default::default()
