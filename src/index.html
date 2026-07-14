@@ -538,6 +538,7 @@ let pc = null;
 let ws = null;
 let reconnectTimer = null;
 let negotiationTimer = null;
+let iceRecoveryTimer = null;
 let displayWidth = 0;
 let displayHeight = 0;
 let reconnectDelay = 1000;
@@ -860,6 +861,9 @@ function connect() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   // Cancel negotiation timeout
   if (negotiationTimer) { clearTimeout(negotiationTimer); negotiationTimer = null; }
+  // Cancel ICE recovery timer
+  if (iceRecoveryTimer) { clearTimeout(iceRecoveryTimer); iceRecoveryTimer = null; }
+  window.iceRetryCount = 0;
 
   // ── Fully tear down any existing WebRTC session before starting fresh ──
   // Detach event handlers first so no stale callback can touch the new
@@ -969,6 +973,22 @@ function connect() {
 
     switch (msg.type) {
       case 'offer':
+        // 重协商 offer（由服务端 ICE restart 触发）
+        if (msg.renegotiation && pc) {
+          console.log('[offer] renegotiation offer received');
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: msg.sdp }));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+            console.log('[offer] renegotiation answer sent');
+          } catch (e) {
+            console.error('[offer] renegotiation failed:', e);
+            ws.close();
+          }
+          break;
+        }
+        // 首次协商走原来逻辑
         try {
           await handleOffer(msg.sdp);
         } catch (e) {
@@ -1010,6 +1030,7 @@ function connect() {
     if (!isCurrent()) return;
     releaseAllModifiers();
     inputDC = null;
+    window.iceRetryCount = 0;
     setStatus('Disconnected, retrying...', false);
     cursorOverlay.style.display = 'none';
     // Stop media tracks
@@ -1042,6 +1063,9 @@ async function handleOffer(sdp) {
 
   if (pc) { pc.close(); pc = null; }
   if (!isCur()) return;
+
+  // 每个新 RTCPeerConnection 从 0 开始计数
+  window.iceRetryCount = 0;
 
   setStatus('Negotiating...', false);
 
@@ -1080,12 +1104,14 @@ async function handleOffer(sdp) {
       };
       setStatus('●', true);
       document.getElementById('status-text').style.opacity = '0';
-      pointerHint.style.display = 'block';
+      showPointerHint();
     } else if (event.track.kind === 'audio') {
       const audio = document.getElementById('remote-audio');
       audio.srcObject = event.streams[0];
       audio.play().catch(() => {}); // user gesture may be required
-      document.getElementById('audio-hint').style.display = 'block';
+      if (!audioEnabled) {
+        document.getElementById('audio-hint').style.display = 'block';
+      }
     }
   };
 
@@ -1111,8 +1137,94 @@ async function handleOffer(sdp) {
       clearTimeout(negotiationTimer);
       negotiationTimer = null;
     }
-    if (st === 'failed' || st === 'disconnected' ||
-        ice === 'failed' || ice === 'disconnected') {
+    // 连接恢复
+    if (st === 'connected' || ice === 'connected') {
+      if (iceRecoveryTimer) {
+        clearTimeout(iceRecoveryTimer);
+        iceRecoveryTimer = null;
+      }
+      window.iceRetryCount = 0; // 重置计数
+      setStatus('●', true);
+      return;
+    }
+    // 网络波动 — 启动 10s 容忍窗口，带重试计数（最多 3 次）
+    if (st === 'disconnected' || ice === 'disconnected') {
+      if (iceRecoveryTimer) return; // 已有计时器在运行
+
+      // 初始化重试计数器
+      if (typeof window.iceRetryCount !== 'number') window.iceRetryCount = 0;
+
+      // 若已达 3 次，放弃恢复，降级到完全重建
+      if (window.iceRetryCount >= 3) {
+        console.warn('[ice] max retries (3) reached, closing WebSocket');
+        ws.close();
+        return;
+      }
+
+      // 定义具名递归函数，每次尝试前递增计数
+      async function attemptRecovery() {
+        if (!pc) return;
+
+        // 每次尝试前递增计数（首次调用时从 0→1）
+        window.iceRetryCount++;
+        setStatus(`Recovering (${window.iceRetryCount}/3)...`, false);
+
+        const curSt = pc.connectionState;
+        const curIce = pc.iceConnectionState;
+
+        // 如果已经恢复，重置计数并退出
+        if (curSt === 'connected' || curIce === 'connected') {
+          window.iceRetryCount = 0;
+          setStatus('●', true);
+          return;
+        }
+
+        // 如果已彻底失败，放弃恢复
+        if (curSt === 'failed' || curIce === 'failed') {
+          ws.close();
+          return;
+        }
+
+        // 如果仍处于 disconnected，尝试 ICE 重启
+        if (curSt === 'disconnected' || curIce === 'disconnected') {
+          try {
+            console.log(`[ice] restart attempt ${window.iceRetryCount}/3`);
+            const offer = await pc.createOffer({ iceRestart: true });
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({
+              type: 'offer',
+              sdp: offer.sdp,
+              renegotiation: true,
+            }));
+            setStatus(`Renegotiating (${window.iceRetryCount}/3)...`, false);
+          } catch (e) {
+            console.error('[ice] restart attempt failed:', e);
+          }
+
+          // 尝试后若未达到 3 次，且状态仍为 disconnected，则 10 秒后再次尝试
+          if (window.iceRetryCount < 3) {
+            const stillDisconnected = pc &&
+              (pc.connectionState === 'disconnected' || pc.iceConnectionState === 'disconnected');
+            if (stillDisconnected) {
+              iceRecoveryTimer = setTimeout(attemptRecovery, 10000);
+              return;
+            }
+          }
+        }
+
+        // 若达到 3 次仍未恢复，关闭 WebSocket 降级到完全重建
+        if (window.iceRetryCount >= 3) {
+          console.warn('[ice] max retries (3) reached, closing WebSocket');
+          ws.close();
+        }
+      }
+
+      // 启动第一次尝试（10 秒后）
+      iceRecoveryTimer = setTimeout(attemptRecovery, 10000);
+      return;
+    }
+    // 彻底失败 → 降级到完全重建
+    if (st === 'failed' || ice === 'failed') {
       console.warn(`[pc] connection failed (connectionState=${st}, iceConnectionState=${ice})`);
       setStatus('Connection lost', false);
       ws.close();
@@ -1484,7 +1596,7 @@ document.addEventListener('keydown', (e) => {
     fsBtn.click();
     return;
   }
-  const preventKeys = ['Tab', 'F5', 'F12', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+  const preventKeys = ['Tab', 'F5', 'F12', 'Slash', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
   if (preventKeys.includes(e.code) || e.ctrlKey || e.altKey || e.metaKey) {
     e.preventDefault();
   }
@@ -1503,6 +1615,7 @@ window.addEventListener('beforeunload', () => {
   cancelCursorAnim();
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (negotiationTimer) { clearTimeout(negotiationTimer); negotiationTimer = null; }
+  if (iceRecoveryTimer) { clearTimeout(iceRecoveryTimer); iceRecoveryTimer = null; }
   resizeObserver.disconnect();
   // Stop media tracks
   if (video.srcObject) {
@@ -1520,18 +1633,25 @@ window.addEventListener('beforeunload', () => {
   }
 });
 
-// Auto-hide hint after 4 seconds
-setTimeout(() => {
-  pointerHint.style.display = 'none';
-}, 4000);
-
 function hideHint() {
   pointerHint.style.display = 'none';
+}
+
+function showPointerHint() {
+  pointerHint.style.display = 'block';
+  // Re-register listeners (they may have been removed after prior hide)
   document.removeEventListener('touchstart', hideHint);
   document.removeEventListener('mousedown', hideHint);
+  document.addEventListener('touchstart', hideHint);
+  document.addEventListener('mousedown', hideHint);
+  // Auto-hide after 4 seconds
+  setTimeout(() => {
+    pointerHint.style.display = 'none';
+  }, 4000);
 }
-document.addEventListener('touchstart', hideHint);
-document.addEventListener('mousedown', hideHint);
+
+// Initial hint display on page load
+showPointerHint();
 
 document.addEventListener('contextmenu', (e) => {
   e.preventDefault();
@@ -1855,8 +1975,6 @@ function enableAudio() {
   video.muted = false;
   document.getElementById('remote-audio').play().catch(() => {});
   audioHint.style.display = 'none';
-  document.removeEventListener('click', enableAudio);
-  document.removeEventListener('touchstart', enableAudio);
 }
 
 video.addEventListener('playing', () => {

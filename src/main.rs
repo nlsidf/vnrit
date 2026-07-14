@@ -7,6 +7,8 @@ unsafe extern "C" {
 }
 
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Instant;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as block_mpsc;
 
@@ -43,6 +45,7 @@ use x11rb_protocol::xauth::get_auth;
 
 // ── webrtc-rs types ──
 use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS};
+use rtc::peer_connection::configuration::RTCOfferOptions;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
     RtpCodecKind,
@@ -73,6 +76,7 @@ use openh264_sys2::ENCODER_OPTION_BITRATE;
 use async_trait::async_trait;
 use bytes::Bytes;
 use ice::network_type::NetworkType;
+use tokio::task::JoinHandle;
 use rand::Rng;
 use std::os::fd::IntoRawFd;
 
@@ -296,7 +300,11 @@ When omitted and --height is active, defaults to 0.8 automatically."
 #[serde(tag = "type")]
 enum SignalingMessage {
     #[serde(rename = "offer")]
-    Offer { sdp: String },
+    Offer {
+        sdp: String,
+        #[serde(default)]
+        renegotiation: Option<bool>,
+    },
     #[serde(rename = "answer")]
     Answer { sdp: String },
     #[serde(rename = "ice")]
@@ -2030,6 +2038,14 @@ struct WebrtcHandler {
     done: Arc<tokio::sync::Notify>,
     dc_tx: tokio::sync::watch::Sender<Option<Arc<dyn DataChannel>>>,
     lan_ip: String,
+    /// Channel to signal the main loop that ICE restart is needed.
+    recovery_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// If set, the deadline before which the connection should recover; None = stable.
+    recovery_deadline: Arc<Mutex<Option<Instant>>>,
+    /// Handle of the background recovery task; abort() on successful recovery.
+    recovery_task_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Number of ICE restart attempts already made during this recovery session.
+    recovery_attempts: Arc<Mutex<u32>>,
 }
 
 #[async_trait]
@@ -2077,11 +2093,34 @@ impl PeerConnectionEventHandler for WebrtcHandler {
         log::info!("[pc] connection state: {:?}", state);
         match state {
             RTCPeerConnectionState::Connected => {
+                // 连接恢复 → 取消恢复任务
+                if let Some(handle) = self.recovery_task_handle.lock().unwrap().take() {
+                    handle.abort();
+                }
+                *self.recovery_deadline.lock().unwrap() = None;
+                *self.recovery_attempts.lock().unwrap() = 0;
                 let _ = self.connected_tx.try_send(());
             }
-            RTCPeerConnectionState::Failed
-            | RTCPeerConnectionState::Disconnected
-            | RTCPeerConnectionState::Closed => {
+            RTCPeerConnectionState::Disconnected => {
+                // 启动 15s 容忍窗口
+                let deadline = Instant::now() + Duration::from_secs(15);
+                *self.recovery_deadline.lock().unwrap() = Some(deadline);
+                *self.recovery_attempts.lock().unwrap() = 0;
+                let recovery_tx = self.recovery_tx.clone();
+                let recovery_deadline = self.recovery_deadline.clone();
+                let handle_arc = self.recovery_task_handle.clone();
+                let handle = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    // 再次检查是否仍然需要恢复
+                    if recovery_deadline.lock().unwrap().is_some() {
+                        log::info!("[recovery] timeout reached, signaling main loop");
+                        let _ = recovery_tx.send(());
+                    }
+                });
+                *handle_arc.lock().unwrap() = Some(handle);
+            }
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+                // 彻底失败 → 直接触发全局关闭（保留原有逻辑）
                 self.done.notify_one();
             }
             _ => {}
@@ -2101,6 +2140,28 @@ impl PeerConnectionEventHandler for WebrtcHandler {
         // returns None immediately. Sending to dc_tx as a fallback is harmless.
         let _ = self.dc_tx.send(Some(data_channel));
     }
+}
+
+/// Initiate an ICE restart by creating a new offer with `ice_restart=true` and sending
+/// it to the browser via WebSocket.
+async fn initiate_ice_restart(
+    pc: &dyn PeerConnection,
+    out_tx: &mpsc::Sender<Message>,
+) -> Result<()> {
+    let options = RTCOfferOptions { ice_restart: true };
+    let offer = pc.create_offer(Some(options)).await?;
+    pc.set_local_description(offer).await?;
+    let local_desc = pc
+        .local_description()
+        .await
+        .context("local_description returned None after ICE restart")?;
+    let msg = serde_json::to_string(&SignalingMessage::Offer {
+        sdp: local_desc.sdp,
+        renegotiation: Some(true),
+    })?;
+    out_tx.send(Message::Text(msg.into())).await?;
+    log::info!("[recovery] ICE restart offer sent");
+    Ok(())
 }
 
 /// Get all non-loopback LAN IPs + loopback fallback for local testing.
@@ -2579,6 +2640,8 @@ struct SignalingOutput {
     /// The on_data_channel callback provides a separate reference that may be
     /// invalid on reconnect; using this field avoids that race.
     input_dc: Option<Arc<dyn DataChannel>>,
+    /// Receiver for ICE restart recovery signals from the handler's background task.
+    recovery_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
 }
 
 /// Run the WebRTC signaling phase inside a Result so that all early exits
@@ -2659,6 +2722,9 @@ async fn run_signaling(
     let done = Arc::new(tokio::sync::Notify::new());
     let (dc_tx, dc_rx) = tokio::sync::watch::channel::<Option<Arc<dyn DataChannel>>>(None);
 
+    // ── Recovery channel: handler signals main loop when ICE restart is needed ──
+    let (recovery_tx, recovery_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
     // ── Build PeerConnection ──
     let lan_ip = all_ips[0].clone();
     log::info!("[ice] binding interfaces: {:?}", all_ips);
@@ -2669,6 +2735,10 @@ async fn run_signaling(
         done: done.clone(),
         dc_tx: dc_tx.clone(),
         lan_ip,
+        recovery_tx,
+        recovery_deadline: Arc::new(Mutex::new(None)),
+        recovery_task_handle: Arc::new(Mutex::new(None)),
+        recovery_attempts: Arc::new(Mutex::new(0)),
     });
 
     let rt = runtime::default_runtime().context("no webrtc runtime available")?;
@@ -2767,6 +2837,7 @@ async fn run_signaling(
             .context("local_description returned None")?;
         let offer_msg = serde_json::to_string(&SignalingMessage::Offer {
             sdp: local.sdp.clone(),
+            renegotiation: None,
         })
         .context("serialize offer")?;
         log::info!("[sdp] sending offer ({} bytes)", local.sdp.len());
@@ -2823,6 +2894,7 @@ async fn run_signaling(
         audio_track,
         audio_ssrc,
         input_dc,
+        recovery_rx,
     })
 }
 
@@ -3026,6 +3098,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let audio_track = sig.audio_track;
     let audio_ssrc = sig.audio_ssrc;
     let input_dc = sig.input_dc;
+    let mut recovery_rx = sig.recovery_rx;
 
     // ── Send initial cursor position ──
     send_cursor_position(&out_tx, &input_state, native_w, native_h, out_w, out_h);
@@ -3927,8 +4000,52 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                                     };
                                     let _ = pc.add_ice_candidate(init).await;
                                 }
-                                SignalingMessage::Offer { .. } => {
-                                    log::debug!("[ws] unexpected duplicate offer, ignoring");
+                                SignalingMessage::Offer { sdp, renegotiation } => {
+                                    if renegotiation.unwrap_or(false) {
+                                        log::info!("[recovery] received renegotiation offer, creating answer");
+                                        match RTCSessionDescription::offer(sdp) {
+                                            Ok(offer) => {
+                                                let _ = pc.set_remote_description(offer).await;
+                                                if let Ok(answer) = pc.create_answer(None).await {
+                                                    if pc.set_local_description(answer).await.is_ok() {
+                                                        if let Some(local) = pc.local_description().await {
+                                                            let answer_msg = SignalingMessage::Answer { sdp: local.sdp };
+                                                            if let Ok(json) = serde_json::to_string(&answer_msg) {
+                                                                let _ = out_tx.try_send(Message::Text(json.into()));
+                                                                log::info!("[recovery] renegotiation answer sent");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => log::warn!("[recovery] invalid renegotiation offer SDP: {e}"),
+                                        }
+                                    } else {
+                                        log::debug!("[ws] unexpected duplicate offer, ignoring");
+                                    }
+                                }
+                                SignalingMessage::Answer { sdp } => {
+                                    let in_recovery = handler.recovery_deadline.lock().unwrap().is_some();
+                                    if in_recovery {
+                                        log::info!("[recovery] received renegotiation answer");
+                                        match RTCSessionDescription::answer(sdp) {
+                                            Ok(answer) => {
+                                                if let Err(e) = pc.set_remote_description(answer).await {
+                                                    log::warn!("[recovery] set_remote_description(answer) failed: {e}");
+                                                } else {
+                                                    log::info!("[recovery] renegotiation answer applied");
+                                                    // 清理恢复状态
+                                                    *handler.recovery_deadline.lock().unwrap() = None;
+                                                    if let Some(task) = handler.recovery_task_handle.lock().unwrap().take() {
+                                                        task.abort();
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => log::warn!("[recovery] invalid renegotiation answer SDP: {e}"),
+                                        }
+                                    } else {
+                                        log::debug!("[ws] unexpected answer, ignoring");
+                                    }
                                 }
                                 _ => {}
                             }
@@ -3988,6 +4105,34 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
             _ = out_tx.closed() => {
                 log::debug!("[loop] WebSocket send channel closed, exiting");
                 break;
+            }
+
+            // ICE restart recovery signal from handler's background task.
+            // Fires after 15s of Disconnected state.
+            _ = recovery_rx.recv() => {
+                if handler.recovery_deadline.lock().unwrap().is_some() {
+                    log::info!("[recovery] initiating ICE restart from main loop");
+                    if let Err(e) = initiate_ice_restart(&*pc, &out_tx).await {
+                        log::warn!("[recovery] ice restart failed: {e}");
+                        // 重试一次：若未达到 2 次，重新启动 15s 定时器
+                        let mut attempts = handler.recovery_attempts.lock().unwrap();
+                        *attempts += 1;
+                        if *attempts < 2 && handler.recovery_deadline.lock().unwrap().is_some() {
+                            log::info!("[recovery] scheduling retry 2/2 in 10s");
+                            let recovery_tx_clone = handler.recovery_tx.clone();
+                            let deadline_clone = handler.recovery_deadline.clone();
+                            let handle_arc = handler.recovery_task_handle.clone();
+                            let handle = tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                                if deadline_clone.lock().unwrap().is_some() {
+                                    log::info!("[recovery] retry timeout reached, signaling main loop");
+                                    let _ = recovery_tx_clone.send(());
+                                }
+                            });
+                            *handle_arc.lock().unwrap() = Some(handle);
+                        }
+                    }
+                }
             }
         }
     }
