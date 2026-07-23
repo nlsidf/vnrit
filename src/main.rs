@@ -77,7 +77,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ice::network_type::NetworkType;
 use tokio::task::JoinHandle;
-use rand::Rng;
 use std::os::fd::IntoRawFd;
 
 use vnrit_libyuv::{self, ArgbImage, FilterMode, I420ImageMut, ImageSize};
@@ -2788,7 +2787,7 @@ async fn run_signaling(
     // ── Post-pc operations (tracks, offer/answer) — close pc on error ──
     let v = match async {
         // ── Create video track ──
-        let ssrc = rand::rng().random::<u32>();
+        let ssrc = rand::random::<u32>();
         let rtp_codec = video_codec.rtp_codec.clone();
 
         let track = TrackLocalStaticSample::new(MediaStreamTrack::new(
@@ -2812,7 +2811,7 @@ async fn run_signaling(
         log::info!("[pc] video track added");
 
         // ── Create audio track ──
-        let audio_ssrc = rand::rng().random::<u32>();
+        let audio_ssrc = rand::random::<u32>();
         let audio_rtp_codec = audio_codec.rtp_codec.clone();
         let audio_track = TrackLocalStaticSample::new(MediaStreamTrack::new(
             "audio-stream".to_owned(),
