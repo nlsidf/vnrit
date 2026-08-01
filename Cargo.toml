@@ -29,11 +29,11 @@ x11rb = { version = "0.14", features = ["xtest", "allow-unsafe-code", "shm", "xi
 x11rb-protocol = "0.14"
 
 # WebRTC pure Rust stack
-webrtc = "0.20.0"
-rtc = "0.20.0"
-rtc-media = "0.20.0"
+webrtc = "0.20"
+rtc = "0.20"
+rtc-media = "0.20"
 # ICE network types for TCP-only mode
-ice = { package = "rtc-ice", version = "0.20.0" }
+ice = { package = "rtc-ice", version = "0.20" }
 
 # async-trait for PeerConnectionEventHandler
 async-trait = "0.1"
