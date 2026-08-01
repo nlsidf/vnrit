@@ -1681,7 +1681,7 @@ fn apply_enhancement(
         // [-32768, 32767].  Any product exceeding this wraps silently in
         // release mode, causing black-pixel flickering in white areas.
         //
-        // Protected by mul_widen → i32x8 (safe for any u8×u8 product):
+        // Protected by widening_mul → i32x8 (safe for any u8×u8 product):
         //   [1] y_v * (256 - w_d)    max 255×256 = 65280     — denoise blend
         //   [2] b_v * w_d            max 255×128 = 32640     — denoise blend
         //   [3] b_v * (256 - weight) max 255×256 = 65280     — edge blend
@@ -1729,7 +1729,7 @@ fn apply_enhancement(
             let raw_dc = raw_diff.min(o);
             let w_d = (o - raw_dc) * s128;
             let y2 = i16x8::from_i32x8_saturate(
-                (y_v.mul_widen(s256 - w_d) + b_v.mul_widen(w_d) + s128_i32) >> 8_i32,
+                (y_v.widening_mul(s256 - w_d) + b_v.widening_mul(w_d) + s128_i32) >> 8_i32,
             );
 
             // ── Edge refine ──
@@ -1750,7 +1750,7 @@ fn apply_enhancement(
 
             // blended = blend(b, y2, weight) — safe via i32x8 widen
             let blended = i16x8::from_i32x8_saturate(
-                (b_v.mul_widen(s256 - weight) + y2.mul_widen(weight) + s128_i32) >> 8_i32,
+                (b_v.widening_mul(s256 - weight) + y2.widening_mul(weight) + s128_i32) >> 8_i32,
             );
 
             // Edge boost
@@ -1783,25 +1783,25 @@ fn apply_enhancement(
             // ── Overflow-safe multiplications via i32x8 widening ──
             // combined_q8 = (motion_factor × texture_q8 + 128) >> 8
             let combined_q8 =
-                i16x8::from_i32x8_saturate((mf_v.mul_widen(texture_q8) + s128_i32) >> 8_i32);
+                i16x8::from_i32x8_saturate((mf_v.widening_mul(texture_q8) + s128_i32) >> 8_i32);
 
             // amount = ((effective_base × combined_q8 + 128) >> 8).min(1023)
             let amount =
-                i16x8::from_i32x8_saturate((eb_v.mul_widen(combined_q8) + s128_i32) >> 8_i32)
+                i16x8::from_i32x8_saturate((eb_v.widening_mul(combined_q8) + s128_i32) >> 8_i32)
                     .min(s1023);
 
             // amount = ((amount × midtone_q8 + 128) >> 8).min(1023)
             let midtone_q8 = midtone_gain_simd(y2);
             let amount =
-                i16x8::from_i32x8_saturate((amount.mul_widen(midtone_q8) + s128_i32) >> 8_i32)
+                i16x8::from_i32x8_saturate((amount.widening_mul(midtone_q8) + s128_i32) >> 8_i32)
                     .min(s1023);
 
             // adj_a = (diff × nonlinear_gain + 128) >> 8
             let adj_a =
-                i16x8::from_i32x8_saturate((diff.mul_widen(nonlinear_gain) + s128_i32) >> 8_i32);
+                i16x8::from_i32x8_saturate((diff.widening_mul(nonlinear_gain) + s128_i32) >> 8_i32);
 
             // adj = (adj_a × amount + 128) >> 8
-            let adj = i16x8::from_i32x8_saturate((adj_a.mul_widen(amount) + s128_i32) >> 8_i32);
+            let adj = i16x8::from_i32x8_saturate((adj_a.widening_mul(amount) + s128_i32) >> 8_i32);
 
             // Accumulate |adj| for chroma saturation boost
             let adj_arr = adj.to_array();
