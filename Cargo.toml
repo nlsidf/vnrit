@@ -1,6 +1,6 @@
 [package]
 name = "vnrit"
-version = "0.2.27"
+version = "0.2.28"
 edition = "2024"
 description = "Lightweight X11 desktop WebRTC streaming server (pure Rust, no GStreamer)"
 license = "Apache-2.0"  
@@ -29,11 +29,11 @@ x11rb = { version = "0.14", features = ["xtest", "allow-unsafe-code", "shm", "xi
 x11rb-protocol = "0.14"
 
 # WebRTC pure Rust stack
-webrtc = "0.20.0-rc.4"
-rtc = "0.20.0-rc.4"
-rtc-media = "0.20.0-rc.4"
+webrtc = "0.20.0"
+rtc = "0.20.0"
+rtc-media = "0.20.0"
 # ICE network types for TCP-only mode
-ice = { package = "rtc-ice", version = "0.20.0-rc.4" }
+ice = { package = "rtc-ice", version = "0.20.0" }
 
 # async-trait for PeerConnectionEventHandler
 async-trait = "0.1"
