@@ -19,7 +19,7 @@
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## Features
+## Features:
 
 - **Pure Rust** — zero GStreamer/FFmpeg dependency, ~6.6 MB release binary
 - **WebRTC H.264** — openh264 encoder with screen content optimization
