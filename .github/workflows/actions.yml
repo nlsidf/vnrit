@@ -29,4 +29,4 @@ jobs:
         if: steps.check_version.outputs.skip == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.VNRIT_CARGO }}
-        run: cargo publish
+        run: cargo publish --allow-dirty
