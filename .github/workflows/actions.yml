@@ -13,14 +13,29 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install llvm-tools
-        run: rustup component add llvm-tools
-
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm
+          sudo apt-get install -y \
+            nasm \
+            libpulse-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            libc++-dev \
+            libstdc++-12-dev \
+            libopus-dev
           rustup component add llvm-tools
+
+      - name: Update Cargo.lock and commit if changed
+        run: |
+          cargo update
+          if ! git diff --quiet Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "chore: update Cargo.lock"
+          fi
 
       - name: Check if version already published
         id: check_version
@@ -28,7 +43,6 @@ jobs:
           PACKAGE_NAME=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].name')
           CURRENT_VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].version')
           if curl -s "https://crates.io/api/v1/crates/${PACKAGE_NAME}/${CURRENT_VERSION}" | grep -q '"version":"'"${CURRENT_VERSION}"'"'; then
-            echo "Version already published, skipping publish."
             echo "skip=true" >> $GITHUB_OUTPUT
           else
             echo "skip=false" >> $GITHUB_OUTPUT
@@ -38,4 +52,4 @@ jobs:
         if: steps.check_version.outputs.skip == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.VNRIT_CARGO }}
-        run: cargo publish --allow-dirty
+        run: cargo publish
