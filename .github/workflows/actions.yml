@@ -3,7 +3,7 @@ name: Publish to crates.io
 on:
   push:
     branches:
-      - main   # 仅在 main 分支上触发，防止 PR 或功能分支错误发布
+      - main
 
 jobs:
   publish:
@@ -13,7 +13,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # 可选：检查 Cargo.toml 版本是否已发布，避免无意义的失败
       - name: Check if version already published
         id: check_version
         run: |
@@ -30,7 +29,4 @@ jobs:
         if: steps.check_version.outputs.skip == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.VNRIT_CARGO }}
-         run: |
-           cargo check --release
-           git commit -am .
-           cargo publish
+        run: cargo publish
