@@ -31,6 +31,6 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.VNRIT_CARGO }}
          run: |
-            cargo check --release
-            git commit -am .
-            cargo publish
+           cargo check --release
+           git commit -am .
+           cargo publish
