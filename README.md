@@ -3,7 +3,7 @@
 [![License: Apache2.0](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](LICENSE)
 
 **vnrit** 是一款使用纯 Rust 编写的 X11 桌面流媒体服务器，通过 **WebRTC** 将 X11 屏幕以低延迟、高画质的方式传输至浏览器，并支持键盘鼠标反向控制。  
-项目**不依赖 GStreamer、FFmpeg 或任何系统编解码器**，所有核心组件均为 Rust 实现或安全封装，编译后二进制仅约 **6.6 MB**，资源占用极低。
+项目**不依赖 GStreamer、FFmpeg 或任何系统编解码器**，所有核心组件均为 Rust 实现或安全封装，编译后二进制仅约 **7.9 MB**，资源占用极低。
 
 ---
 
