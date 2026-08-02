@@ -13,6 +13,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Install llvm-tools
+        run: rustup component add llvm-tools
+
       - name: Check if version already published
         id: check_version
         run: |
