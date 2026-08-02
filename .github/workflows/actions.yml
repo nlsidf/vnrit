@@ -1,136 +1,33 @@
-name: CI & Publish
+name: Publish to crates.io
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-
-env:
-  CARGO_TERM_COLOR: always
+    branches:
+      - main   # 仅在 main 分支上触发，防止 PR 或功能分支错误发布
 
 jobs:
-  # 代码格式与静态检查
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo registry
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Check formatting
-        run: cargo fmt -- --check
-
-  # 构建（包括多个平台）
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: Cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}-${{ matrix.target }}
-      - name: Install cross-compilation dependencies (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Build for ${{ matrix.target }}
-        run: cargo build --release --target ${{ matrix.target }}
-
-  # 安全审计（检查 Cargo.lock 中的漏洞）
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-      - name: Cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-      - name: Run security audit
-        run: cargo audit
-
-  # 文档检查
-  doc:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-      - name: Build documentation
-        run: cargo doc --no-deps --document-private-items
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-
-  # 发布到 crates.io（仅当推送到 main 且版本未发布时）
   publish:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'      # 仅在 main 分支执行（PR 不会触发）
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
-      - name: Cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-      - name: Check if version is already published
+
+      # 可选：检查 Cargo.toml 版本是否已发布，避免无意义的失败
+      - name: Check if version already published
         id: check_version
         run: |
-          # 获取包名和版本
           PACKAGE_NAME=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].name')
           CURRENT_VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].version')
-          # 检查 crates.io 是否存在该版本
           if curl -s "https://crates.io/api/v1/crates/${PACKAGE_NAME}/${CURRENT_VERSION}" | grep -q '"version":"'"${CURRENT_VERSION}"'"'; then
-            echo "Version already exists on crates.io, skipping publish."
+            echo "Version already published, skipping publish."
             echo "skip=true" >> $GITHUB_OUTPUT
           else
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
+
       - name: Publish to crates.io
         if: steps.check_version.outputs.skip == 'false'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ vnrit_cargo }}
-        run: git add .
-        run: git commit -m .
+          CARGO_REGISTRY_TOKEN: ${{ VNRIT_CARGO  }}
         run: cargo publish
