@@ -1,0 +1,1995 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>vnrit</title>
+<script>{{PAKO_JS}}</script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #111;
+    color: #ccc;
+    font-family: -apple-system, sans-serif;
+    height: 100vh;
+    overflow: hidden;
+  }
+  #status {
+    position: fixed;
+    top: 4px;
+    right: 8px;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    user-select: none;
+    pointer-events: none;
+  }
+  #status-text {
+    font-size: 11px;
+    color: rgba(255,255,255,0.3);
+    transition: opacity 0.5s;
+  }
+  #dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #f44;
+    display: inline-block;
+    transition: background 0.3s;
+  }
+  #dot.connected { background: #4f4; }
+  #container {
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+    position: relative;
+    cursor: none;
+  }
+  #viewport {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    overflow: hidden;
+  }
+  #zoom-layer {
+    width: 100%;
+    height: 100%;
+    transform-origin: 0 0;
+  }
+  #zoom-layer.smooth {
+    transition: transform 0.15s cubic-bezier(0.33, 1, 0.68, 1);
+  }
+  #zoom-layer.follow {
+    transition: transform 0.06s ease-out;
+  }
+  video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+    background: #000;
+    cursor: crosshair;
+    image-rendering: auto;
+    touch-action: none;
+  }
+  /* Hidden audio element for Opus playback */
+  #remote-audio { display: none; }
+  #info {
+    position: fixed;
+    bottom: 8px;
+    right: 48px;
+    font-size: 12px;
+    color: rgba(255,255,255,0.25);
+    pointer-events: none;
+    z-index: 5;
+  }
+  #pointer-hint {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: rgba(255,255,255,0.4);
+    font-size: 14px;
+    pointer-events: none;
+    display: none;
+    text-align: center;
+    transition: opacity 1s;
+    background: rgba(0,0,0,0.5);
+    padding: 12px 20px;
+    border-radius: 8px;
+  }
+  #pointer-hint.fade {
+    opacity: 0;
+  }
+  #toolbar {
+    position: fixed;
+    bottom: 10px;
+    right: 10px;
+    left: auto;
+    transform: none;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    opacity: 0.35;
+    transition: opacity 0.3s;
+    pointer-events: auto;
+  }
+  #toolbar:hover,
+  #toolbar:active {
+    opacity: 1;
+  }
+  #toolbar button {
+    background: rgba(0,0,0,0.5);
+    color: #ccc;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 5px;
+    padding: 3px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    user-select: none;
+    touch-action: none;
+  }
+  #toolbar button:hover {
+    background: rgba(255,255,255,0.12);
+    color: #fff;
+  }
+  #toolbar button.active {
+    background: rgba(255,255,255,0.25);
+    color: #fff;
+    border-color: rgba(255,255,255,0.4);
+  }
+  #stats-display {
+    color: rgba(255,255,255,0.7);
+    font-size: 11px;
+    margin-left: 8px;
+    white-space: nowrap;
+  }
+  #kbd-btn {
+    font-size: 14px;
+    line-height: 1;
+    padding: 2px 6px;
+  }
+  #audio-hint {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(255,255,255,0.5);
+    font-size: 12px;
+    pointer-events: none;
+    display: none;
+    background: rgba(0,0,0,0.5);
+    padding: 6px 14px;
+    border-radius: 4px;
+    z-index: 10;
+  }
+  /* ── Browser-side cursor overlay ── */
+  #cursor-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 22px;
+    height: 22px;
+    pointer-events: none;
+    z-index: 999;
+    display: none;
+    /* Use transform instead of left/top to avoid layout thrash */
+    will-change: transform;
+    box-shadow: 0 0 6px rgba(0,0,0,0.5);
+    background: radial-gradient(
+      circle at 50% 50%,
+      #fff 2px,
+      #fff 3px,
+      rgba(0,0,0,0.85) 3.5px,
+      rgba(0,0,0,0.85) 4.5px,
+      transparent 5px
+    );
+    border-radius: 50%;
+  }
+  /* ── Custom Virtual Keyboard ── */
+  #custom-keyboard {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 38vh;
+    background: rgba(18,18,22,0.92);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    z-index: 200;
+    display: flex;
+    flex-direction: column;
+    padding: 4px 3px 2px;
+    transform: translateY(100%);
+    transition: transform 0.22s cubic-bezier(0.33, 1, 0.68, 1);
+    user-select: none;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    border-top: 1px solid rgba(255,255,255,0.06);
+  }
+  #custom-keyboard.visible {
+    transform: translateY(0);
+  }
+  .kbd-layer {
+    display: none;
+    flex: 1;
+    flex-direction: column;
+    justify-content: space-evenly;
+    padding: 1px 0;
+  }
+  .kbd-layer.active {
+    display: flex;
+  }
+  .kbd-row {
+    display: flex;
+    gap: 2px;
+    justify-content: center;
+    align-items: stretch;
+    flex: 1;
+  }
+  .kbd-key {
+    flex: 1;
+    min-width: 0;
+    background: rgba(255,255,255,0.08);
+    color: #ddd;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 5px;
+    font-size: 11px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 2px;
+    transition: background 0.05s, transform 0.05s, border-color 0.15s, box-shadow 0.15s;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    will-change: transform;
+    position: relative;
+  }
+  .kbd-key:active {
+    background: rgba(255,255,255,0.18);
+    transform: scale(0.94);
+  }
+  .kbd-key.wide {
+    flex: 1.6;
+  }
+  .kbd-key.xwide {
+    flex: 2.2;
+  }
+  .kbd-key.xxwide {
+    flex: 3.5;
+  }
+  .kbd-key.mod-active {
+    border-color: #4a9eff;
+    box-shadow: inset 0 0 6px rgba(74,158,255,0.25);
+  }
+  .kbd-key.mod-latched {
+    background: rgba(74,158,255,0.12);
+    border-color: rgba(74,158,255,0.5);
+  }
+  .kbd-key.mod-locked {
+    background: rgba(74,158,255,0.22);
+    border-color: #4a9eff;
+    box-shadow: inset 0 0 8px rgba(74,158,255,0.35);
+  }
+  .kbd-key.special {
+    font-size: 9px;
+  }
+  .kbd-key .sub {
+    font-size: 8px;
+    position: absolute;
+    top: 2px;
+    right: 3px;
+    color: rgba(255,255,255,0.35);
+  }
+  /* Bottom bar */
+  .kbd-bottom-bar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 4px 1px;
+    border-top: 1px solid rgba(255,255,255,0.05);
+    flex-shrink: 0;
+  }
+  .kbd-bottom-bar button {
+    background: rgba(255,255,255,0.06);
+    color: #999;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 5px;
+    padding: 3px 6px;
+    font-size: 9px;
+    cursor: pointer;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    flex-shrink: 0;
+  }
+  .kbd-bottom-bar button:active {
+    background: rgba(255,255,255,0.14);
+  }
+  .kbd-bottom-bar .layer-active {
+    background: rgba(74,158,255,0.25);
+    color: #fff;
+    border-color: rgba(74,158,255,0.4);
+  }
+  .kbd-bottom-bar .kbd-spacer {
+    flex: 1;
+  }
+  .kbd-dismiss {
+    font-size: 14px;
+    padding: 5px 14px;
+  }
+  .kbd-key.dim {
+    color: rgba(255,255,255,0.15);
+  }
+  /* Prevent body scroll when keyboard is visible */
+  body.kbd-open {
+    overflow: hidden;
+  }
+</style>
+</head>
+<body>
+
+<div id="status">
+  <span id="dot"></span>
+  <span id="status-text">Connecting...</span>
+</div>
+
+<div id="container">
+  <div id="viewport">
+    <div id="zoom-layer">
+      <video id="remote-video" autoplay playsinline muted></video>
+      <audio id="remote-audio" autoplay playsinline></audio>
+    </div>
+    <div id="cursor-overlay"></div>
+    <div id="pointer-hint">Click to interact<br><small>(right-click for menu)</small></div>
+    <div id="audio-hint">Tap to enable audio</div>
+  </div>
+  <!-- 工具栏移入 container 内部，全屏时可见 -->
+  <div id="toolbar">
+    <button id="fullscreen-btn">Fullscreen</button>
+    <button id="zoom-btn">+</button>
+    <button id="kbd-btn">⌨️</button>
+    <span id="stats-display"></span>
+  </div>
+  <!-- ── Custom Virtual Keyboard (inside container for fullscreen) ── -->
+  <div id="custom-keyboard" style="position:fixed;">
+  <!-- Main Layer -->
+  <div class="kbd-layer active" data-layer="main">
+    <div class="kbd-row">
+      <button class="kbd-key special" data-code="Escape">Esc</button>
+      <button class="kbd-key" data-code="Backquote">`~</button>
+      <button class="kbd-key" data-code="Digit1">1!</button>
+      <button class="kbd-key" data-code="Digit2">2@</button>
+      <button class="kbd-key" data-code="Digit3">3#</button>
+      <button class="kbd-key" data-code="Digit4">4$</button>
+      <button class="kbd-key" data-code="Digit5">5%</button>
+      <button class="kbd-key" data-code="Digit6">6^</button>
+      <button class="kbd-key" data-code="Digit7">7&amp;</button>
+      <button class="kbd-key" data-code="Digit8">8*</button>
+      <button class="kbd-key" data-code="Digit9">9(</button>
+      <button class="kbd-key" data-code="Digit0">0)</button>
+      <button class="kbd-key special" data-code="Minus">-_</button>
+      <button class="kbd-key special" data-code="Equal">=+</button>
+      <button class="kbd-key wide special" data-code="Backspace">⌫</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key wide special" data-code="Tab">Tab</button>
+      <button class="kbd-key" data-code="KeyQ">Q</button>
+      <button class="kbd-key" data-code="KeyW">W</button>
+      <button class="kbd-key" data-code="KeyE">E</button>
+      <button class="kbd-key" data-code="KeyR">R</button>
+      <button class="kbd-key" data-code="KeyT">T</button>
+      <button class="kbd-key" data-code="KeyY">Y</button>
+      <button class="kbd-key" data-code="KeyU">U</button>
+      <button class="kbd-key" data-code="KeyI">I</button>
+      <button class="kbd-key" data-code="KeyO">O</button>
+      <button class="kbd-key" data-code="KeyP">P</button>
+      <button class="kbd-key special" data-code="BracketLeft">[</button>
+      <button class="kbd-key special" data-code="BracketRight">]</button>
+      <button class="kbd-key wide special" data-code="Backslash">\</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key xwide special" data-code="CapsLock">Caps</button>
+      <button class="kbd-key" data-code="KeyA">A</button>
+      <button class="kbd-key" data-code="KeyS">S</button>
+      <button class="kbd-key" data-code="KeyD">D</button>
+      <button class="kbd-key" data-code="KeyF">F</button>
+      <button class="kbd-key" data-code="KeyG">G</button>
+      <button class="kbd-key" data-code="KeyH">H</button>
+      <button class="kbd-key" data-code="KeyJ">J</button>
+      <button class="kbd-key" data-code="KeyK">K</button>
+      <button class="kbd-key" data-code="KeyL">L</button>
+      <button class="kbd-key special" data-code="Semicolon">;</button>
+      <button class="kbd-key special" data-code="Quote">'</button>
+      <button class="kbd-key xwide special" data-code="Enter">Enter</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key xwide mod-key special" data-code="ShiftLeft">Shift</button>
+      <button class="kbd-key" data-code="KeyZ">Z</button>
+      <button class="kbd-key" data-code="KeyX">X</button>
+      <button class="kbd-key" data-code="KeyC">C</button>
+      <button class="kbd-key" data-code="KeyV">V</button>
+      <button class="kbd-key" data-code="KeyB">B</button>
+      <button class="kbd-key" data-code="KeyN">N</button>
+      <button class="kbd-key" data-code="KeyM">M</button>
+      <button class="kbd-key special" data-code="Comma">,</button>
+      <button class="kbd-key special" data-code="Period">.</button>
+      <button class="kbd-key special" data-code="Slash">/</button>
+      <button class="kbd-key xwide mod-key special" data-code="ShiftRight">Shift</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key wide mod-key special" data-code="ControlLeft">Ctrl</button>
+      <button class="kbd-key mod-key special" data-code="AltLeft">Alt</button>
+      <button class="kbd-key xxwide" data-code="Space">Space</button>
+      <button class="kbd-key mod-key special" data-code="AltRight">Alt</button>
+      <button class="kbd-key wide mod-key special" data-code="ControlRight">Ctrl</button>
+      <button class="kbd-key special" data-code="ArrowLeft">◀</button>
+      <button class="kbd-key special" data-code="ArrowUp">▲</button>
+      <button class="kbd-key special" data-code="ArrowDown">▼</button>
+      <button class="kbd-key special" data-code="ArrowRight">▶</button>
+    </div>
+  </div>
+
+  <!-- Func Layer -->
+  <div class="kbd-layer" data-layer="func">
+    <div class="kbd-row">
+      <button class="kbd-key special" data-code="F1">F1</button>
+      <button class="kbd-key special" data-code="F2">F2</button>
+      <button class="kbd-key special" data-code="F3">F3</button>
+      <button class="kbd-key special" data-code="F4">F4</button>
+      <button class="kbd-key special" data-code="F5">F5</button>
+      <button class="kbd-key special" data-code="F6">F6</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key special" data-code="F7">F7</button>
+      <button class="kbd-key special" data-code="F8">F8</button>
+      <button class="kbd-key special" data-code="F9">F9</button>
+      <button class="kbd-key special" data-code="F10">F10</button>
+      <button class="kbd-key special" data-code="F11">F11</button>
+      <button class="kbd-key special" data-code="F12">F12</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key special" data-code="PrintScreen">PrtSc</button>
+      <button class="kbd-key special" data-code="ScrollLock">ScrLk</button>
+      <button class="kbd-key special" data-code="Pause">Pause</button>
+      <button class="kbd-key special" data-code="Break">Break</button>
+      <button class="kbd-key special" data-code="SysRq">SysRq</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key special" data-code="Insert">Ins</button>
+      <button class="kbd-key special" data-code="Delete">Del</button>
+      <button class="kbd-key special" data-code="Home">Home</button>
+      <button class="kbd-key special" data-code="End">End</button>
+      <button class="kbd-key special" data-code="PageUp">PgUp</button>
+      <button class="kbd-key special" data-code="PageDown">PgDn</button>
+    </div>
+  </div>
+
+  <!-- Num Layer -->
+  <div class="kbd-layer" data-layer="num">
+    <div class="kbd-row">
+      <button class="kbd-key special" data-code="NumLock">NumLk</button>
+      <button class="kbd-key special" data-code="NumpadDivide">/</button>
+      <button class="kbd-key special" data-code="NumpadMultiply">*</button>
+      <button class="kbd-key special" data-code="NumpadSubtract">-</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key" data-code="Numpad7">7</button>
+      <button class="kbd-key" data-code="Numpad8">8</button>
+      <button class="kbd-key" data-code="Numpad9">9</button>
+      <button class="kbd-key special" data-code="NumpadAdd">+</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key" data-code="Numpad4">4</button>
+      <button class="kbd-key" data-code="Numpad5">5</button>
+      <button class="kbd-key" data-code="Numpad6">6</button>
+      <button class="kbd-key wide special" data-code="NumpadDecimal">.</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key" data-code="Numpad1">1</button>
+      <button class="kbd-key" data-code="Numpad2">2</button>
+      <button class="kbd-key" data-code="Numpad3">3</button>
+      <button class="kbd-key wide special" data-code="NumpadEnter">Ent</button>
+    </div>
+    <div class="kbd-row">
+      <button class="kbd-key xxwide" data-code="Numpad0">0</button>
+      <button class="kbd-key" data-code="NumpadDecimal">.</button>
+    </div>
+  </div>
+
+  <!-- Bottom bar (always visible) -->
+  <div class="kbd-bottom-bar">
+    <button id="kbd-layer-fn" class="kbd-layer-btn" data-target="func">Fn</button>
+    <button id="kbd-layer-num" class="kbd-layer-btn" data-target="num">123</button>
+    <span class="kbd-spacer"></span>
+    <button class="kbd-dismiss">▼</button>
+  </div>
+</div>
+</div>
+<div id="info">vnrit</div>
+
+<script>
+const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const urlParams = new URLSearchParams(location.search);
+const authToken = urlParams.get('token');
+let wsUrl = `${wsProto}//${location.host}/ws`;
+if (authToken) {
+  wsUrl += `?token=${encodeURIComponent(authToken)}`;
+}
+const STUN_SERVER = '{{STUN_SERVER}}';
+const video = document.getElementById('remote-video');
+const dot = document.getElementById('dot');
+const statusText = document.getElementById('status-text');
+const pointerHint = document.getElementById('pointer-hint');
+const statsDisplay = document.getElementById('stats-display');
+const fsBtn = document.getElementById('fullscreen-btn');
+const zoomBtn = document.getElementById('zoom-btn');
+const container = document.getElementById('container');
+const viewport = document.getElementById('viewport');
+
+let pc = null;
+let ws = null;
+let reconnectTimer = null;
+let negotiationTimer = null;
+let iceRecoveryTimer = null;
+let displayWidth = 0;
+let displayHeight = 0;
+let reconnectDelay = 1000;
+
+// ── Frontend zoom & pan ──
+let zoomLevel = 1.0;
+let zoomPanX = 0;
+let zoomPanY = 0;
+let altHeld = false;
+let buttonZoom = false;
+let zoomActive = false;
+
+function syncZoomActive() {
+  zoomActive = altHeld || buttonZoom;
+}
+
+const ZOOM_MIN = 1.0;
+const ZOOM_MAX = 5.0;
+const ZOOM_STEP = 0.1;
+
+// ── Pinch-to-zoom state ──
+let pinchActive = false;
+let pinchDist0 = 0;
+let pinchZoom0 = 1;
+let pinchPanX0 = 0;
+let pinchPanY0 = 0;
+let pinchWorldCX = 0;
+let pinchWorldCY = 0;
+
+// ── Layout cache — updated only on resize / metadata change ──
+let layoutVersion = 0;           // bumped on every LayoutCache.update()
+let layoutFlushedVersion = -1;   // version used by last flushRender
+const LayoutCache = {
+  rect: null,          // video.getBoundingClientRect()
+  viewRect: null,      // viewport.getBoundingClientRect()
+  renderW: 0, renderH: 0, renderX: 0, renderY: 0,
+  viewW: 0, viewH: 0,  // viewport.clientWidth / clientHeight
+  valid: false,
+  update() {
+    this.rect = video.getBoundingClientRect();
+    this.viewRect = viewport.getBoundingClientRect();
+    const elW = this.rect.width, elH = this.rect.height;
+    this.viewW = viewport.clientWidth;
+    this.viewH = viewport.clientHeight;
+    if (elW <= 0 || elH <= 0 || displayWidth <= 0 || displayHeight <= 0) {
+      this.valid = false;
+      return;
+    }
+    const elAspect = elW / elH;
+    const vidAspect = displayWidth / displayHeight;
+    if (vidAspect > elAspect) {
+      this.renderW = elW;
+      this.renderH = elW / vidAspect;
+      this.renderX = 0;
+      this.renderY = (elH - this.renderH) / 2;
+    } else {
+      this.renderH = elH;
+      this.renderW = elH * vidAspect;
+      this.renderX = (elW - this.renderW) / 2;
+      this.renderY = 0;
+    }
+    this.valid = true;
+    ++layoutVersion;
+  },
+};
+
+// ── RAF render loop — batch all DOM writes ──
+let renderDirty = false;
+
+/// Ensure LayoutCache is up-to-date with current DOM layout.
+/// Call before reading cache after any zoom/pan/keyboard state change.
+function ensureLayoutFresh() {
+  if (layoutVersion !== layoutFlushedVersion) {
+    LayoutCache.update();
+    layoutFlushedVersion = layoutVersion;
+  }
+}
+
+/// @param {string} [smoothClass] — 'smooth' (150ms) or 'follow' (60ms) CSS transition.
+function scheduleRender(smoothClass) {
+  if (!renderDirty) {
+    renderDirty = true;
+    if (smoothClass) {
+      document.getElementById('zoom-layer').classList.add(smoothClass);
+    }
+    requestAnimationFrame(flushRender);
+  }
+}
+
+function flushRender() {
+  renderDirty = false;
+  const layer = document.getElementById('zoom-layer');
+  const kbdHeight = keyboardVisible ? keyboard.offsetHeight : 0;
+  // Clamp pan bounds before applying transform
+  if (zoomLevel > 1) clampPan();
+  if (zoomLevel <= 1.01 && kbdHeight === 0) {
+    layer.style.transform = 'none';
+  } else {
+    let t = '';
+    if (kbdHeight > 0) t += `translateY(-${kbdHeight}px) `;
+    if (zoomLevel > 1.01) t += `translate(${zoomPanX}px, ${zoomPanY}px) scale(${zoomLevel})`;
+    layer.style.transform = t;
+  }
+  // Clear smooth class after each flush (re-added by scheduleRender when needed)
+  layer.classList.remove('smooth', 'follow');
+  // Refresh layout cache after transform change, so cursor is positioned correctly
+  LayoutCache.update();
+  layoutFlushedVersion = layoutVersion;
+  // Render cursor overlay
+  applyCursorPos(localCursorX, localCursorY);
+  cursorOverlay.style.display = 'block';
+}
+
+// ── Browser-side cursor overlay tracking ──
+let localCursorX = 0;
+let localCursorY = 0;
+const cursorOverlay = document.getElementById('cursor-overlay');
+const CURSOR_CENTER = 11; // half of 22px width — precomputed for translate(-50%, -50%)
+
+// ── Smooth cursor correction animation ──
+let animFrameId = null;
+let animStartX = 0, animStartY = 0;
+let animTargetX = 0, animTargetY = 0;
+let animStartTime = 0;
+const ANIM_DURATION = 40; // ms — constant convergence time regardless of distance
+
+/// Render helper: convert display-coordinate (x, y) to a CSS transform.
+/// Uses LayoutCache — does NOT touch DOM layout.
+function applyCursorPos(x, y) {
+  if (displayWidth > 0 && displayHeight > 0 && LayoutCache.valid) {
+    const L = LayoutCache;
+    const vx = L.rect.left + L.renderX + (x / displayWidth) * L.renderW;
+    const vy = L.rect.top + L.renderY + (y / displayHeight) * L.renderH;
+    cursorOverlay.style.transform =
+      `translate(${vx - CURSOR_CENTER}px, ${vy - CURSOR_CENTER}px)`;
+  }
+}
+
+/// Single-frame override refresh: snapshot localCursorX/Y and render immediately.
+/// Used by local input (mouse/touch) for instant response.
+/// @param {boolean} [skipPan] — skip virtual-cursor panning (used during animation).
+/// When zoomed, also pans the view to keep the remote cursor near center.
+function updateCursorOverlay(skipPan) {
+  ensureLayoutFresh();
+  // Mutate state only — flushRender pushes to DOM in next RAF
+  if (!skipPan && zoomLevel > 1 && displayWidth > 0 && LayoutCache.valid) {
+    const L = LayoutCache;
+    const cvx = L.rect.left + L.renderX + (localCursorX / displayWidth) * L.renderW;
+    const cvy = L.rect.top + L.renderY + (localCursorY / displayHeight) * L.renderH;
+    const dx = cvx - L.viewW / 2;
+    const dy = cvy - L.viewH / 2;
+    // 50px dead zone to avoid micro-adjustments
+    if (Math.abs(dx) > 50 || Math.abs(dy) > 50) {
+      zoomPanX -= dx;
+      zoomPanY -= dy;
+    }
+  }
+  scheduleRender();
+}
+
+/// Clamp zoom pan offset so the visible area never exceeds video boundaries.
+/// At zoom=1 → pan must be (0,0).
+/// At zoom>1 → pan ∈ [viewportW*(1-zoom), 0], [viewportH*(1-zoom), 0].
+function clampPan() {
+  const vw = viewport.clientWidth;
+  const vh = viewport.clientHeight;
+  const minPanX = vw * (1 - zoomLevel);
+  const minPanY = vh * (1 - zoomLevel);
+  zoomPanX = Math.max(minPanX, Math.min(0, zoomPanX));
+  zoomPanY = Math.max(minPanY, Math.min(0, zoomPanY));
+}
+
+
+/// Clamp localCursorX/Y to display bounds (only when dimensions are known)
+/// and refresh the overlay.  Also cancels any running correction animation
+/// because local input always wins.
+function capLocalCursor() {
+  cancelCursorAnim();
+  if (displayWidth > 0 && displayHeight > 0) {
+    localCursorX = Math.max(0, Math.min(displayWidth - 1, localCursorX));
+    localCursorY = Math.max(0, Math.min(displayHeight - 1, localCursorY));
+  }
+  updateCursorOverlay();
+}
+
+/// Cancel any in-flight cursor correction animation.
+function cancelCursorAnim() {
+  if (animFrameId !== null) {
+    cancelAnimationFrame(animFrameId);
+    animFrameId = null;
+  }
+}
+
+/// Per-frame step of the cursor correction animation.
+/// Uses ease-out cubic easing: fast initial catch-up, smooth deceleration.
+/// Always reaches exact target within ANIM_DURATION ms.
+function animStep(now) {
+  const elapsed = now - animStartTime;
+
+  if (elapsed >= ANIM_DURATION) {
+    // Snap to exact target
+    localCursorX = animTargetX;
+    localCursorY = animTargetY;
+    updateCursorOverlay();
+    animFrameId = null;
+    return;
+  }
+
+  // Ease-out cubic: 1 - (1-t)^3  →  reaches 1.0 at t=1
+  const t = elapsed / ANIM_DURATION;
+  const eased = 1 - Math.pow(1 - t, 3);
+
+  localCursorX = animStartX + (animTargetX - animStartX) * eased;
+  localCursorY = animStartY + (animTargetY - animStartY) * eased;
+  updateCursorOverlay(true);
+
+  animFrameId = requestAnimationFrame(animStep);
+}
+
+/// Start a cursor correction animation from the current localCursorX/Y to (targetX, targetY).
+/// - If deviation < 1 px on both axes → jump directly (no animation).
+/// - Otherwise begin a fixed-duration (ANIM_DURATION) easing animation.
+/// - Cancels any previously running animation first.
+function startCursorAnim(targetX, targetY) {
+  const dx = targetX - localCursorX;
+  const dy = targetY - localCursorY;
+
+  // Below 1-pixel threshold: snap directly
+  if (Math.abs(dx) < 1 && Math.abs(dy) < 1) {
+    localCursorX = targetX;
+    localCursorY = targetY;
+    updateCursorOverlay();
+    return;
+  }
+
+  // Cancel any running animation and start fresh from current position
+  cancelCursorAnim();
+
+  animStartX = localCursorX;
+  animStartY = localCursorY;
+  animTargetX = targetX;
+  animTargetY = targetY;
+  animStartTime = performance.now();
+
+  animFrameId = requestAnimationFrame(animStep);
+}
+
+
+function setStatus(text, connected) {
+  statusText.textContent = text;
+  dot.className = connected ? 'connected' : '';
+}
+
+// ── On-demand input throttle (requestAnimationFrame, no idle firing) ──
+let relAccDx = 0, relAccDy = 0;
+let relFlushPending = false;
+let lastAbsMoveTs = 0;
+const THROTTLE_MS = 20;
+
+function flushRelInput() {
+  relFlushPending = false;
+  const dx = relAccDx;
+  const dy = relAccDy;
+  relAccDx = 0;
+  relAccDy = 0;
+  if ((dx !== 0 || dy !== 0) && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(`mr,${dx},${dy}`);
+  }
+}
+
+function scheduleRelFlush() {
+  if (!relFlushPending) {
+    relFlushPending = true;
+    requestAnimationFrame(flushRelInput);
+  }
+}
+
+function cancelPendingInputs() {
+  relAccDx = 0;
+  relAccDy = 0;
+  relFlushPending = false;
+}
+
+let inputDC = null; // WebRTC DataChannel for input
+let currentSession = 0; // monotonic counter — each connect() bumps it so
+                        // stale callbacks from a previous session bail out
+
+function safeSession() {
+  const sid = ++currentSession;
+  return () => sid === currentSession;
+}
+
+function sendInput(csv) {
+  if (csv.startsWith('ma,')) {
+    const parts = csv.split(',');
+    localCursorX = parseInt(parts[1], 10);
+    localCursorY = parseInt(parts[2], 10);
+    capLocalCursor();
+    updateCursorOverlay();
+  }
+  // Prefer DataChannel for lower latency; fall back to WebSocket
+  // Also verify pc.connectionState to avoid sending through a DataChannel
+  // whose underlying ICE transport has already disconnected.
+  if (inputDC && inputDC.readyState === 'open'
+      && pc && pc.connectionState === 'connected') {
+    inputDC.send(csv);
+  } else if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(csv);
+  }
+}
+
+function connect() {
+  // ── Bump session so every callback below can bail out if a newer
+  //     connect() / handleOffer has been called in the meantime. ──
+  const isCurrent = safeSession();
+
+  // Release any stuck modifiers before reconnecting
+  releaseAllModifiers();
+  // Cancel any pending reconnect
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  // Cancel negotiation timeout
+  if (negotiationTimer) { clearTimeout(negotiationTimer); negotiationTimer = null; }
+  // Cancel ICE recovery timer
+  if (iceRecoveryTimer) { clearTimeout(iceRecoveryTimer); iceRecoveryTimer = null; }
+  window.iceRetryCount = 0;
+
+  // ── Fully tear down any existing WebRTC session before starting fresh ──
+  // Detach event handlers first so no stale callback can touch the new
+  // connection's pc/ws (which will be overwritten on the next line).
+  if (ws) {
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      ws.close();
+    }
+  }
+  // Close old PeerConnection — if we don't, the stale DataChannel and ICE
+  // transports remain active and the server's webrtc driver will report
+  // Disconnected errors when it tries to deliver in-flight messages.
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+  // Release stale DataChannel reference — without this, the callbacks on the
+  // new connection reuse the old, already-closed DC and miss the new one.
+  inputDC = null;
+  // Stop media tracks
+  if (video.srcObject) {
+    video.srcObject.getTracks().forEach(t => t.stop());
+    video.srcObject = null;
+  }
+  const audioEl = document.getElementById('remote-audio');
+  if (audioEl && audioEl.srcObject) {
+    audioEl.srcObject.getTracks().forEach(t => t.stop());
+    audioEl.srcObject = null;
+  }
+
+  setStatus('Connecting...', false);
+  ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    if (!isCurrent()) return;
+    setStatus('Connected', true);
+    reconnectDelay = 1000;
+    ws.send(JSON.stringify({ type: 'ready' }));
+  };
+
+  // Set binary type for receiving compressed messages
+  ws.binaryType = 'arraybuffer';
+
+  // ── WebSocket decompression (native DecompressionStream with pako fallback) ──
+  // Also accepts raw UTF-8 text on failure (belt-and-suspenders fallback).
+  async function decompressDeflate(data) {
+    // Try native DecompressionStream (Chrome 80+, Firefox 113+, Safari 16.4+)
+    if (typeof DecompressionStream !== 'undefined') {
+      try {
+        const ds = new DecompressionStream('deflate-raw');
+        const writer = ds.writable.getWriter();
+        writer.write(data);
+        writer.close();
+        return await new Response(ds.readable).text();
+      } catch (e) {
+        console.warn('[ws] DecompressionStream failed:', e);
+        // Fall through to pako
+      }
+    }
+    // Try pako.js fallback
+    if (typeof window.pako !== 'undefined') {
+      try {
+        return new TextDecoder().decode(window.pako.inflateRaw(data));
+      } catch (e) {
+        console.warn('[ws] pako.inflateRaw failed:', e);
+        // Fall through to raw text
+      }
+    }
+    // Last resort: try raw UTF-8 decode (may produce garbage, but at least
+    // the browser can attempt to parse the signaling message)
+    console.warn('[ws] no decompressor available, trying raw UTF-8');
+    return new TextDecoder().decode(data);
+  }
+
+  ws.onmessage = async (event) => {
+    if (!isCurrent()) return;
+    let text;
+    if (event.data instanceof ArrayBuffer) {
+      // Binary message with compression prefix byte
+      const view = new Uint8Array(event.data);
+      if (view[0] === 1) {
+        // Decompress deflate payload with native API or pako fallback.
+        // If all decompressors fail, falls back to raw UTF-8 as last resort.
+        const compressed = view.slice(1);
+        text = await decompressDeflate(compressed);
+      } else {
+        // Uncompressed text
+        text = new TextDecoder().decode(view.slice(1));
+      }
+    } else if (typeof event.data === 'string') {
+      text = event.data;
+    } else {
+      console.warn('[ws] unknown message type:', typeof event.data);
+      return;
+    }
+
+    let msg;
+    try {
+      msg = JSON.parse(text);
+    } catch {
+      console.warn('[ws] non-JSON message:', text);
+      return;
+    }
+
+    switch (msg.type) {
+      case 'offer':
+        // 重协商 offer（由服务端 ICE restart 触发）
+        if (msg.renegotiation && pc) {
+          console.log('[offer] renegotiation offer received');
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: msg.sdp }));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+            console.log('[offer] renegotiation answer sent');
+          } catch (e) {
+            console.error('[offer] renegotiation failed:', e);
+            ws.close();
+          }
+          break;
+        }
+        // 首次协商走原来逻辑
+        try {
+          await handleOffer(msg.sdp);
+        } catch (e) {
+          console.error('[offer] handleOffer failed:', e);
+          ws.close();
+        }
+        break;
+      case 'ice':
+        if (pc) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate({
+              candidate: msg.candidate,
+              sdpMLineIndex: msg.sdp_mline_index,
+            }));
+          } catch (e) {}
+        }
+        break;
+      case 'cursor':
+        if (typeof msg.x === 'number' && typeof msg.y === 'number') {
+          const dx = msg.x - localCursorX;
+          const dy = msg.y - localCursorY;
+          if (dx * dx + dy * dy > 4) { // >2px threshold to filter echo jitter
+            startCursorAnim(msg.x, msg.y);
+          }
+        }
+        break;
+      case 'error':
+        setStatus('Error: ' + msg.error, false);
+        break;
+      case 'stats':
+        if (msg.rtt_ms !== undefined) {
+          statsDisplay.textContent = `${msg.rtt_ms}ms`;
+        }
+        break;
+    }
+  };
+
+  ws.onclose = () => {
+    if (!isCurrent()) return;
+    releaseAllModifiers();
+    inputDC = null;
+    window.iceRetryCount = 0;
+    setStatus('Disconnected, retrying...', false);
+    cursorOverlay.style.display = 'none';
+    // Stop media tracks
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach(t => t.stop());
+      video.srcObject = null;
+    }
+    const audioEl = document.getElementById('remote-audio');
+    if (audioEl && audioEl.srcObject) {
+      audioEl.srcObject.getTracks().forEach(t => t.stop());
+      audioEl.srcObject = null;
+    }
+    if (pc) { pc.close(); pc = null; }
+    reconnectTimer = setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+  };
+
+  ws.onerror = () => {
+    if (!isCurrent()) return;
+    releaseAllModifiers();
+    ws.close();
+  };
+}
+
+async function handleOffer(sdp) {
+  // Inherit the session from the connect() that created the WebSocket
+  // whose onmessage is calling us. If a newer connect() has run, bail.
+  const offerSession = currentSession;
+  const isCur = () => offerSession === currentSession;
+
+  if (pc) { pc.close(); pc = null; }
+  if (!isCur()) return;
+
+  // 每个新 RTCPeerConnection 从 0 开始计数
+  window.iceRetryCount = 0;
+
+  setStatus('Negotiating...', false);
+
+  const pcConfig = {};
+  if (STUN_SERVER) {
+    pcConfig.iceServers = [{ urls: STUN_SERVER.replace('stun://', 'stun:') }];
+  } else {
+    pcConfig.iceServers = [];
+    pcConfig.iceTransportPolicy = 'host';
+  }
+
+  pc = new RTCPeerConnection(pcConfig);
+
+  pc.ontrack = (event) => {
+    if (!isCur()) return;
+    if (event.track.kind === 'video') {
+      video.srcObject = event.streams[0];
+      video.onloadedmetadata = () => {
+        if (!isCur()) return;
+        const newW = video.videoWidth;
+        const newH = video.videoHeight;
+        // Reset zoom if remote resolution changed
+        if (newW !== displayWidth || newH !== displayHeight) {
+          zoomLevel = 1.0;
+          zoomPanX = 0;
+          zoomPanY = 0;
+          LayoutCache.update();
+          scheduleRender();
+        }
+        displayWidth = newW;
+        displayHeight = newH;
+        console.log(`[video] ${displayWidth}x${displayHeight}`);
+        LayoutCache.update();
+        cursorOverlay.style.display = 'block';
+        scheduleRender();
+      };
+      setStatus('●', true);
+      document.getElementById('status-text').style.opacity = '0';
+      showPointerHint();
+    } else if (event.track.kind === 'audio') {
+      const audio = document.getElementById('remote-audio');
+      audio.srcObject = event.streams[0];
+      audio.play().catch(() => {}); // user gesture may be required
+      if (!audioEnabled) {
+        document.getElementById('audio-hint').style.display = 'block';
+      }
+    }
+  };
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'ice',
+        candidate: event.candidate.candidate,
+        sdp_mline_index: event.candidate.sdpMLineIndex,
+      }));
+    }
+  };
+
+  const onConnectionFail = () => {
+    if (!isCur()) return;
+    if (!pc) return;
+    const st = pc.connectionState;
+    const ice = pc.iceConnectionState;
+    // Clear inputDC first so sendInput() immediately falls back to WebSocket
+    inputDC = null;
+    // Clear negotiation timer on success
+    if (st === 'connected' && negotiationTimer) {
+      clearTimeout(negotiationTimer);
+      negotiationTimer = null;
+    }
+    // 连接恢复
+    if (st === 'connected' || ice === 'connected') {
+      if (iceRecoveryTimer) {
+        clearTimeout(iceRecoveryTimer);
+        iceRecoveryTimer = null;
+      }
+      window.iceRetryCount = 0; // 重置计数
+      setStatus('●', true);
+      return;
+    }
+    // 网络波动 — 启动 10s 容忍窗口，带重试计数（最多 3 次）
+    if (st === 'disconnected' || ice === 'disconnected') {
+      if (iceRecoveryTimer) return; // 已有计时器在运行
+
+      // 初始化重试计数器
+      if (typeof window.iceRetryCount !== 'number') window.iceRetryCount = 0;
+
+      // 若已达 3 次，放弃恢复，降级到完全重建
+      if (window.iceRetryCount >= 3) {
+        console.warn('[ice] max retries (3) reached, closing WebSocket');
+        ws.close();
+        return;
+      }
+
+      // 定义具名递归函数，每次尝试前递增计数
+      async function attemptRecovery() {
+        if (!pc) return;
+
+        // 每次尝试前递增计数（首次调用时从 0→1）
+        window.iceRetryCount++;
+        setStatus(`Recovering (${window.iceRetryCount}/3)...`, false);
+
+        const curSt = pc.connectionState;
+        const curIce = pc.iceConnectionState;
+
+        // 如果已经恢复，重置计数并退出
+        if (curSt === 'connected' || curIce === 'connected') {
+          window.iceRetryCount = 0;
+          setStatus('●', true);
+          return;
+        }
+
+        // 如果已彻底失败，放弃恢复
+        if (curSt === 'failed' || curIce === 'failed') {
+          ws.close();
+          return;
+        }
+
+        // 如果仍处于 disconnected，尝试 ICE 重启
+        if (curSt === 'disconnected' || curIce === 'disconnected') {
+          try {
+            console.log(`[ice] restart attempt ${window.iceRetryCount}/3`);
+            const offer = await pc.createOffer({ iceRestart: true });
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({
+              type: 'offer',
+              sdp: offer.sdp,
+              renegotiation: true,
+            }));
+            setStatus(`Renegotiating (${window.iceRetryCount}/3)...`, false);
+          } catch (e) {
+            console.error('[ice] restart attempt failed:', e);
+          }
+
+          // 尝试后若未达到 3 次，且状态仍为 disconnected，则 10 秒后再次尝试
+          if (window.iceRetryCount < 3) {
+            const stillDisconnected = pc &&
+              (pc.connectionState === 'disconnected' || pc.iceConnectionState === 'disconnected');
+            if (stillDisconnected) {
+              iceRecoveryTimer = setTimeout(attemptRecovery, 10000);
+              return;
+            }
+          }
+        }
+
+        // 若达到 3 次仍未恢复，关闭 WebSocket 降级到完全重建
+        if (window.iceRetryCount >= 3) {
+          console.warn('[ice] max retries (3) reached, closing WebSocket');
+          ws.close();
+        }
+      }
+
+      // 启动第一次尝试（10 秒后）
+      iceRecoveryTimer = setTimeout(attemptRecovery, 10000);
+      return;
+    }
+    // 彻底失败 → 降级到完全重建
+    if (st === 'failed' || ice === 'failed') {
+      console.warn(`[pc] connection failed (connectionState=${st}, iceConnectionState=${ice})`);
+      setStatus('Connection lost', false);
+      ws.close();
+    }
+  };
+  pc.onconnectionstatechange = onConnectionFail;
+  pc.oniceconnectionstatechange = onConnectionFail;
+
+  try {
+    const remoteDesc = { type: 'offer', sdp: sdp };
+    await pc.setRemoteDescription(new RTCSessionDescription(remoteDesc));
+
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    if (ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket closed before answer could be sent');
+    }
+
+    ws.send(JSON.stringify({
+      type: 'answer',
+      sdp: answer.sdp,
+    }));
+
+    // ── DataChannel for input: listen for server-initiated channel ──
+    pc.ondatachannel = (event) => {
+      if (!isCur()) return;
+      inputDC = event.channel;
+      inputDC.onopen = () => { if (!isCur()) return; console.log('[dc] input channel open'); };
+      inputDC.onclose = () => { if (!isCur()) return; console.log('[dc] input channel closed'); inputDC = null; };
+      inputDC.onerror = () => { if (!isCur()) return; console.warn('[dc] input channel error'); inputDC = null; };
+    };
+
+    negotiationTimer = setTimeout(() => {
+      if (pc && pc.connectionState !== 'connected' && pc.connectionState !== 'closed') {
+        console.warn('[pc] negotiation timeout (15s), restarting');
+        setStatus('Negotiation timeout, retrying...', false);
+        ws.close();
+      }
+      negotiationTimer = null;
+    }, 15000);
+
+  } catch (e) {
+    console.error('[offer] negotiation error:', e);
+    setStatus('Error: ' + (e.message || e), false);
+    ws.close();
+  }
+}
+
+function videoPos(clientX, clientY) {
+  ensureLayoutFresh();
+  if (!LayoutCache.valid) return null;
+  const L = LayoutCache;
+  const x = (clientX - L.rect.left - L.renderX) / L.renderW;
+  const y = (clientY - L.rect.top - L.renderY) / L.renderH;
+
+  if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+
+  return {
+    x: Math.round(x * displayWidth),
+    y: Math.round(y * displayHeight)
+  };
+}
+
+// ── ResizeObserver for real-time container tracking ──
+const resizeObserver = new ResizeObserver(() => {
+  LayoutCache.update();
+  if (displayWidth > 0) scheduleRender();
+});
+resizeObserver.observe(viewport);
+
+// ── Mouse events ──
+let lastTouchEndTime = 0;
+
+function isSyntheticFromTouch() {
+  return touchActive || Date.now() - lastTouchEndTime < 200;
+}
+
+// Skip mouse events that land on UI controls (toolbar / keyboard)
+function closestUI(el, sel) {
+  return el instanceof Element ? el.closest(sel) : null;
+}
+function isOnUI(el) {
+  return closestUI(el, '#toolbar') || closestUI(el, '#custom-keyboard');
+}
+
+document.addEventListener('mousemove', (e) => {
+  if (isSyntheticFromTouch() || isOnUI(e.target)) return;
+
+  const pos = videoPos(e.clientX, e.clientY);
+  if (pos) {
+    localCursorX = pos.x;
+    localCursorY = pos.y;
+    capLocalCursor(); // calls updateCursorOverlay
+    const now = Date.now();
+    if (now - lastAbsMoveTs >= THROTTLE_MS) {
+      sendInput(`ma,${pos.x},${pos.y}`);
+      lastAbsMoveTs = now;
+    }
+  }
+});
+
+document.addEventListener('mousedown', (e) => {
+  if (isSyntheticFromTouch() || isOnUI(e.target)) return;
+  const pos = videoPos(e.clientX, e.clientY);
+  if (pos) {
+    sendInput(`ma,${pos.x},${pos.y}`);
+    let btn = 0;
+    if (e.button === 0) btn = 1;
+    else if (e.button === 1) btn = 2;
+    else if (e.button === 2) btn = 3;
+    else return;
+    sendInput(`md,${btn}`);
+  }
+});
+
+document.addEventListener('mouseup', (e) => {
+  if (isSyntheticFromTouch() || isOnUI(e.target)) return;
+  let btn = 0;
+  if (e.button === 0) btn = 1;
+  else if (e.button === 1) btn = 2;
+  else if (e.button === 2) btn = 3;
+  else return;
+  sendInput(`mu,${btn}`);
+});
+
+document.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  if (zoomActive) {
+    const oldZoom = zoomLevel;
+    zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomLevel - e.deltaY * ZOOM_STEP / 100));
+    if (Math.abs(zoomLevel - oldZoom) > 0.001) {
+      const rect = LayoutCache.viewRect || viewport.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      // Account for keyboard offset: layer Y = cursor Y + kbd
+      const kbdOff = keyboardVisible ? keyboard.offsetHeight : 0;
+      const effectY = cy + kbdOff;
+      // Incremental zoom pivot: keep layer point under cursor fixed
+      const oldPanX = zoomPanX, oldPanY = zoomPanY;
+      zoomPanX = cx - ((cx - oldPanX) / oldZoom) * zoomLevel;
+      zoomPanY = effectY - ((effectY - oldPanY) / oldZoom) * zoomLevel;
+      scheduleRender('smooth');
+    }
+  } else {
+    sendInput(`ms,${-e.deltaY}`);
+  }
+}, { passive: false });
+
+// ── Touch events (trackpad mode) ──
+let touchActive = false;
+let dragMode = false;
+let dragStarted = false;
+let lastWasTap = false;
+let longPressTimer = null;
+let lastTapTime = 0;
+let startTouchTime = 0;
+let touchStartX = 0;
+let touchStartY = 0;
+let isLongPress = false;
+let longPressMoved = false;
+let cursorMoved = false;
+let lastScrollY = 0;
+let lastTouchX = 0;
+let lastTouchY = 0;
+const MOVE_THRESHOLD = 15;
+const SCROLL_THRESHOLD = 20;
+const TAP_TIME_MAX = 300;
+const LONG_PRESS_MS = 700;
+const DBL_TAP_MAX = 400;
+
+video.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  lastTouchEndTime = Date.now();
+
+  // ── Two-finger pinch → enter pinch zoom mode ──
+  if (e.touches.length === 2) {
+    const t1 = e.touches[0], t2 = e.touches[1];
+    pinchActive = true;
+    pinchZoom0 = zoomLevel;
+    pinchPanX0 = zoomPanX;
+    pinchPanY0 = zoomPanY;
+    // Initial distance between fingers
+    const dx = t1.clientX - t2.clientX;
+    const dy = t1.clientY - t2.clientY;
+    pinchDist0 = Math.sqrt(dx * dx + dy * dy);
+    // Center point in screen coordinates
+    const cx = (t1.clientX + t2.clientX) / 2;
+    const cy = (t1.clientY + t2.clientY) / 2;
+    // Center point in "world" (unscaled video CSS) coordinates
+    // Account for keyboard offset: layer Y = screen Y + kbdHeight
+    const kbdOff = keyboardVisible ? keyboard.offsetHeight : 0;
+    pinchWorldCX = (cx - zoomPanX) / zoomLevel;
+    pinchWorldCY = (cy + kbdOff - zoomPanY) / zoomLevel;
+    return;
+  }
+
+  const t = e.touches[0];
+  clearTimeout(longPressTimer);
+
+  const now = Date.now();
+  if (lastWasTap && (now - lastTapTime < DBL_TAP_MAX) && lastTapTime > 0) {
+    dragMode = true;
+    lastWasTap = false;
+  } else {
+    dragMode = false;
+  }
+
+  touchActive = true;
+  startTouchTime = now;
+  touchStartX = t.clientX;
+  touchStartY = t.clientY;
+  lastTouchX = t.clientX;
+  lastTouchY = t.clientY;
+  isLongPress = false;
+  dragStarted = false;
+  longPressMoved = false;
+  cursorMoved = false;
+  lastScrollY = t.clientY;
+
+  if (!dragMode) {
+    longPressTimer = setTimeout(() => {
+      if (touchActive && !dragMode) {
+        cancelPendingInputs();
+        isLongPress = true;
+        lastScrollY = touchStartY;
+      }
+    }, LONG_PRESS_MS);
+  }
+}, { passive: false });
+
+video.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+
+  // ── Pinch zoom ──
+  if (pinchActive && e.touches.length === 2) {
+    const t1 = e.touches[0], t2 = e.touches[1];
+    const dx = t1.clientX - t2.clientX;
+    const dy = t1.clientY - t2.clientY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const scale = dist / pinchDist0;
+    // Apply scale with pivot on world center
+    zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, pinchZoom0 * scale));
+    zoomPanX = pinchPanX0 + pinchWorldCX * (pinchZoom0 - zoomLevel);
+    zoomPanY = pinchPanY0 + pinchWorldCY * (pinchZoom0 - zoomLevel);
+    scheduleRender('smooth');
+    return;
+  }
+  if (pinchActive) return; // was pinch but finger count changed — ignore
+
+  if (!touchActive) return;
+
+  const t = e.touches[0];
+  const dx = Math.abs(t.clientX - touchStartX);
+  const dy = Math.abs(t.clientY - touchStartY);
+  const moved = dx > MOVE_THRESHOLD || dy > MOVE_THRESHOLD;
+
+  if (!moved) return;
+
+  if (dragMode) {
+    if (!dragStarted) {
+      clearTimeout(longPressTimer);
+      cancelPendingInputs();
+      dragStarted = true;
+      sendInput('md,1');
+    }
+    cursorMoved = true;
+    const deltaXDrag = Math.round(t.clientX - lastTouchX);
+    const deltaYDrag = Math.round(t.clientY - lastTouchY);
+    lastTouchX = t.clientX;
+    lastTouchY = t.clientY;
+    if (deltaXDrag !== 0 || deltaYDrag !== 0) {
+      // Always move cursor (updateCursorOverlay handles virtual-cursor panning)
+      relAccDx += deltaXDrag;
+      relAccDy += deltaYDrag;
+      localCursorX += deltaXDrag;
+      localCursorY += deltaYDrag;
+      capLocalCursor(); // calls updateCursorOverlay → auto-pans if zoomed
+      scheduleRelFlush();
+    }
+  } else if (isLongPress) {
+    longPressMoved = true;
+    const scrollDy = t.clientY - lastScrollY;
+    if (Math.abs(scrollDy) >= SCROLL_THRESHOLD) {
+      if (zoomActive) {
+        // Zoom mode active → adjust zoom level instead of scrolling
+        const oldZoom = zoomLevel;
+        zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomLevel - scrollDy * ZOOM_STEP / 20));
+        if (Math.abs(zoomLevel - oldZoom) > 0.001) {
+          const rect = LayoutCache.viewRect || viewport.getBoundingClientRect();
+          const cx = t.clientX - rect.left;
+          const cy = t.clientY - rect.top;
+          const kbdOff = keyboardVisible ? keyboard.offsetHeight : 0;
+          const effectY = cy + kbdOff;
+          const oldPanX = zoomPanX, oldPanY = zoomPanY;
+          zoomPanX = cx - ((cx - oldPanX) / oldZoom) * zoomLevel;
+          zoomPanY = effectY - ((effectY - oldPanY) / oldZoom) * zoomLevel;
+          scheduleRender('smooth');
+        }
+      } else {
+        // Normal → send scroll steps to backend
+        const steps = Math.floor(Math.abs(scrollDy) / SCROLL_THRESHOLD);
+        const dir = scrollDy > 0 ? -1 : 1;
+        for (let i = 0; i < Math.min(steps, 5); i++) {
+          sendInput(`ms,${dir}`);
+        }
+      }
+      lastScrollY = t.clientY;
+    }
+  } else {
+    cursorMoved = true;
+    const deltaX = Math.round(t.clientX - lastTouchX);
+    const deltaY = Math.round(t.clientY - lastTouchY);
+    lastTouchX = t.clientX;
+    lastTouchY = t.clientY;
+    if (deltaX !== 0 || deltaY !== 0) {
+      // Always move cursor
+      relAccDx += deltaX;
+      relAccDy += deltaY;
+      localCursorX += deltaX;
+      localCursorY += deltaY;
+      capLocalCursor(); // calls updateCursorOverlay → auto-pans if zoomed
+      scheduleRelFlush();
+    }
+  }
+}, { passive: false });
+
+video.addEventListener('touchend', (e) => {
+  e.preventDefault();
+  // Reset pinch state regardless of other touch logic
+  pinchActive = false;
+  clearTimeout(longPressTimer);
+  cancelPendingInputs();
+
+  const touchDuration = Date.now() - startTouchTime;
+
+  if (touchActive) {
+    if (dragStarted) {
+      sendInput('mu,1');
+      dragMode = false;
+      lastWasTap = false;
+    } else if (isLongPress && !longPressMoved) {
+      sendInput('md,3');
+      sendInput('mu,3');
+      lastWasTap = false;
+    } else if (touchDuration < TAP_TIME_MAX && !cursorMoved) {
+      sendInput('md,1');
+      sendInput('mu,1');
+      lastWasTap = true;
+    } else {
+      lastWasTap = false;
+    }
+  }
+
+  touchActive = false;
+  dragMode = false;
+  dragStarted = false;
+  cursorMoved = false;
+  longPressMoved = false;
+  lastTapTime = Date.now();
+  lastTouchEndTime = Date.now();
+  isLongPress = false;
+}, { passive: false });
+
+// ── Keyboard events (physical keyboard) ──
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'F11') {
+    e.preventDefault();
+    fsBtn.click();
+    return;
+  }
+  const preventKeys = ['Tab', 'F5', 'F12', 'Slash', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+  if (preventKeys.includes(e.code) || e.ctrlKey || e.altKey || e.metaKey) {
+    e.preventDefault();
+  }
+  sendInput(`kd,${e.code}`);
+});
+
+document.addEventListener('keyup', (e) => {
+  sendInput(`ku,${e.code}`);
+});
+
+// ── Page unload: release modifier keys before connection drops ──
+window.addEventListener('beforeunload', () => {
+  releaseAllModifiers();
+  inputDC = null;
+  flushRelInput();
+  cancelCursorAnim();
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (negotiationTimer) { clearTimeout(negotiationTimer); negotiationTimer = null; }
+  if (iceRecoveryTimer) { clearTimeout(iceRecoveryTimer); iceRecoveryTimer = null; }
+  resizeObserver.disconnect();
+  // Stop media tracks
+  if (video.srcObject) {
+    video.srcObject.getTracks().forEach(t => t.stop());
+    video.srcObject = null;
+  }
+  const audioEl = document.getElementById('remote-audio');
+  if (audioEl && audioEl.srcObject) {
+    audioEl.srcObject.getTracks().forEach(t => t.stop());
+    audioEl.srcObject = null;
+  }
+  if (pc) { try { pc.close(); } catch(_) {} pc = null; }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.close(); } catch (_) {}
+  }
+});
+
+function hideHint() {
+  pointerHint.style.display = 'none';
+}
+
+function showPointerHint() {
+  pointerHint.style.display = 'block';
+  // Re-register listeners (they may have been removed after prior hide)
+  document.removeEventListener('touchstart', hideHint);
+  document.removeEventListener('mousedown', hideHint);
+  document.addEventListener('touchstart', hideHint);
+  document.addEventListener('mousedown', hideHint);
+  // Auto-hide after 4 seconds
+  setTimeout(() => {
+    pointerHint.style.display = 'none';
+  }, 4000);
+}
+
+// Initial hint display on page load
+showPointerHint();
+
+document.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+});
+
+// ── Fullscreen toggle ──
+function updateFsButton() {
+  fsBtn.textContent = document.fullscreenElement ? 'Exit' : 'Fullscreen';
+}
+
+fsBtn.addEventListener('click', () => {
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    container.requestFullscreen();
+  }
+});
+
+// ── Zoom toggle button ──
+zoomBtn.addEventListener('click', () => {
+  buttonZoom = !buttonZoom;
+  zoomBtn.classList.toggle('active', buttonZoom);
+  syncZoomActive();
+});
+
+document.addEventListener('fullscreenchange', () => {
+  updateFsButton();
+  LayoutCache.update();
+  scheduleRender();
+});
+
+// ── Custom Virtual Keyboard ──
+const keyboard = document.getElementById('custom-keyboard');
+const kbdBtn = document.getElementById('kbd-btn');
+const allLayers = keyboard.querySelectorAll('.kbd-layer');
+const layerBtns = keyboard.querySelectorAll('.kbd-layer-btn');
+const dismissBtn = keyboard.querySelector('.kbd-dismiss');
+const allKeys = keyboard.querySelectorAll('.kbd-key');
+
+let keyboardVisible = false;
+let currentLayer = 'main';
+
+// Modifier key state
+const MOD_CODES = ['ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight', 'AltLeft', 'AltRight'];
+const modState = {};
+for (const code of MOD_CODES) {
+  modState[code] = { active: false, latched: false, timer: null };
+}
+
+function updateModVisual(code) {
+  const state = modState[code];
+  // Update all buttons with this data-code
+  keyboard.querySelectorAll(`.kbd-key[data-code="${code}"]`).forEach(el => {
+    el.classList.remove('mod-latched', 'mod-locked', 'mod-active');
+    if (state.active && state.latched) {
+      el.classList.add('mod-latched', 'mod-active');
+    } else if (state.active && !state.latched) {
+      el.classList.add('mod-locked', 'mod-active');
+    }
+  });
+}
+
+function releaseLatchedMods() {
+  for (const code of Object.keys(modState)) {
+    const m = modState[code];
+    if (m.active && m.latched) {
+      sendInput(`ku,${code}`);
+      m.active = false;
+      m.latched = false;
+      clearTimeout(m.timer);
+      m.timer = null;
+      updateModVisual(code);
+    }
+  }
+}
+
+function releaseAllModifiers() {
+  for (const code of Object.keys(modState)) {
+    const m = modState[code];
+    if (m.active) {
+      sendInput(`ku,${code}`);
+    }
+    clearTimeout(m.timer);
+    m.active = false;
+    m.latched = false;
+    m.timer = null;
+    updateModVisual(code);
+  }
+}
+
+function handleModKey(code) {
+  const m = modState[code];
+  if (!m) return;
+
+  if (m.active) {
+    // Toggle off (release)
+    sendInput(`ku,${code}`);
+    m.active = false;
+    m.latched = false;
+    clearTimeout(m.timer);
+    m.timer = null;
+    updateModVisual(code);
+    return;
+  }
+
+  // Press
+  sendInput(`kd,${code}`);
+  m.active = true;
+
+  if (m.timer) {
+    // Second click within timer window → lock
+    clearTimeout(m.timer);
+    m.timer = null;
+    m.latched = false;
+    updateModVisual(code);
+    return;
+  }
+
+  // First click: start timer for latch detection
+  m.timer = setTimeout(() => {
+    m.timer = null;
+    m.latched = true;
+    updateModVisual(code);
+  }, 300);
+}
+
+function handleNormalKey(code) {
+  sendInput(`kd,${code}`);
+  sendInput(`ku,${code}`);
+
+  for (const modCode of Object.keys(modState)) {
+    const m = modState[modCode];
+    if (!m.active) continue;
+
+    // Latched (300ms timer fired): auto-release after first key
+    if (m.latched) {
+      sendInput(`ku,${modCode}`);
+      m.active = false;
+      m.latched = false;
+      clearTimeout(m.timer);
+      m.timer = null;
+      updateModVisual(modCode);
+    }
+    // Quick-press (timer still ticking): release instantly — Shift+/ → ?
+    else if (m.timer) {
+      clearTimeout(m.timer);
+      m.timer = null;
+      sendInput(`ku,${modCode}`);
+      m.active = false;
+      updateModVisual(modCode);
+    }
+    // Locked (double-tap, no timer): leave active for subsequent keys
+  }
+}
+
+function handleKeyUp(code) {
+  // Normal keys already released in handleNormalKey; modifiers managed by latch/lock logic
+}
+
+// Layer switching
+function switchLayer(layer) {
+  if (layer === 'main' && currentLayer === 'main') return; // already main
+  if (layer === currentLayer) {
+    // Toggle back to main
+    layer = 'main';
+  }
+  currentLayer = layer;
+  allLayers.forEach(l => l.classList.toggle('active', l.dataset.layer === layer));
+  layerBtns.forEach(btn => {
+    const target = btn.dataset.target;
+    btn.classList.toggle('layer-active', target === layer);
+  });
+}
+
+// Pointer events for keyboard keys
+function getCode(el) {
+  const key = closestUI(el, '.kbd-key');
+  return key ? key.dataset.code : null;
+}
+
+// Block all click events inside the keyboard from bubbling to the container
+keyboard.addEventListener('click', (e) => {
+  e.stopPropagation();
+});
+
+keyboard.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  const key = closestUI(e.target, '.kbd-key');
+  if (!key) return;
+  const code = key.dataset.code;
+  if (!code) return;
+
+  // Set pointer capture so we get the up event even if pointer leaves the element
+  try { key.setPointerCapture(e.pointerId); } catch(_) {}
+
+  if (MOD_CODES.includes(code)) {
+    handleModKey(code);
+  } else {
+    handleNormalKey(code);
+  }
+});
+
+keyboard.addEventListener('pointerup', (e) => {
+  const key = closestUI(e.target, '.kbd-key');
+  if (!key) return;
+  const code = key.dataset.code;
+  if (!code) return;
+  try { key.releasePointerCapture(e.pointerId); } catch(_) {}
+  handleKeyUp(code);
+});
+
+keyboard.addEventListener('pointerleave', (e) => {
+  // Release all pressed normal keys when pointer leaves keyboard
+  // (safety net for edge cases)
+});
+
+// Layer switch buttons (Fn, 123)
+layerBtns.forEach(btn => {
+  btn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const target = btn.dataset.target;
+    if (target === 'func' || target === 'num') {
+      switchLayer(target);
+    }
+  });
+});
+
+// Dismiss button
+dismissBtn.addEventListener('click', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  hideKeyboard();
+});
+
+// Keyboard toggle from toolbar
+kbdBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (keyboardVisible) {
+    hideKeyboard();
+  } else {
+    showKeyboard();
+  }
+});
+
+function showKeyboard() {
+  keyboardVisible = true;
+  keyboard.classList.add('visible');
+  document.body.classList.add('kbd-open');
+  currentLayer = 'main';
+  allLayers.forEach(l => l.classList.toggle('active', l.dataset.layer === 'main'));
+  layerBtns.forEach(btn => btn.classList.remove('layer-active'));
+  requestAnimationFrame(() => adjustVideoForKeyboard(true));
+}
+
+function hideKeyboard() {
+  keyboardVisible = false;
+  keyboard.classList.remove('visible');
+  document.body.classList.remove('kbd-open');
+  // Reset to main layer
+  switchLayer('main');
+  // Release all modifier states (sends ku for any active modifiers)
+  releaseAllModifiers();
+  adjustVideoForKeyboard(false);
+}
+
+// ── Alt key: activate frontend zoom mode ──
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'AltLeft' || e.code === 'AltRight') {
+    e.preventDefault();
+    altHeld = true;
+    syncZoomActive();
+  }
+});
+document.addEventListener('keyup', (e) => {
+  if (e.code === 'AltLeft' || e.code === 'AltRight') {
+    altHeld = false;
+    syncZoomActive();
+  }
+});
+// Safety: release all modifier keys (ku) + reset zoom when window loses focus
+window.addEventListener('blur', () => {
+  releaseAllModifiers();
+  if (altHeld) {
+    altHeld = false;
+    syncZoomActive();
+  }
+});
+
+// Adjust container for keyboard visibility
+function adjustVideoForKeyboard(show) {
+  const toolbar = document.getElementById('toolbar');
+  if (show) {
+    toolbar.style.display = 'none';
+  } else {
+    toolbar.style.display = 'flex';
+  }
+  LayoutCache.update();
+  scheduleRender();
+}
+
+// Recalculate container offset on resize when keyboard is visible
+window.addEventListener('resize', () => {
+  if (keyboardVisible) adjustVideoForKeyboard(true);
+});
+
+// Click on video area → hide keyboard
+container.addEventListener('click', (e) => {
+  if (keyboardVisible && !closestUI(e.target, '#toolbar') && !closestUI(e.target, '#custom-keyboard')) {
+    hideKeyboard();
+  }
+});
+
+// ── Audio unmute ──
+const audioHint = document.getElementById('audio-hint');
+let audioEnabled = false;
+
+function enableAudio() {
+  if (audioEnabled) return;
+  audioEnabled = true;
+  video.muted = false;
+  document.getElementById('remote-audio').play().catch(() => {});
+  audioHint.style.display = 'none';
+}
+
+video.addEventListener('playing', () => {
+  if (!audioEnabled) {
+    audioHint.style.display = 'block';
+    setTimeout(() => { audioHint.style.display = 'none'; }, 8000);
+  }
+});
+
+document.addEventListener('click', enableAudio);
+document.addEventListener('touchstart', enableAudio);
+
+// ── Start ──
+// Defer initial connection to avoid blocking first paint / layout
+requestIdleCallback(connect, { timeout: 2000 });
+</script>
+</body>
+</html>
