@@ -1,0 +1,55 @@
+name: Publish to crates.io
+
+on:
+  push:
+    branches:
+      - ndk
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update && cargo fmt
+          sudo apt-get install -y \
+            nasm \
+            libpulse-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            libc++-dev \
+            libstdc++-12-dev \
+            libopus-dev
+          rustup component add llvm-tools
+
+      - name: Update Cargo.lock and commit if changed
+        run: |
+          cargo update && git switch ndk
+          if ! git diff --quiet .; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .
+            git commit -m "chore: update Cargo.lock"
+          fi
+
+      - name: Check if version already published
+        id: check_version
+        run: |
+          PACKAGE_NAME=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].name')
+          CURRENT_VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].version')
+          if curl -s "https://crates.io/api/v1/crates/${PACKAGE_NAME}/${CURRENT_VERSION}" | grep -q '"version":"'"${CURRENT_VERSION}"'"'; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Publish to crates.io
+        if: steps.check_version.outputs.skip == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.VNRIT_CARGO }}
+        run: cargo publish
