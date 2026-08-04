@@ -1,10 +1,10 @@
 [package]
-name = "vnrit"
-version = "0.2.26"
+name = "ndk-vnrit"
+version = "0.1.29"
 edition = "2024"
 description = "Lightweight X11 desktop WebRTC streaming server (pure Rust, no GStreamer)"
 license = "Apache-2.0"  
-repository = "https://github.com/nlsidf/vnrit.git"
+repository = "https://github.com/nlsidf/ndk-vnrit.git"
 
 [profile.release]
 opt-level = 3
@@ -25,22 +25,21 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-x11rb = { version = "0.13", features = ["xtest", "allow-unsafe-code", "shm", "xinput"] }
-x11rb-protocol = "0.13"
+x11rb = { version = "0.14", features = ["xtest", "allow-unsafe-code", "shm", "xinput"] }
+x11rb-protocol = "0.14"
 
 # WebRTC pure Rust stack
-webrtc = "0.20.0-rc.3"
-rtc = "0.20.0-rc.3"
-rtc-media = "0.20.0-rc.3"
+webrtc = "0.20"
+rtc = "0.20"
+rtc-media = "0.20"
 # ICE network types for TCP-only mode
-ice = { package = "rtc-ice", version = "0.20.0-rc.3" }
+ice = { package = "rtc-ice", version = "0.20" }
 
 # async-trait for PeerConnectionEventHandler
 async-trait = "0.1"
 
-# Video encoding
-openh264 = { version = "0.9", features = ["source"] }
-openh264-sys2 = "0.9"
+# Video encoding: Android NDK MediaCodec hardware encoder
+# libmediandk.so is loaded at runtime via dlopen (no compile-time link needed)
 
 # shiguredo_libyuv — Rust bindings for Google's libyuv (SIMD-accelerated conversion + scaling)
 # Fork: vnrit-libyuv (Android build fixes, Gitee mirrors for git clone)
@@ -54,7 +53,7 @@ opus = { version = "0.3", package = "vnrit-opus" }
 
 # Utilities for webrtc-rs
 bytes = "1"
-rand = "0.9"
+rand = "0.10"
 
 # mmap for SHM shared memory
 libc = "0.2"
@@ -73,7 +72,7 @@ flate2 = "1.0"
 
 # Memory allocator
 mimalloc = "0.1.52"
-phf = { version = "0.11", features = ["macros"] }
+phf = { version = "0.14", features = ["macros"] }
 
 # Image blur/sharpening (stack_blur, SIMD-accelerated, no image crate dependency)
 libblur = { version = "0.24", default-features = false }

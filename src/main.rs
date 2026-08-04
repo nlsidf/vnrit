@@ -64,23 +64,13 @@ use webrtc::peer_connection::{
 };
 use webrtc::runtime;
 
-// ── openh264 ──
-use openh264::OpenH264API;
-use openh264::encoder::{
-    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile,
-    RateControlMode, UsageType,
-};
-use openh264::formats::YUVSlices;
-use openh264_sys2::ENCODER_OPTION_BITRATE;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use ice::network_type::NetworkType;
 use tokio::task::JoinHandle;
-use rand::Rng;
 use std::os::fd::IntoRawFd;
 
-use vnrit_libyuv::{self, ArgbImage, FilterMode, I420ImageMut, ImageSize};
+use vnrit_libyuv::{self, ArgbImage, FilterMode, I420Image, I420ImageMut, ImageSize, Nv12ImageMut};
 
 // ── libblur: SIMD-accelerated fast blur (used for Y-plane unsharp mask) ──
 use libblur::{self, AnisotropicRadius, BlurImageMut, FastBlurChannels, ThreadingPolicy};
@@ -132,7 +122,7 @@ vnrit streams an X11 display to one or more browsers over WebRTC.
 The frontend supports touch-to-mouse translation (one-finger move,
 two-finger scroll, tap = left click, long-press = right click).
 
-Uses pure Rust: webrtc-rs for WebRTC, openh264 for H.264 encoding,
+Uses pure Rust: webrtc-rs for WebRTC, AMediaCodec NDK for H.264 encoding,
 x11rb for X11 screen capture and input injection.
 No GStreamer dependency.
 ",
@@ -143,7 +133,7 @@ No GStreamer dependency.
 
 ─── CODEC ──────────────────────────────���────────────────────────
 
-  H.264 (only) built-in via openh264 (Cisco OpenH264).
+  H.264 (only) built-in via Android NDK AMediaCodec (dlopen).
   Constrained Baseline profile, real-time screen content mode.
 
 ─── RECOMMENDED COMMAND ────────────────────────────────────────
@@ -1921,84 +1911,279 @@ fn bgra_to_i420_into(bgra: &[u8], width: u32, height: u32, out: &mut [u8]) {
     let _ = vnrit_libyuv::argb_to_i420(&src, &mut dst, size);
 }
 
-// ── VideoEncoder: wraps openh264 ──
+// ── VideoEncoder: Android NDK AMediaCodec H.264 (loaded via dlopen) ──
 
-struct VideoEncoder {
-    inner: Encoder,
-    width: u32,
-    height: u32,
-    last_bitrate_bps: u32,
-    last_adjust: std::time::Instant,
+use std::ffi::c_void;
+
+type AMediaCodec = c_void;
+type AMediaFormat = c_void;
+
+const MC_CONFIGURE_FLAG_ENCODE: u32 = 1;
+const MC_COLOR_NV12: i32 = 21;
+const MC_TRY_AGAIN: i64 = -1;
+const MC_FORMAT_CHANGED: i64 = -2;
+const MC_BUFFERS_CHANGED: i64 = -3;
+const MC_FLAG_END_OF_STREAM: u32 = 4;
+
+#[repr(C)]
+struct McBufferInfo {
+    offset: u32,
+    size: u32,
+    pts: u64,
+    flags: u32,
 }
 
-impl VideoEncoder {
+struct McApi {
+    create: unsafe extern "C" fn(*const u8) -> *mut AMediaCodec,
+    delete: unsafe extern "C" fn(*mut AMediaCodec) -> i32,
+    configure: unsafe extern "C" fn(*mut AMediaCodec, *const AMediaFormat, *mut c_void, *mut c_void, u32) -> i32,
+    start: unsafe extern "C" fn(*mut AMediaCodec) -> i32,
+    stop: unsafe extern "C" fn(*mut AMediaCodec) -> i32,
+    flush: unsafe extern "C" fn(*mut AMediaCodec) -> i32,
+    deq_in: unsafe extern "C" fn(*mut AMediaCodec, i64) -> i64,
+    get_in: unsafe extern "C" fn(*mut AMediaCodec, usize, *mut usize) -> *mut u8,
+    queue_in: unsafe extern "C" fn(*mut AMediaCodec, usize, usize, usize, u64, u32) -> i32,
+    deq_out: unsafe extern "C" fn(*mut AMediaCodec, *mut c_void, i64) -> i64,
+    get_out: unsafe extern "C" fn(*mut AMediaCodec, usize, *mut usize) -> *mut u8,
+    rel_out: unsafe extern "C" fn(*mut AMediaCodec, usize, i32) -> i32,
+    get_ofmt: unsafe extern "C" fn(*mut AMediaCodec) -> *mut AMediaFormat,
+    set_params: unsafe extern "C" fn(*mut AMediaCodec, *const AMediaFormat) -> i32,
+    fmt_new: unsafe extern "C" fn() -> *mut AMediaFormat,
+    fmt_del: unsafe extern "C" fn(*mut AMediaFormat),
+    fmt_str: unsafe extern "C" fn(*mut AMediaFormat, *const u8, *const u8),
+    fmt_i32: unsafe extern "C" fn(*mut AMediaFormat, *const u8, i32),
+    fmt_buf: unsafe extern "C" fn(*const AMediaFormat, *const u8, *mut *mut u8, *mut usize) -> i32,
+}
+
+fn load_mc_api() -> anyhow::Result<(*mut c_void, McApi)> {
+    let paths = [
+        "/system/lib64/libmediandk.so\0",
+        "/apex/com.android.media.swcodec/lib64/libmediandk.so\0",
+        "/apex/com.android.media/lib64/libmediandk.so\0",
+        "/vendor/lib64/libmediandk.so\0",
+        "/system/lib/libmediandk.so\0",
+        "libmediandk.so\0",
+    ];
+    let lib = paths.iter().find_map(|p| {
+        let h = unsafe { libc::dlopen(p.as_ptr() as *const _, libc::RTLD_LAZY) };
+        if h.is_null() { None } else { Some(h) }
+    });
+    let lib = lib.ok_or_else(|| {
+        anyhow::anyhow!("libmediandk.so not found (tried /system/lib64/, /apex/, /vendor/, /system/lib/, default linker)")
+    })?;
+    macro_rules! sym {
+        ($n:literal) => {{
+            let p = unsafe { libc::dlsym(lib, concat!($n, "\0").as_ptr() as *const _) };
+            if p.is_null() {
+                unsafe { libc::dlclose(lib); }
+                anyhow::bail!("dlsym {} failed", $n);
+            }
+            unsafe { std::mem::transmute_copy::<*mut c_void, _>(&p) }
+        }};
+    }
+    let api = McApi {
+        create: sym!("AMediaCodec_createEncoderByType"),
+        delete: sym!("AMediaCodec_delete"),
+        configure: sym!("AMediaCodec_configure"),
+        start: sym!("AMediaCodec_start"),
+        stop: sym!("AMediaCodec_stop"),
+        flush: sym!("AMediaCodec_flush"),
+        deq_in: sym!("AMediaCodec_dequeueInputBuffer"),
+        get_in: sym!("AMediaCodec_getInputBuffer"),
+        queue_in: sym!("AMediaCodec_queueInputBuffer"),
+        deq_out: sym!("AMediaCodec_dequeueOutputBuffer"),
+        get_out: sym!("AMediaCodec_getOutputBuffer"),
+        rel_out: sym!("AMediaCodec_releaseOutputBuffer"),
+        get_ofmt: sym!("AMediaCodec_getOutputFormat"),
+        set_params: sym!("AMediaCodec_setParameters"),
+        fmt_new: sym!("AMediaFormat_new"),
+        fmt_del: sym!("AMediaFormat_delete"),
+        fmt_str: sym!("AMediaFormat_setString"),
+        fmt_i32: sym!("AMediaFormat_setInt32"),
+        fmt_buf: sym!("AMediaFormat_getBuffer"),
+    };
+    Ok((lib, api))
+}
+
+/// Debug-only H.264 Annex B validator.
+/// Scans for start codes, checks NAL unit types, flags anomalies via log::warn.
+#[cfg(debug_assertions)]
+fn debug_validate_h264(data: &[u8]) {
+    if data.is_empty() {
+        log::warn!("[nal] empty frame");
+        return;
+    }
+    let mut pos = 0;
+    let mut nal_count = 0;
+    let mut has_sps = false;
+    let mut has_pps = false;
+    let mut has_idr = false;
+    while pos + 3 < data.len() {
+        // scan for start code
+        let sc_len;
+        if data[pos] == 0 && data[pos+1] == 0 && data[pos+2] == 0 && data[pos+3] == 1 {
+            sc_len = 4;
+        } else if data[pos] == 0 && data[pos+1] == 0 && data[pos+2] == 1 {
+            sc_len = 3;
+        } else {
+            pos += 1;
+            continue;
+        }
+        let nal_start = pos + sc_len;
+        if nal_start >= data.len() {
+            break;
+        }
+        nal_count += 1;
+        let nal_type = data[nal_start] & 0x1F;
+        match nal_type {
+            7 => has_sps = true,
+            8 => has_pps = true,
+            5 => has_idr = true,
+            1 | 6 | 9 | 12 => {} // non-IDR, SEI, AUD, filler
+            other => log::warn!("[nal] unexpected type {} at offset {}", other, pos),
+        }
+        // skip past this NAL to next start code
+        let mut end = nal_start;
+        while end + 3 < data.len() {
+            if (data[end] == 0 && data[end+1] == 0 && data[end+2] == 1)
+                || (data[end] == 0 && data[end+1] == 0 && data[end+2] == 0 && data[end+3] == 1)
+            {
+                break;
+            }
+            end += 1;
+        }
+        pos = end;
+    }
+    if nal_count == 0 {
+        log::warn!("[nal] no NAL units found");
+    }
+    if has_idr && (!has_sps || !has_pps) {
+        log::warn!("[nal] IDR without SPS/PPS");
+    }
+}
+
+struct MediaCodecEncoder {
+    _lib: *mut c_void,
+    api: McApi,
+    codec: *mut AMediaCodec,
+    width: u32,
+    height: u32,
+    bitrate_bps: u32,
+    last_adjust: std::time::Instant,
+    nv12: Vec<u8>,
+    csd: Vec<u8>,
+    csd_sent: bool,
+    /// Wall-clock base for PTS. Reset on encoder re-creation (new WebRTC session).
+    epoch: std::time::Instant,
+}
+
+// The encoder is created inside spawn_blocking and stays on that thread.
+// codec: *mut is never moved across threads; no Send impl needed.
+
+impl MediaCodecEncoder {
     fn new(args: &Args, width: u32, height: u32) -> Result<Self> {
+        let (lib, mc) = load_mc_api()?;
         let bitrate_bps = (args.bitrate as u32) * 1000;
-        let framerate = args.framerate as f32;
+        let framerate = args.framerate as u32;
 
-        let intra_period = (args.framerate as u32) * 10; // GOP = 10× framerate
+        let codec = unsafe { (mc.create)("video/avc\0".as_ptr()) };
+        if codec.is_null() {
+            unsafe { libc::dlclose(lib); }
+            anyhow::bail!("AMediaCodec_createEncoderByType failed");
+        }
 
-        let config = EncoderConfig::new()
-            .num_threads(1)
-            .bitrate(BitRate::from_bps(bitrate_bps))
-            .max_frame_rate(FrameRate::from_hz(framerate))
-            .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Bitrate)
-            .complexity(Complexity::Low)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(intra_period))
-            .profile(Profile::Baseline);
+        let fmt = unsafe { (mc.fmt_new)() };
+        let ret = unsafe {
+            (mc.fmt_str)(fmt, "mime\0".as_ptr(), "video/avc\0".as_ptr());
+            (mc.fmt_i32)(fmt, "width\0".as_ptr(), width as i32);
+            (mc.fmt_i32)(fmt, "height\0".as_ptr(), height as i32);
+            (mc.fmt_i32)(fmt, "bitrate\0".as_ptr(), bitrate_bps as i32);
+            (mc.fmt_i32)(fmt, "frame-rate\0".as_ptr(), framerate as i32);
+            (mc.fmt_i32)(fmt, "i-frame-interval\0".as_ptr(), 10);
+            (mc.fmt_i32)(fmt, "color-format\0".as_ptr(), MC_COLOR_NV12);
+            (mc.fmt_i32)(fmt, "stride\0".as_ptr(), width as i32);
+            (mc.fmt_i32)(fmt, "slice-height\0".as_ptr(), height as i32);
+            (mc.fmt_i32)(fmt, "latency\0".as_ptr(), 1);
+            (mc.configure)(codec, fmt, std::ptr::null_mut(), std::ptr::null_mut(), MC_CONFIGURE_FLAG_ENCODE)
+        };
+        unsafe { (mc.fmt_del)(fmt) };
+        if ret != 0 {
+            unsafe { (mc.delete)(codec); libc::dlclose(lib); }
+            anyhow::bail!("AMediaCodec_configure failed: {}", ret);
+        }
+        if unsafe { (mc.start)(codec) } != 0 {
+            unsafe { (mc.delete)(codec); libc::dlclose(lib); }
+            anyhow::bail!("AMediaCodec_start failed");
+        }
 
-        let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
-            .context("failed to create openh264 encoder")?;
+        let y_size = (width * height) as usize;
+        let uv_size = ((width / 2) * (height / 2)) as usize;
+        log::info!(
+            "[mcenc] {}x{}, {}kbps, {}fps",
+            width, height, args.bitrate, framerate
+        );
 
-        log::info!("[encoder] 1 thread configured, {}kbps", bitrate_bps / 1000);
-
-        Ok(VideoEncoder {
-            inner: encoder,
+        Ok(MediaCodecEncoder {
+            codec,
+            _lib: lib,
+            api: mc,
             width,
             height,
-            last_bitrate_bps: bitrate_bps,
+            bitrate_bps,
             last_adjust: std::time::Instant::now(),
+            nv12: vec![0u8; y_size + uv_size * 2],
+            csd: Vec::with_capacity(256),
+            csd_sent: false,
+            epoch: std::time::Instant::now(),
         })
     }
 
-    /// Adjust encoder bitrate at runtime via openh264 SetOption (no recreate).
-    /// Returns true if bitrate was actually changed.
     fn set_bitrate(&mut self, new_bps: u32) -> bool {
         const MIN_GAP: std::time::Duration = std::time::Duration::from_secs(5);
         if self.last_adjust.elapsed() < MIN_GAP {
             return false;
         }
-        if (new_bps as i32 - self.last_bitrate_bps as i32).abs() < 50000 {
+        if (new_bps as i32 - self.bitrate_bps as i32).abs() < 50000 {
             return false;
         }
         let clamped = new_bps.clamp(100_000, 10_000_000);
-        let mut val: i32 = clamped as i32;
-        // SAFETY: set_option with ENCODER_OPTION_BITRATE is a well-defined
-        // operation in openh264's public C API — the encoder handles mid-stream
-        // bitrate changes safely without requiring re-initialization.
+        let fmt = unsafe { (self.api.fmt_new)() };
         unsafe {
-            self.inner
-                .raw_api()
-                .set_option(ENCODER_OPTION_BITRATE, std::ptr::addr_of_mut!(val).cast());
+            (self.api.fmt_i32)(fmt, "video-bitrate\0".as_ptr(), clamped as i32);
+            (self.api.set_params)(self.codec, fmt);
+            (self.api.fmt_del)(fmt);
         }
-        let old_bps = self.last_bitrate_bps;
-        self.last_bitrate_bps = clamped;
+        let old_bps = self.bitrate_bps;
+        self.bitrate_bps = clamped;
         self.last_adjust = std::time::Instant::now();
-        // Only force IDR on significant drops (>30%) to avoid bloating an
-        // already-congested link. Small adjustments transition smoothly via
-        // the encoder's internal rate control.
         if clamped < old_bps && (old_bps - clamped) > old_bps * 30 / 100 {
-            self.inner.force_intra_frame();
-            log::info!(
-                "[encoder] {}→{}kbps (IDR forced)",
-                old_bps / 1000,
-                clamped / 1000
-            );
+            self.force_keyframe();
+            log::info!("[mcenc] {}→{}kbps (IDR)", old_bps / 1000, clamped / 1000);
         } else {
-            log::info!("[encoder] {}→{}kbps", old_bps / 1000, clamped / 1000);
+            log::info!("[mcenc] {}→{}kbps", old_bps / 1000, clamped / 1000);
         }
         true
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        let ret = unsafe { (self.api.flush)(self.codec) };
+        if ret != 0 {
+            anyhow::bail!("AMediaCodec_flush failed: {}", ret);
+        }
+        Ok(())
+    }
+
+    fn force_keyframe(&mut self) {
+        let fmt = unsafe { (self.api.fmt_new)() };
+        unsafe {
+            (self.api.fmt_i32)(fmt, "request-sync\0".as_ptr(), 0);
+            (self.api.set_params)(self.codec, fmt);
+            (self.api.fmt_del)(fmt);
+        }
+        // Reset flag so CSD (SPS/PPS) is prepended to the next output frame.
+        // The encoder hardware may or may not include SPS/PPS in the IDR output;
+        // prepending our copy is harmless and ensures decoders always have them.
+        self.csd_sent = false;
     }
 
     fn encode(&mut self, i420: &[u8], out: &mut Vec<u8>) -> Result<()> {
@@ -2006,26 +2191,136 @@ impl VideoEncoder {
         let h = self.height as usize;
         let y_size = w * h;
         let uv_size = (w / 2) * (h / 2);
-        let slices = YUVSlices::new(
-            (
-                &i420[..y_size],
-                &i420[y_size..y_size + uv_size],
-                &i420[y_size + uv_size..],
-            ),
-            (w, h),
-            (w, w / 2, w / 2),
-        );
-        let bitstream = self
-            .inner
-            .encode(&slices)
-            .context("openh264 encode failed")?;
+
+        // I420 → NV12 via SIMD libyuv
+        let src = I420Image {
+            y: &i420[..y_size],
+            y_stride: w,
+            u: &i420[y_size..y_size + uv_size],
+            u_stride: w / 2,
+            v: &i420[y_size + uv_size..],
+            v_stride: w / 2,
+        };
+        let (nv_y, nv_uv) = self.nv12.split_at_mut(y_size);
+        let mut dst = Nv12ImageMut {
+            y: nv_y,
+            y_stride: w,
+            uv: nv_uv,
+            uv_stride: w,
+        };
+        vnrit_libyuv::i420_to_nv12(&src, &mut dst, ImageSize::new(w, h))
+            .context("I420ToNV12")?;
+
+        // PTS from wall-clock; handles frame drops and timing variations naturally.
+        let pts = self.epoch.elapsed().as_micros() as u64;
+
+        let idx = unsafe { (self.api.deq_in)(self.codec, 10_000) };
+        if idx < 0 {
+            return if idx == MC_TRY_AGAIN {
+                Ok(())
+            } else {
+                anyhow::bail!("dequeueInputBuffer: {}", idx)
+            };
+        }
+        let mut cap = 0usize;
+        let buf = unsafe { (self.api.get_in)(self.codec, idx as usize, &mut cap) };
+        if buf.is_null() {
+            anyhow::bail!("getInputBuffer null");
+        }
+        if cap < self.nv12.len() {
+            anyhow::bail!("input buffer too small: {} < {}", cap, self.nv12.len());
+        }
+        unsafe { std::ptr::copy_nonoverlapping(self.nv12.as_ptr(), buf, self.nv12.len()) };
+        if unsafe { (self.api.queue_in)(self.codec, idx as usize, 0, self.nv12.len(), pts, 0) } != 0 {
+            anyhow::bail!("queueInputBuffer");
+        }
+
+        // Drain all available output. IDR keyframes may produce multiple NALs
+        // (SPS, PPS, SEI, IDR slices) across several dequeue calls.
         out.clear();
-        bitstream.write_vec(out);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                log::warn!("[mcenc] drain timeout");
+                break;
+            }
+            let mut info = McBufferInfo { offset: 0, size: 0, pts: 0, flags: 0 };
+            let idx = unsafe {
+                (self.api.deq_out)(self.codec, &mut info as *mut _ as *mut c_void, 5_000)
+            };
+            if idx == MC_TRY_AGAIN {
+                break;
+            }
+            if idx == MC_FORMAT_CHANGED {
+                let fmt = unsafe { (self.api.get_ofmt)(self.codec) };
+                if !fmt.is_null() {
+                    self.csd.clear();
+                    unsafe {
+                        let mut d: *mut u8 = std::ptr::null_mut();
+                        let mut sz = 0usize;
+                        if (self.api.fmt_buf)(fmt, "csd-0\0".as_ptr(), &mut d, &mut sz) != 0
+                            && !d.is_null() && sz > 0
+                        {
+                            self.csd.extend_from_slice(std::slice::from_raw_parts(d, sz));
+                        }
+                        let mut d: *mut u8 = std::ptr::null_mut();
+                        let mut sz = 0usize;
+                        if (self.api.fmt_buf)(fmt, "csd-1\0".as_ptr(), &mut d, &mut sz) != 0
+                            && !d.is_null() && sz > 0
+                        {
+                            self.csd.extend_from_slice(std::slice::from_raw_parts(d, sz));
+                        }
+                    }
+                    if !self.csd.is_empty() {
+                        log::info!("[mcenc] CSD {}B", self.csd.len());
+                    }
+                    unsafe { (self.api.fmt_del)(fmt) };
+                }
+                continue;
+            }
+            if idx == MC_BUFFERS_CHANGED {
+                continue;
+            }
+            if idx < 0 {
+                break;
+            }
+            let mut cap = 0usize;
+            let buf = unsafe { (self.api.get_out)(self.codec, idx as usize, &mut cap) };
+            if !buf.is_null() && info.size > 0 {
+                if info.offset as usize + info.size as usize > cap {
+                    log::warn!("[mcenc] output buffer bounds: offset={} size={} cap={}", info.offset, info.size, cap);
+                    unsafe { (self.api.rel_out)(self.codec, idx as usize, 0) };
+                    continue;
+                }
+                if !self.csd_sent && !self.csd.is_empty() {
+                    out.extend_from_slice(&self.csd);
+                    self.csd_sent = true;
+                }
+                let data = unsafe {
+                    std::slice::from_raw_parts(buf.add(info.offset as usize), info.size as usize)
+                };
+                out.extend_from_slice(data);
+            }
+            unsafe { (self.api.rel_out)(self.codec, idx as usize, 0) };
+            if info.flags & MC_FLAG_END_OF_STREAM != 0 {
+                break;
+            }
+        }
+        #[cfg(debug_assertions)]
+        debug_validate_h264(out);
         Ok(())
     }
+}
 
-    fn force_keyframe(&mut self) {
-        self.inner.force_intra_frame();
+impl Drop for MediaCodecEncoder {
+    fn drop(&mut self) {
+        unsafe {
+            // AMediaCodec state machine: Running → Flushed → Stopped → Released
+            let _ = self.flush();
+            let _ = (self.api.stop)(self.codec);
+            let _ = (self.api.delete)(self.codec);
+            libc::dlclose(self._lib);
+        }
     }
 }
 
@@ -2218,7 +2513,7 @@ fn main() -> Result<()> {
             log::LevelFilter::Off,
         )
         .filter(Some("rtc_dtls"), log::LevelFilter::Error)
-        .filter(Some("openh264"), log::LevelFilter::Error)
+
         .format_timestamp(None)
         .init();
 
@@ -2788,7 +3083,7 @@ async fn run_signaling(
     // ── Post-pc operations (tracks, offer/answer) — close pc on error ──
     let v = match async {
         // ── Create video track ──
-        let ssrc = rand::rng().random::<u32>();
+        let ssrc = rand::random::<u32>();
         let rtp_codec = video_codec.rtp_codec.clone();
 
         let track = TrackLocalStaticSample::new(MediaStreamTrack::new(
@@ -2812,7 +3107,7 @@ async fn run_signaling(
         log::info!("[pc] video track added");
 
         // ── Create audio track ──
-        let audio_ssrc = rand::rng().random::<u32>();
+        let audio_ssrc = rand::random::<u32>();
         let audio_rtp_codec = audio_codec.rtp_codec.clone();
         let audio_track = TrackLocalStaticSample::new(MediaStreamTrack::new(
             "audio-stream".to_owned(),
@@ -3164,24 +3459,6 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
         }
     };
 
-    // ── Create VideoEncoder ──
-    let mut encoder = match VideoEncoder::new(&state.args, out_w, out_h) {
-        Ok(e) => e,
-        Err(err) => {
-            log::info!("[encoder] failed to create: {:#}", err);
-            tasks.shutdown().await;
-            let _ = pc.close().await;
-            return;
-        }
-    };
-    log::info!(
-        "[encoder] created ({}x{}, {}kbps, {}fps)",
-        out_w,
-        out_h,
-        state.args.bitrate,
-        state.args.framerate
-    );
-
     // ── Forward ICE candidates ──
     let ice_out_tx = out_tx.clone();
     tasks.spawn(async move {
@@ -3426,18 +3703,26 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     let enc_args = state.args.clone();
     let (enc_w, enc_h) = (out_w, out_h);
     tasks.spawn_blocking(move || {
+        let mut encoder = match MediaCodecEncoder::new(&enc_args, enc_w, enc_h) {
+            Ok(e) => e,
+            Err(err) => {
+                log::error!("[mcenc] failed to create: {:#}", err);
+                enc_done.notify_one();
+                return;
+            }
+        };
+        log::info!("[mcenc] created ({}x{}, {}kbps, {}fps)", enc_w, enc_h, enc_args.bitrate, enc_args.framerate);
         let mut enc_buf = Vec::with_capacity(65536);
         let mut last_idr = std::time::Instant::now();
         let mut enc_failures = 0u32;
         let mut hard_failures = 0u32;
-        const ENC_MAX_FAILURES: u32 = 10;
-        const ENC_HARD_LIMIT: u32 = 3;
+        const MAX_FAILURES: u32 = 10;
+        const HARD_LIMIT: u32 = 3;
         const IDR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
         loop {
             if enc_stop.is_cancelled() {
                 break;
             }
-            // Check for adaptive bitrate update
             let desired = enc_bps.load(Ordering::Relaxed);
             encoder.set_bitrate(desired);
             match yuv_rx.recv_timeout(std::time::Duration::from_millis(20)) {
@@ -3447,26 +3732,20 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                         enc_failures += 1;
                         hard_failures += 1;
                         log::error!(
-                            "[encoder] error #{}/{} (hard={}/{}): {:#}",
-                            enc_failures,
-                            ENC_MAX_FAILURES,
-                            hard_failures,
-                            ENC_HARD_LIMIT,
-                            e
+                            "[mcenc] error #{}/{} (hard={}/{}): {:#}",
+                            enc_failures, MAX_FAILURES, hard_failures, HARD_LIMIT, e
                         );
-                        // Hard limit: if encoder keeps failing after multiple resets, give up
-                        if hard_failures >= ENC_HARD_LIMIT {
-                            log::error!("[encoder] hard limit reached, disconnecting");
+                        if hard_failures >= HARD_LIMIT {
+                            log::error!("[mcenc] hard limit reached, disconnecting");
                             enc_done.notify_one();
                             break;
                         }
-                        if enc_failures >= ENC_MAX_FAILURES {
-                            log::error!("[encoder] too many failures, resetting encoder");
-                            // Give the encoder some breathing room, then recreate it
+                        if enc_failures >= MAX_FAILURES {
+                            log::error!("[mcenc] too many failures, resetting");
                             std::thread::sleep(std::time::Duration::from_millis(
                                 enc_failures as u64 * 100,
                             ));
-                            encoder = match VideoEncoder::new(&enc_args, enc_w, enc_h) {
+                            encoder = match MediaCodecEncoder::new(&enc_args, enc_w, enc_h) {
                                 Ok(e) => e,
                                 Err(_) => {
                                     enc_done.notify_one();
@@ -3477,15 +3756,12 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                             continue;
                         }
                         encoder.force_keyframe();
-                        // Exponential backoff before retry
                         std::thread::sleep(std::time::Duration::from_millis(
                             enc_failures.min(10) as u64 * 100,
                         ));
                         continue;
                     }
-                    enc_failures = 0; // reset on success
-                    // Zero-copy: transfer encoder buffer ownership to Bytes,
-                    // replacing enc_buf with an empty Vec for the next frame.
+                    enc_failures = 0;
                     let frame = Bytes::from(std::mem::take(&mut enc_buf));
                     if enc_stop.is_cancelled() {
                         return;
@@ -3493,14 +3769,11 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                     match enc_tx_clone.try_send(frame) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            // 通道满，丢弃当前帧，强制 IDR
                             encoder.force_keyframe();
-                            log::trace!("[encoder] dropping frame: channel full");
+                            log::trace!("[mcenc] dropping frame: channel full");
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
                     }
-                    // Force IDR on a wall-clock basis so timing is unaffected
-                    // by encoder stalls or frame drops.
                     if last_idr.elapsed() >= IDR_INTERVAL {
                         encoder.force_keyframe();
                         last_idr = std::time::Instant::now();
@@ -3513,7 +3786,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
                 }
             }
         }
-        log::debug!("[encoder] task ended");
+        log::debug!("[mcenc] task ended");
     });
 
     // ── Stage 4: Send (async) ──
@@ -4242,7 +4515,7 @@ async fn handle_ws(ws: WebSocket, state: ServerState) {
     drop(input_state);
 
     // Force mimalloc to return cached memory segments to the OS.
-    // Per-session allocations (openh264 ref frames ~1.4MB, X11 buffers, audio)
+    // Per-session allocations (X11 buffers, MediaCodec encoder, audio)
     // are freed but mimalloc retains them in thread-local heaps. Without
     // explicit collection this manifests as a ~1.5MB/heap RSS increment.
     unsafe {
